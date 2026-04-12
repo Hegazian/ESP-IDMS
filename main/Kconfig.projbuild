@@ -1,0 +1,114 @@
+menu "ESP-IDMS Configuration"
+
+    config IDMS_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "myssid"
+
+    config IDMS_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "mypassword"
+
+    config IDMS_TELEGRAM_BOT_TOKEN
+        string "Telegram bot token (empty disables outbound messages)"
+        default ""
+
+    config IDMS_DEFAULT_TECH_CHAT_ID
+        string "Default technician Telegram chat_id (copied to NVS on first boot if empty)"
+        default ""
+
+    config IDMS_CURRENT_THRESHOLD_MA
+        int "RMS current below this = machine off (milliamps)"
+        range 50 5000
+        default 350
+
+    config IDMS_CT_AMPS_PER_VOLT_X100
+        int "Calibration: RMS amps per volt at ADC, fixed-point x100 (3000 = 30.00 A/V)"
+        range 10 500000
+        default 3000
+
+    config IDMS_DT_LOW_C
+        int "Cooling fault: delta-T below (°C)"
+        range 1 20
+        default 5
+
+    config IDMS_DT_HIGH_C
+        int "Cooling fault: delta-T above (°C)"
+        range 10 80
+        default 15
+
+    config IDMS_ADC_GPIO
+        int "GPIO for SCT-013 biased ADC input (must be ADC-capable on this chip)"
+        range 0 48
+        default 34 if IDF_TARGET_ESP32
+        default 3 if IDF_TARGET_ESP32S3
+        default 34
+
+    config IDMS_PIN_ONEWIRE
+        int "DS18B20 1-Wire GPIO"
+        range 0 48
+        default 4
+
+    config IDMS_LCD_HOST
+        int "SPI host ID (2 = FSPI / common SPI2, 3 = SPI3)"
+        range 1 3
+        default 2
+
+    config IDMS_PIN_LCD_SCLK
+        int "LCD SPI SCLK GPIO"
+        range 0 48
+        default 18
+
+    config IDMS_PIN_LCD_MOSI
+        int "LCD SPI MOSI GPIO"
+        range 0 48
+        default 23
+
+    config IDMS_PIN_LCD_MISO
+        int "LCD SPI MISO GPIO (touch shares bus)"
+        range 0 48
+        default 19
+
+    config IDMS_PIN_LCD_DC
+        int "LCD D/C GPIO"
+        range 0 48
+        default 2
+
+    config IDMS_PIN_LCD_CS
+        int "LCD chip select GPIO"
+        range 0 48
+        default 15
+
+    config IDMS_PIN_LCD_BL
+        int "LCD backlight GPIO (-1 to skip)"
+        range -1 48
+        default 21
+
+    config IDMS_PIN_TOUCH_CS
+        int "XPT2046 chip select GPIO"
+        range 0 48
+        default 33
+
+    config IDMS_PIN_TOUCH_IRQ
+        int "XPT2046 IRQ GPIO (-1 if unused)"
+        range -1 48
+        default 36
+
+    config IDMS_LCD_SWAP_XY
+        bool "Swap X/Y for 320x240 landscape"
+        default y
+
+    config IDMS_LCD_MIRROR_X
+        bool "Mirror X"
+        default n
+
+    config IDMS_LCD_MIRROR_Y
+        bool "Mirror Y"
+        default y
+
+    config IDMS_UI_ENABLE
+        bool "Enable LVGL + ILI9341 UI"
+        default y
+        help
+            When disabled, the firmware runs without the display stack (monitoring + Telegram still active).
+
+endmenu

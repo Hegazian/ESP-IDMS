@@ -1,0 +1,14 @@
+# ESP32-S3 N16R8: 16 MB quad flash, 8 MB octal PSRAM (typical ESP32-S3-WROOM-1 / DevKitC-1 N16R8)
+# Applied automatically when target is esp32s3 (in addition to sdkconfig.defaults).
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# More app space on 16 MB flash (adjust if you add a custom partition table)
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Reduce internal DRAM pressure when Wi-Fi is enabled
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
