@@ -6,10 +6,16 @@ idf_component_register(
     "config_store.c"
     "wifi_manager.c"
     "telegram.c"
+    "tg_http.c"
+    "tg_send.c"
+    "tg_parse.c"
+    "tg_ui.c"
+    "tg_bot.c"
     "monitor.c"
     "xpt2046.c"
     "ui_lvgl.c"
     "ota.c"
+    "serial_console.c"
   INCLUDE_DIRS "."
   PRIV_REQUIRES
     nvs_flash

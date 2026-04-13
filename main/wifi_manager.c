@@ -30,8 +30,15 @@ static void try_connect(void)
     strncpy((char *)cfg.sta.ssid, CONFIG_IDMS_WIFI_SSID, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, CONFIG_IDMS_WIFI_PASSWORD, sizeof(cfg.sta.password) - 1);
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
-    esp_err_t err = esp_wifi_connect();
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        /* WiFi may be stopping (during reboot) — ignore gracefully */
+        if (err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_STOP_STATE) {
+            ESP_LOGW(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+    err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect: %s", esp_err_to_name(err));
     }

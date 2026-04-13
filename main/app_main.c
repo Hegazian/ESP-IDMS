@@ -7,6 +7,7 @@
 #include "ui_lvgl.h"
 #include "telegram.h"
 #include "ota.h"
+#include "serial_console.h"
 
 static const char *TAG = "app";
 
@@ -23,6 +24,9 @@ void app_main(void)
 
     /* Telegram command polling (OTA commands, future commands) */
     telegram_command_poll_start();
+
+    /* Serial console for local configuration */
+    serial_console_start();
 
     /* OTA init starts the HTTP server — call after Wi-Fi so we can log the IP */
     ESP_ERROR_CHECK(ota_init());

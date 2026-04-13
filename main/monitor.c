@@ -1,6 +1,7 @@
 #include "monitor.h"
 #include "ds18b20.h"
 #include "telegram.h"
+#include "config_store.h"
 #include "wifi_manager.h"
 #include "sdkconfig.h"
 #include "esp_err.h"
@@ -66,6 +67,14 @@ static void send_power_alert(bool loss, float a)
         char msg[96];
         snprintf(msg, sizeof(msg), "⚠️ ALERT: Machine power loss detected. Current: %.1fA", a);
         telegram_broadcast_text(msg);
+        /* Ringing alert to all technicians */
+        uint8_t n = config_get_tech_count();
+        for (int i = 0; i < n; i++) {
+            char id[64];
+            if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                telegram_send_ringing_alert(id, msg);
+            }
+        }
     } else {
         telegram_broadcast_text("✅ Machine power has been restored.");
     }
@@ -73,14 +82,20 @@ static void send_power_alert(bool loss, float a)
 
 static void send_cool_alert(bool low_side, float dt)
 {
+    char msg[96];
     if (low_side) {
-        char msg[96];
         snprintf(msg, sizeof(msg), "⚠️ ALERT: Cooling failure. ΔT = %.1f°C (below minimum).", dt);
-        telegram_broadcast_text(msg);
     } else {
-        char msg[96];
         snprintf(msg, sizeof(msg), "⚠️ ALERT: Thermal overload. ΔT = %.1f°C (above maximum).", dt);
-        telegram_broadcast_text(msg);
+    }
+    telegram_broadcast_text(msg);
+    /* Ringing alert to all technicians */
+    uint8_t n = config_get_tech_count();
+    for (int i = 0; i < n; i++) {
+        char id[64];
+        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+            telegram_send_ringing_alert(id, msg);
+        }
     }
 }
 

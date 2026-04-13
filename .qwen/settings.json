@@ -4,7 +4,10 @@
       "Bash(idf.py *)",
       "Bash(find *)",
       "Bash(which *)",
-      "Bash(ls *)"
+      "Bash(ls *)",
+      "Bash(sed *)",
+      "Bash(xxd)",
+      "Bash(grep *)"
     ]
   },
   "$version": 3
