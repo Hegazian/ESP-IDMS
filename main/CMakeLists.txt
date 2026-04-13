@@ -6,9 +6,16 @@ idf_component_register(
     "config_store.c"
     "wifi_manager.c"
     "telegram.c"
+    "tg_http.c"
+    "tg_send.c"
+    "tg_parse.c"
+    "tg_ui.c"
+    "tg_bot.c"
     "monitor.c"
     "xpt2046.c"
     "ui_lvgl.c"
+    "ota.c"
+    "serial_console.c"
   INCLUDE_DIRS "."
   PRIV_REQUIRES
     nvs_flash
@@ -16,6 +23,7 @@ idf_component_register(
     esp_wifi
     esp_event
     esp_http_client
+    esp_http_server
     esp_timer
     driver
     esp_adc
@@ -23,4 +31,12 @@ idf_component_register(
     mbedtls
     esp_lcd_ili9341
     lvgl
+    esp_app_format
+    esp_partition
+    spi_flash
+    app_update
+    bootloader_support
+    lwip
 )
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE PROJECT_VER=\"${PROJECT_VER}\")

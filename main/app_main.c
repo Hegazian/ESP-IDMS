@@ -5,6 +5,9 @@
 #include "ds18b20.h"
 #include "monitor.h"
 #include "ui_lvgl.h"
+#include "telegram.h"
+#include "ota.h"
+#include "serial_console.h"
 
 static const char *TAG = "app";
 
@@ -19,5 +22,19 @@ void app_main(void)
     monitor_init();
     idms_ui_init();
 
-    ESP_LOGI(TAG, "All subsystems started");
+    /* Telegram command polling (OTA commands, future commands) */
+    telegram_command_poll_start();
+
+    /* Serial console for local configuration */
+    serial_console_start();
+
+    /* OTA init starts the HTTP server — call after Wi-Fi so we can log the IP */
+    ESP_ERROR_CHECK(ota_init());
+
+    /* Mark the app as valid if this is a post-OTA first boot.
+     * The bootloader sets a pending-verify flag on OTA boot.
+     * If this code runs successfully, rollback is cancelled. */
+    ota_mark_app_valid();
+
+    ESP_LOGI(TAG, "All subsystems started (version: %s)", ota_get_version());
 }

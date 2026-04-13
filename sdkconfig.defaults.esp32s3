@@ -7,8 +7,13 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 
-# More app space on 16 MB flash (adjust if you add a custom partition table)
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# OTA partition table (16 MB flash)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota_16m.csv"
+
+# More app space via OTA layout
+# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
+# CONFIG_PARTITION_TABLE_TWO_OTA_LARGE is not set
 
 # Reduce internal DRAM pressure when Wi-Fi is enabled
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

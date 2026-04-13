@@ -12,3 +12,22 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # LVGL (managed component)
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
+
+# NVS encryption for secrets — enable when ready to deploy:
+#   CONFIG_NVS_ENCRYPTION=y
+#   CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=1
+# Then burn the key block with espefuse.py. Not enabled by default.
+# CONFIG_NVS_ENCRYPTION is not set
+
+# OTA: enable boot tracking + rollback
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_TEST_TIME=10
+
+# Task Watchdog Timer — logs warnings but does NOT panic/reboot.
+# Panic mode is too aggressive for a monitoring device; leave for dev debugging.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+# CONFIG_ESP_TASK_WDT_PANIC is not set
+
+# SNTP time sync for timestamps
+CONFIG_LWIP_SNTP_MAX_SERVERS=3

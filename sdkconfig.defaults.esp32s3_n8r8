@@ -1,0 +1,15 @@
+# ESP32-S3 N8R8 / N8R4: 8 MB flash, 8 MB or 4 MB octal PSRAM
+# Use: idf.py set-target esp32s3
+
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# OTA partition table (8 MB flash)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota_8m.csv"
+
+# Reduce internal DRAM pressure when Wi-Fi is enabled
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
