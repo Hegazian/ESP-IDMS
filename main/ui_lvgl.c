@@ -27,6 +27,7 @@
 #include "config_store.h"
 #include "pins.h"
 #include "xpt2046.h"
+#include "ota.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -56,6 +57,8 @@ static lv_obj_t *s_lbl_tin;
 static lv_obj_t *s_lbl_tout;
 static lv_obj_t *s_lbl_dt;
 static lv_obj_t *s_lbl_wifi;
+static lv_obj_t *s_lbl_version;
+static lv_obj_t *s_lbl_ota_status;
 static lv_obj_t *s_ta_tech;
 static lv_obj_t *s_lbl_tech_count;
 
@@ -190,6 +193,14 @@ static void on_timer_refresh(lv_timer_t *t)
     }
     lv_label_set_text(s_lbl_wifi, buf);
 
+    /* Firmware version */
+    lv_label_set_text(s_lbl_version, ota_get_version());
+
+    /* OTA status */
+    char ota_buf[64];
+    snprintf(ota_buf, sizeof(ota_buf), "OTA: %s (%s)", ota_get_status(), ota_get_partition());
+    lv_label_set_text(s_lbl_ota_status, ota_buf);
+
     snprintf(buf, sizeof(buf), "Technicians (NVS): %u", (unsigned)config_get_tech_count());
     lv_label_set_text(s_lbl_tech_count, buf);
 }
@@ -225,27 +236,31 @@ static void build_ui(void)
     s_lbl_tout = lv_label_create(scr);
     s_lbl_dt = lv_label_create(scr);
     s_lbl_wifi = lv_label_create(scr);
+    s_lbl_version = lv_label_create(scr);
+    s_lbl_ota_status = lv_label_create(scr);
     s_lbl_tech_count = lv_label_create(scr);
 
-    lv_obj_align(s_lbl_i, LV_ALIGN_TOP_LEFT, 8, 36);
-    lv_obj_align(s_lbl_tin, LV_ALIGN_TOP_LEFT, 8, 56);
-    lv_obj_align(s_lbl_tout, LV_ALIGN_TOP_LEFT, 8, 76);
-    lv_obj_align(s_lbl_dt, LV_ALIGN_TOP_LEFT, 8, 96);
-    lv_obj_align(s_lbl_wifi, LV_ALIGN_TOP_LEFT, 8, 116);
-    lv_obj_align(s_lbl_tech_count, LV_ALIGN_TOP_LEFT, 8, 136);
+    lv_obj_align(s_lbl_i, LV_ALIGN_TOP_LEFT, 8, 30);
+    lv_obj_align(s_lbl_tin, LV_ALIGN_TOP_LEFT, 8, 48);
+    lv_obj_align(s_lbl_tout, LV_ALIGN_TOP_LEFT, 8, 66);
+    lv_obj_align(s_lbl_dt, LV_ALIGN_TOP_LEFT, 8, 84);
+    lv_obj_align(s_lbl_wifi, LV_ALIGN_TOP_LEFT, 8, 102);
+    lv_obj_align(s_lbl_version, LV_ALIGN_TOP_LEFT, 8, 120);
+    lv_obj_align(s_lbl_ota_status, LV_ALIGN_TOP_LEFT, 8, 138);
+    lv_obj_align(s_lbl_tech_count, LV_ALIGN_TOP_LEFT, 8, 156);
 
     lv_obj_t *lbl_add = lv_label_create(scr);
     lv_label_set_text(lbl_add, "Add Telegram chat_id:");
-    lv_obj_align(lbl_add, LV_ALIGN_TOP_LEFT, 8, 158);
+    lv_obj_align(lbl_add, LV_ALIGN_TOP_LEFT, 8, 176);
 
     s_ta_tech = lv_textarea_create(scr);
     lv_textarea_set_one_line(s_ta_tech, true);
     lv_obj_set_width(s_ta_tech, LCD_H_RES - 110);
-    lv_obj_align(s_ta_tech, LV_ALIGN_TOP_LEFT, 8, 178);
+    lv_obj_align(s_ta_tech, LV_ALIGN_TOP_LEFT, 8, 196);
 
     lv_obj_t *btn = lv_btn_create(scr);
-    lv_obj_set_size(btn, 90, 36);
-    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, -8, 172);
+    lv_obj_set_size(btn, 90, 30);
+    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, -8, 193);
     lv_obj_t *bl = lv_label_create(btn);
     lv_label_set_text(bl, "Save");
     lv_obj_center(bl);

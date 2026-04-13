@@ -111,4 +111,42 @@ menu "ESP-IDMS Configuration"
         help
             When disabled, the firmware runs without the display stack (monitoring + Telegram still active).
 
+    menu "OTA Firmware Update"
+
+        config IDMS_OTA_ENABLE
+            bool "Enable OTA firmware update"
+            default y
+            help
+                Enables over-the-air firmware updates via HTTP server or Telegram command.
+                Requires a partition table with ota_0 and ota_1 slots.
+
+        config IDMS_OTA_HTTP_PORT
+            int "OTA HTTP server port"
+            range 1024 65535
+            default 8080
+            help
+                Port for the built-in OTA HTTP server. Access via http://<device-ip>:<port>/
+
+        config IDMS_OTA_HTTP_AUTH_USER
+            string "OTA HTTP admin username"
+            default "admin"
+            help
+                HTTP basic auth username for OTA upload endpoint.
+
+        config IDMS_OTA_HTTP_AUTH_PASS
+            string "OTA HTTP admin password"
+            default "ota_admin"
+            help
+                HTTP basic auth password for OTA upload endpoint.
+                WARNING: Stored in sdkconfig plaintext — change via menuconfig before deployment.
+
+        config IDMS_OTA_TELEGRAM_COMMAND
+            bool "Enable OTA trigger via Telegram command"
+            default y
+            help
+                When enabled, sending /ota_update to the bot triggers an OTA check.
+                The actual firmware upload still happens via HTTP POST.
+
+    endmenu
+
 endmenu

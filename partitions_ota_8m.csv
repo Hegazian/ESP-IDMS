@@ -1,0 +1,10 @@
+# ESP-IDMS OTA Partition Table — 8 MB flash (ESP32-S3 N8R8 / N8R4 / ESP32 8MB)
+# Name,   Type, SubType,  Offset,    Size,      Flags
+nvs,      data, nvs,      0x9000,    0x6000,
+otadata,  data, ota,      0xf000,    0x2000,
+phy_init, data, phy,      0x11000,   0x1000,
+factory,  app,  factory,  0x20000,   0x200000,
+ota_0,    app,  ota_0,    0x220000,  0x200000,
+ota_1,    app,  ota_1,    0x420000,  0x200000,
+nvs_key,  data, nvs_keys, 0x620000,  0x1000,   encrypted
+storage,  data, spiffs,   0x630000,  0x1D0000,

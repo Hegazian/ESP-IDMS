@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(idf.py *)",
+      "Bash(find *)",
+      "Bash(which *)",
+      "Bash(ls *)"
+    ]
+  },
+  "$version": 3
+}
