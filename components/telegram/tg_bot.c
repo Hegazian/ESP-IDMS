@@ -3,6 +3,7 @@
 #include "tg_send.h"
 #include "tg_parse.h"
 #include "tg_ui.h"
+#include "tg_token.h"
 #include "config_store.h"
 #include "ota.h"
 #include "wifi_manager.h"
@@ -19,9 +20,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* FreeRTOS 11 compat: pdMS_TO_TICKS may not be defined */
-#ifndef pdMS_TO_TICKS
-#define pdMS_TO_TICKS(ms) pdMS_TO_TICKS(ms)
+/* FreeRTOS compat: some ESP-IDF 5.x builds don't export this macro */
+#ifndef pdMS_TO_DELAY
+#define pdMS_TO_DELAY(ms) ((TickType_t)((ms) * configTICK_RATE_HZ / 1000))
 #endif
 
 static const char *TAG = "tg_bot";
@@ -78,7 +79,7 @@ static void clear_pending(void)
 {
     ESP_LOGI(TAG, "Clearing pending updates");
     tg_http_post_json("/deleteWebhook", "{\"drop_pending_updates\":true}");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_DELAY(500));
     s_update_offset += OFFSET_BUMP_ON_REBOOT;
     save_state();
 }
@@ -115,7 +116,7 @@ static void handle_cmd(const char *chat, const char *cmd)
         tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
     } else if (strcmp(cmd, "reboot") == 0) {
         tg_broadcast_alert("⚠️ <b>REBOOT</b>\n\nRebooting now...");
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_DELAY(1000));
         do_reboot();
     } else if (strcmp(cmd, "techs") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
@@ -129,7 +130,6 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
 {
     if (!s_resp_buf) return;
 
-    /* Answer callback — log failure but don't retry (400 = expired/duplicate) */
     esp_err_t e = tg_answer_cb(cb_id);
     if (e != ESP_OK) {
         ESP_LOGD(TAG, "answerCallbackQuery failed for %s (expired or dup)", data);
@@ -147,7 +147,7 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
         tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
     } else if (strcmp(data, "cmd_reboot") == 0) {
         tg_broadcast_alert("⚠️ <b>REBOOT</b>\n\nRebooting now...");
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_DELAY(1000));
         do_reboot();
     } else if (strcmp(data, "cmd_techs") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
@@ -160,11 +160,14 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
     } else if (strcmp(data, "ota_url") == 0) {
         char ip[16];
         wifi_manager_get_ip(ip, sizeof(ip));
+        char ota_user[64], ota_pass[64];
+        config_get_ota_user(ota_user, sizeof(ota_user));
+        config_get_ota_pass(ota_pass, sizeof(ota_pass));
         snprintf(s_resp_buf, RESP_BUF_SZ,
             "<b>🌐 OTA URL</b>\n\n<code>http://%s:%d/</code>\n"
             "User: <code>%s</code>\nPass: <code>%s</code>",
             ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT,
-            CONFIG_IDMS_OTA_HTTP_AUTH_USER, CONFIG_IDMS_OTA_HTTP_AUTH_PASS);
+            ota_user, ota_pass);
         tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
     } else if (strcmp(data, "tech_list") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
@@ -194,7 +197,7 @@ bool tg_check_dns(void)
             ESP_LOGI(TAG, "DNS OK: %s", ip_s);
             return true;
         } else if (err == ERR_INPROGRESS) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_DELAY(2000));
             err = dns_gethostbyname("api.telegram.org", &r, NULL, NULL);
             if (err == ERR_OK) {
                 s_dns_ok = true;
@@ -204,7 +207,7 @@ bool tg_check_dns(void)
                 return true;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_DELAY(1000));
     }
     ESP_LOGE(TAG, "DNS FAIL: api.telegram.org");
     return false;
@@ -240,9 +243,13 @@ static void poll_task(void *arg)
 {
     (void)arg;
     if (CONFIG_IDMS_TELEGRAM_BOT_TOKEN[0] == '\0') {
-        ESP_LOGW(TAG, "Bot token not set");
-        vTaskDelete(NULL);
-        return;
+        char token[128];
+        tg_get_token(token, sizeof(token));
+        if (token[0] == '\0') {
+            ESP_LOGW(TAG, "Bot token not set");
+            vTaskDelete(NULL);
+            return;
+        }
     }
 
     load_state();
@@ -266,7 +273,7 @@ static void poll_task(void *arg)
     bool was_off = false;
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(poll_int * 1000));
+        vTaskDelay(pdMS_TO_DELAY(poll_int * 1000));
 
         char path[256];
         if (s_update_offset < 0) {
@@ -292,7 +299,6 @@ static void poll_task(void *arg)
             continue;
         }
 
-        /* Recovered */
         if (was_off && fail_n > 0) {
             ESP_LOGI(TAG, "Connection restored after %d failures", fail_n);
             tg_flush_offline_queue();
@@ -302,15 +308,14 @@ static void poll_task(void *arg)
         fail_n = 0;
         poll_int = POLL_OK_S;
 
-        /* Advance offset + persist */
         char uid[16];
         if (tg_json_val(resp, "\"update_id\":", uid, sizeof(uid))) {
             s_update_offset = atoi(uid) + 1;
             save_state();
         }
 
-        /* Extract chat */
-        const char *chat = tg_json_chat(resp);
+        char chat_buf[32];
+        const char *chat = tg_json_chat(resp, chat_buf, sizeof(chat_buf));
         if (!chat) {
             ESP_LOGD(TAG, "No chat_id in response");
             continue;
@@ -318,16 +323,14 @@ static void poll_task(void *arg)
 
         /* ---- Callback query ---- */
         if (tg_is_cb(resp)) {
-            /* Auto-register chat ID for callbacks too */
             config_add_tech_id(chat);
-
             char cb_id[64];
             const char *cbid = tg_json_cb_id(resp, cb_id, sizeof(cb_id));
             char cb_data[64];
             const char *data = tg_json_val(resp, "\"data\":", cb_data, sizeof(cb_data));
             if (chat && cbid && data) {
                 if (!tg_is_authorized(resp)) {
-                    ESP_LOGW(TAG, "Unauthorized callback from %s (id=%s)", chat, cbid);
+                    ESP_LOGW(TAG, "Unauthorized callback from %s", chat);
                     tg_answer_cb(cbid);
                     continue;
                 }

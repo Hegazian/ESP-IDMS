@@ -2,12 +2,7 @@
  * telegram.c — Public API wrapper for the Telegram bot module.
  *
  * Re-exports functions from internal submodules for use by the rest of
- * the application. All heavy lifting is done in:
- *   tg_http.c   — HTTP transport
- *   tg_send.c   — Message sending, alerts, offline queue
- *   tg_parse.c  — JSON extraction
- *   tg_ui.c     — Report builders, keyboard definitions
- *   tg_bot.c    — Poll task, command routing, NVS persistence
+ * the application.
  */
 
 #include "telegram.h"

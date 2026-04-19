@@ -1,5 +1,6 @@
 #include "ota.h"
 #include "telegram.h"
+#include "config_store.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -8,6 +9,7 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "mbedtls/sha256.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -28,7 +30,7 @@ static volatile bool s_telegram_trigger = false;
 static volatile bool s_update_in_progress = false;
 
 /* ------------------------------------------------------------------ */
-/*  Basic-auth helper (RFC 7617 — simple Base64, no constant-time)   */
+/*  Basic-auth helper (RFC 7617 — Base64 + constant-time compare)     */
 /* ------------------------------------------------------------------ */
 
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -53,6 +55,17 @@ static int b64_encode(char *out, size_t out_sz, const uint8_t *in, size_t in_len
     return (int)j;
 }
 
+static bool ct_memcmp(const void *a, const void *b, size_t len)
+{
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) {
+        diff |= pa[i] ^ pb[i];
+    }
+    return diff == 0;
+}
+
 static bool check_basic_auth(httpd_req_t *req)
 {
     char auth_header[256];
@@ -63,16 +76,26 @@ static bool check_basic_auth(httpd_req_t *req)
         return false;
     }
     const char *creds = auth_header + 6;
+    size_t creds_len = strlen(creds);
+
+    char ota_user[64], ota_pass[64];
+    config_get_ota_user(ota_user, sizeof(ota_user));
+    config_get_ota_pass(ota_pass, sizeof(ota_pass));
+
     char expected_creds[256];
-    snprintf(expected_creds, sizeof(expected_creds), "%s:%s",
-             CONFIG_IDMS_OTA_HTTP_AUTH_USER, CONFIG_IDMS_OTA_HTTP_AUTH_PASS);
+    snprintf(expected_creds, sizeof(expected_creds), "%s:%s", ota_user, ota_pass);
     char expected_b64[384];
     int n = b64_encode(expected_b64, sizeof(expected_b64),
                        (const uint8_t *)expected_creds, strlen(expected_creds));
     if (n < 0) {
         return false;
     }
-    return strncmp(creds, expected_b64, (size_t)n) == 0;
+
+    if (creds_len != (size_t)n) {
+        ct_memcmp(creds, expected_b64, (creds_len > (size_t)n) ? creds_len : (size_t)n);
+        return false;
+    }
+    return ct_memcmp(creds, expected_b64, (size_t)n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +158,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         boundary[--blen] = '\0';
     }
 
+    /* Optional: client can send X-Expected-SHA256 header for integrity verification */
+    char expected_sha256[65] = {0};
+    bool has_expected_hash = false;
+    if (httpd_req_get_hdr_value_str(req, "X-Expected-SHA256", expected_sha256, sizeof(expected_sha256)) == ESP_OK) {
+        has_expected_hash = true;
+        ESP_LOGI(TAG, "Client provided expected SHA256: %s", expected_sha256);
+    }
+
     ESP_LOGI(TAG, "OTA upload started, boundary: %s", boundary);
 
     /* Determine target partition */
@@ -160,8 +191,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     s_update_part = update;
     s_update_in_progress = true;
 
+    /* Initialize SHA256 digest for integrity verification */
+    mbedtls_sha256_context sha256_ctx;
+    mbedtls_sha256_init(&sha256_ctx);
+    mbedtls_sha256_starts(&sha256_ctx, 0);
+
     char *buf = malloc(OTA_RECV_BUFSZ);
     if (!buf) {
+        mbedtls_sha256_free(&sha256_ctx);
         esp_ota_abort(s_ota_handle);
         s_ota_handle = 0;
         s_update_in_progress = false;
@@ -226,6 +263,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                             upload_ok = false;
                             goto upload_complete;
                         }
+                        mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), chunk);
                         total += chunk;
                     }
                     /* Resume boundary parsing from the boundary */
@@ -241,6 +279,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                         upload_ok = false;
                         goto upload_complete;
                     }
+                    mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), remaining);
                     total += remaining;
                     buf_offset = recv_len;
                 }
@@ -254,6 +293,18 @@ upload_complete:
         upload_ok = false;
     }
 
+    /* Finalize SHA256 */
+    unsigned char sha256_hash[32];
+    mbedtls_sha256_finish(&sha256_ctx, sha256_hash);
+    mbedtls_sha256_free(&sha256_ctx);
+
+    /* Convert SHA256 to hex string */
+    char sha256_hex[65];
+    for (int i = 0; i < 32; i++) {
+        snprintf(sha256_hex + i * 2, 3, "%02x", sha256_hash[i]);
+    }
+    sha256_hex[64] = '\0';
+
     if (!upload_ok) {
         esp_ota_abort(s_ota_handle);
         s_ota_handle = 0;
@@ -265,6 +316,28 @@ upload_complete:
         snprintf(msg, sizeof(msg), "Upload failed (received %zu bytes)", total);
         httpd_resp_sendstr(req, msg);
         return ESP_OK;
+    }
+
+    /* Verify SHA256 if client provided expected hash */
+    if (has_expected_hash) {
+        if (!ct_memcmp(expected_sha256, sha256_hex, 64)) {
+            ESP_LOGE(TAG, "SHA256 mismatch: expected %s, got %s", expected_sha256, sha256_hex);
+            esp_ota_abort(s_ota_handle);
+            s_ota_handle = 0;
+            s_update_in_progress = false;
+            free(buf);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "text/plain");
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "SHA256 verification failed.\nExpected: %s\nActual:   %s",
+                     expected_sha256, sha256_hex);
+            httpd_resp_sendstr(req, msg);
+            return ESP_OK;
+        }
+        ESP_LOGI(TAG, "SHA256 verified: %s", sha256_hex);
+    } else {
+        ESP_LOGI(TAG, "Upload SHA256: %s (no client verification requested)", sha256_hex);
     }
 
     /* Finalize OTA */
@@ -292,10 +365,11 @@ upload_complete:
 
     ESP_LOGI(TAG, "OTA complete: %zu bytes written, rebooting...", total);
 
-    httpd_resp_set_status(req, "200 OK");
-    httpd_resp_set_type(req, "text/plain");
-    char msg[128];
-    snprintf(msg, sizeof(msg), "OTA successful! Rebooting into new firmware (%zu bytes).\n", total);
+    httpd_resp_set_type(req, "application/json");
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "{\"status\":\"success\",\"bytes\":%zu,\"sha256\":\"%s\"}",
+             total, sha256_hex);
     httpd_resp_sendstr(req, msg);
 
     /* Notify technicians via Telegram */
@@ -316,10 +390,19 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
 
-    char body[512];
+    char body[768];
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_app_desc_t app_desc;
     esp_ota_get_partition_description(running, &app_desc);
+
+    /* Compute SHA256 of running partition */
+    char sha256_hex[65] = {0};
+    unsigned char hash[32];
+    if (esp_partition_get_sha256(running, hash) == ESP_OK) {
+        for (int i = 0; i < 32; i++) {
+            snprintf(sha256_hex + i * 2, 3, "%02x", hash[i]);
+        }
+    }
 
     snprintf(body, sizeof(body),
              "{"
@@ -328,7 +411,8 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
              "\"status\":\"%s\","
              "\"idf_version\":\"%s\","
              "\"chip\":\"%s\","
-             "\"compile_time\":\"%s %s\""
+             "\"compile_time\":\"%s %s\","
+             "\"sha256\":\"%s\""
              "}",
              ota_get_version(),
              running->label,
@@ -341,7 +425,8 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
 #else
              "ESP32-variant",
 #endif
-             app_desc.date, app_desc.time);
+             app_desc.date, app_desc.time,
+             sha256_hex);
 
     httpd_resp_sendstr(req, body);
     return ESP_OK;
@@ -353,6 +438,12 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
 
 static esp_err_t ota_page_handler(httpd_req_t *req)
 {
+#if CONFIG_IDMS_OTA_HTTPS_ENABLE
+    const char *proto_note = "<p>Connection is TLS-encrypted (self-signed certificate — accept browser warning).</p>";
+#else
+    const char *proto_note = "<p>Connection is <b>unencrypted</b> HTTP. Credentials are sent in plaintext.</p>";
+#endif
+
     const char *page =
         "<!DOCTYPE html>"
         "<html><head><meta charset=\"utf-8\"><title>ESP-IDMS OTA Update</title>"
@@ -362,9 +453,11 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         "background:#00d4ff;color:#000;border:none;padding:10px 24px;font-size:16px;cursor:pointer;border-radius:4px}"
         "input[type=submit]:hover{background:#00b8d4}"
         ".warn{color:#ff6b6b;font-size:14px;margin-top:16px}"
+        ".info{color:#8be9fd;font-size:14px;margin-top:8px}"
         "</style></head><body>"
         "<h1>ESP-IDMS Firmware Update</h1>"
         "<p>Current version: <strong>" PROJECT_VER "</strong></p>"
+        "<div class=\"info\">" "%s" "</div>"
         "<form method=\"POST\" enctype=\"multipart/form-data\">"
         "<label>Firmware binary (.bin):</label><br>"
         "<input type=\"file\" name=\"firmware\" accept=\".bin\" required><br>"
@@ -373,14 +466,85 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         "<p class=\"warn\">⚠ The device will reboot after a successful update.</p>"
         "</body></html>";
 
+    char *html = malloc(2048);
+    if (!html) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    snprintf(html, 2048, page, proto_note);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, page);
+    httpd_resp_sendstr(req, html);
+    free(html);
     return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/*  HTTP server startup                                                */
+/*  Server startup (HTTP or HTTPS based on Kconfig)                   */
 /* ------------------------------------------------------------------ */
+
+static void register_uri_handlers(httpd_handle_t server)
+{
+    httpd_uri_t page_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = ota_page_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &page_uri);
+
+    httpd_uri_t upload_uri = {
+        .uri = "/",
+        .method = HTTP_POST,
+        .handler = ota_upload_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &upload_uri);
+
+    httpd_uri_t info_uri = {
+        .uri = "/info",
+        .method = HTTP_GET,
+        .handler = ota_info_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &info_uri);
+}
+
+#if CONFIG_IDMS_OTA_HTTPS_ENABLE
+
+#include "esp_https_server.h"
+
+extern const unsigned char ota_server_cert_pem_start[] asm("_binary_ota_server_cert_pem_start");
+extern const unsigned char ota_server_cert_pem_end[] asm("_binary_ota_server_cert_pem_end");
+extern const unsigned char ota_server_key_pem_start[] asm("_binary_ota_server_key_pem_start");
+extern const unsigned char ota_server_key_pem_end[] asm("_binary_ota_server_key_pem_end");
+
+static esp_err_t start_ota_http_server(uint16_t port)
+{
+    httpd_handle_t server = NULL;
+    httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    ssl_cfg.servercert = ota_server_cert_pem_start;
+    ssl_cfg.servercert_len = (ota_server_cert_pem_end - ota_server_cert_pem_start);
+    ssl_cfg.prvtkey = ota_server_key_pem_start;
+    ssl_cfg.prvtkey_len = (ota_server_key_pem_end - ota_server_key_pem_start);
+    ssl_cfg.httpd.server_port = port;
+    ssl_cfg.httpd.max_uri_handlers = 8;
+    ssl_cfg.httpd.recv_wait_timeout = 30;
+    ssl_cfg.httpd.send_wait_timeout = 30;
+    ssl_cfg.httpd.max_open_sockets = 4;
+    ssl_cfg.httpd.lru_purge_enable = true;
+
+    esp_err_t err = httpd_ssl_start(&server, &ssl_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    register_uri_handlers(server);
+    ESP_LOGI(TAG, "OTA HTTPS server started on port %u", (unsigned)port);
+    return ESP_OK;
+}
+
+#else
 
 static esp_err_t start_ota_http_server(uint16_t port)
 {
@@ -399,36 +563,12 @@ static esp_err_t start_ota_http_server(uint16_t port)
         return err;
     }
 
-    /* GET / → upload page */
-    httpd_uri_t page_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = ota_page_handler,
-        .user_ctx = NULL,
-    };
-    httpd_register_uri_handler(server, &page_uri);
-
-    /* POST / → firmware upload */
-    httpd_uri_t upload_uri = {
-        .uri = "/",
-        .method = HTTP_POST,
-        .handler = ota_upload_handler,
-        .user_ctx = NULL,
-    };
-    httpd_register_uri_handler(server, &upload_uri);
-
-    /* GET /info → JSON status */
-    httpd_uri_t info_uri = {
-        .uri = "/info",
-        .method = HTTP_GET,
-        .handler = ota_info_handler,
-        .user_ctx = NULL,
-    };
-    httpd_register_uri_handler(server, &info_uri);
-
+    register_uri_handlers(server);
     ESP_LOGI(TAG, "OTA HTTP server started on port %u", (unsigned)port);
     return ESP_OK;
 }
+
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Boot validation / rollback check                                   */

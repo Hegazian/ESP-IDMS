@@ -112,6 +112,35 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "Rebooting...");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
+    } else if (strncmp(cmd, "set_ssid ", 9) == 0) {
+        const char *val = cmd + 9;
+        esp_err_t err = config_set_wifi_ssid(val);
+        ESP_LOGI(TAG, "Set Wi-Fi SSID: %s (%s)", val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_pass ", 9) == 0) {
+        const char *val = cmd + 9;
+        esp_err_t err = config_set_wifi_password(val);
+        ESP_LOGI(TAG, "Set Wi-Fi password: %s (%s)", err == ESP_OK ? "****" : val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_token ", 10) == 0) {
+        const char *val = cmd + 10;
+        esp_err_t err = config_set_telegram_token(val);
+        ESP_LOGI(TAG, "Set Telegram token: %s (%s)", err == ESP_OK ? "****" : val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_ota_user ", 13) == 0) {
+        const char *val = cmd + 13;
+        esp_err_t err = config_set_ota_user(val);
+        ESP_LOGI(TAG, "Set OTA username: %s (%s)", val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_ota_pass ", 13) == 0) {
+        const char *val = cmd + 13;
+        esp_err_t err = config_set_ota_pass(val);
+        ESP_LOGI(TAG, "Set OTA password: %s (%s)", err == ESP_OK ? "****" : val, esp_err_to_name(err));
+    } else if (strcmp(cmd, "show_secrets") == 0) {
+        char ssid[64], token[128], ota_user[64];
+        config_get_wifi_ssid(ssid, sizeof(ssid));
+        config_get_telegram_token(token, sizeof(token));
+        config_get_ota_user(ota_user, sizeof(ota_user));
+        ESP_LOGI(TAG, "Wi-Fi SSID:     %s", ssid);
+        ESP_LOGI(TAG, "Wi-Fi password:  %s", "****");
+        ESP_LOGI(TAG, "Telegram token:  %s", token[0] ? "****" : "(not set)");
+        ESP_LOGI(TAG, "OTA user:        %s", ota_user);
     } else if (strcmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
         ESP_LOGI(TAG, "  add <chat_id>    — Add technician ID to NVS");
@@ -119,6 +148,12 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  remove <index>   — Remove ID by index (0-4)");
         ESP_LOGI(TAG, "  clear            — Remove all IDs");
         ESP_LOGI(TAG, "  status           — Show device status");
+        ESP_LOGI(TAG, "  set_ssid <ssid>  — Set Wi-Fi SSID (NVS)");
+        ESP_LOGI(TAG, "  set_pass <pass>  — Set Wi-Fi password (NVS)");
+        ESP_LOGI(TAG, "  set_token <tok>  — Set Telegram bot token (NVS)");
+        ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
+        ESP_LOGI(TAG, "  set_ota_pass <p> — Set OTA HTTP password (NVS)");
+        ESP_LOGI(TAG, "  show_secrets     — Show secret status (values hidden)");
         ESP_LOGI(TAG, "  reboot           — Reboot device");
         ESP_LOGI(TAG, "  help             — Show this help");
     } else {

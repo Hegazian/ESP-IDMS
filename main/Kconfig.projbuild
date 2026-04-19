@@ -127,18 +127,29 @@ menu "ESP-IDMS Configuration"
             help
                 Port for the built-in OTA HTTP server. Access via http://<device-ip>:<port>/
 
+        config IDMS_OTA_HTTPS_ENABLE
+            bool "Enable HTTPS for OTA server (self-signed certificate)"
+            default n
+            help
+                When enabled, the OTA HTTP server uses TLS with an embedded self-signed
+                certificate. Browsers will show a security warning — accept it or use
+                curl with --insecure. Credentials are encrypted in transit regardless of
+                the basic-auth layer. For production, replace the embedded certificate
+                with your own CA-signed cert.
+
         config IDMS_OTA_HTTP_AUTH_USER
             string "OTA HTTP admin username"
             default "admin"
             help
                 HTTP basic auth username for OTA upload endpoint.
+                Can be overridden at runtime via serial console: set_ota_user <name>
 
         config IDMS_OTA_HTTP_AUTH_PASS
             string "OTA HTTP admin password"
             default "ota_admin"
             help
                 HTTP basic auth password for OTA upload endpoint.
-                WARNING: Stored in sdkconfig plaintext — change via menuconfig before deployment.
+                Can be overridden at runtime via serial console: set_ota_pass <pass>
 
         config IDMS_OTA_TELEGRAM_COMMAND
             bool "Enable OTA trigger via Telegram command"

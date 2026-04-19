@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include "config_store.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -26,9 +27,14 @@ static void set_ip(void)
 
 static void try_connect(void)
 {
+    char ssid[64] = {0};
+    char password[64] = {0};
+    config_get_wifi_ssid(ssid, sizeof(ssid));
+    config_get_wifi_password(password, sizeof(password));
+
     wifi_config_t cfg = {0};
-    strncpy((char *)cfg.sta.ssid, CONFIG_IDMS_WIFI_SSID, sizeof(cfg.sta.ssid) - 1);
-    strncpy((char *)cfg.sta.password, CONFIG_IDMS_WIFI_PASSWORD, sizeof(cfg.sta.password) - 1);
+    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK) {

@@ -123,7 +123,51 @@ idf.py -p COMx flash monitor
 
 Managed components (`esp_lcd_ili9341`, `lvgl`) are resolved on first build.
 
-**Security:** `menuconfig` stores the Wi-Fi password and Telegram token in `sdkconfig` (plaintext). Do not commit `sdkconfig` to a public repository.
+**Security:** Credentials (Wi-Fi password, Telegram token, OTA auth) can be stored in NVS via the serial console at runtime, avoiding plaintext in `sdkconfig`. The NVS `secrets` namespace falls back to Kconfig defaults if not set. Do not commit `sdkconfig` to a public repository.
+
+## Security
+
+The following security measures are built in:
+
+| Measure | Detail |
+|---------|--------|
+| **OTA Auth** | HTTP Basic Auth with constant-time comparison prevents timing attacks |
+| **OTA Integrity** | SHA256 digest computed on upload; client can verify via `X-Expected-SHA256` header |
+| **OTA HTTPS** | Optional TLS for OTA server (`CONFIG_IDMS_OTA_HTTPS_ENABLE`); self-signed cert included for dev |
+| **Credential Storage** | Wi-Fi, Telegram token, OTA auth stored in NVS `secrets` namespace (fallback to Kconfig) |
+| **NVS Encryption** | Production-ready: uncomment `CONFIG_NVS_ENCRYPTION` in `sdkconfig.defaults` and burn HMAC eFuse key |
+| **Serial Console** | All secrets shown as `****`; set commands: `set_ssid`, `set_pass`, `set_token`, `set_ota_user`, `set_ota_pass` |
+
+### Setting Credentials at Runtime
+
+Connect via serial and use the console:
+
+```
+> set_ssid MyNetwork
+> set_pass MyPassword  
+> set_token 123456:ABC-DEF
+> set_ota_user admin
+> set_ota_pass secure_password
+> show_secrets
+```
+
+After changing Wi-Fi credentials, reboot for them to take effect.
+
+### OTA SHA256 Verification
+
+When uploading firmware, include the expected SHA256 hash:
+
+```bash
+# Compute hash of your firmware
+sha256sum build/esp_idms.bin
+
+# Upload with hash verification
+curl -u admin:ota_admin -F "firmware=@build/esp_idms.bin" \
+  -H "X-Expected-SHA256: <hash>" \
+  http://<device-ip>:8080/
+```
+
+If the hash does not match the computed digest, the upload is rejected with a `400` error.
 
 ## Behaviour summary
 

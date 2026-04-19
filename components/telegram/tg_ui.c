@@ -36,6 +36,9 @@ void tg_build_ota(char *buf, size_t sz)
 {
     char ip[16];
     wifi_manager_get_ip(ip, sizeof(ip));
+    char ota_user[64], ota_pass[64];
+    config_get_ota_user(ota_user, sizeof(ota_user));
+    config_get_ota_pass(ota_pass, sizeof(ota_pass));
     snprintf(buf, sz,
         "<b>🔄 OTA Firmware Update</b>\n\n"
         "<b>Current:</b> %s\n"
@@ -48,8 +51,7 @@ void tg_build_ota(char *buf, size_t sz)
         ota_get_version(), ota_get_partition(), ota_get_status(),
         ip[0] ? ip : "?.?.?.?",
         CONFIG_IDMS_OTA_HTTP_PORT,
-        CONFIG_IDMS_OTA_HTTP_AUTH_USER,
-        CONFIG_IDMS_OTA_HTTP_AUTH_PASS);
+        ota_user, ota_pass);
 }
 
 void tg_build_techs(char *buf, size_t sz)

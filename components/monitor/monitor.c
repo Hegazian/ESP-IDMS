@@ -1,7 +1,7 @@
 #include "monitor.h"
 #include "ds18b20.h"
-#include "telegram.h"
 #include "config_store.h"
+#include "telegram.h"
 #include "wifi_manager.h"
 #include "sdkconfig.h"
 #include "esp_err.h"
