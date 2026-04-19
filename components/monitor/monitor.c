@@ -1,8 +1,4 @@
 #include "monitor.h"
-#include "ds18b20.h"
-#include "config_store.h"
-#include "telegram.h"
-#include "wifi_manager.h"
 #include "sdkconfig.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
@@ -13,6 +9,20 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20
+#include "ds18b20.h"
+#elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
+#include "max31865.h"
+#include "pins.h"
+#endif
+
+#if CONFIG_IDMS_UI_ENABLE
+#include "wifi_manager.h"
+#include "telegram.h"
+#endif
+
+#include "config_store.h"
 
 static const char *TAG = "monitor";
 
@@ -42,7 +52,7 @@ static float sample_current_rms_volts(void)
 {
     const int n = 256;
     int32_t sum = 0;
-    static int buf[256];
+    int buf[256];
     for (int i = 0; i < n; i++) {
         int v = 0;
         if (adc_oneshot_read(s_adc, s_adc_channel, &v) != ESP_OK) {
@@ -61,13 +71,13 @@ static float sample_current_rms_volts(void)
     return rms_counts * (3.3f / 4095.0f);
 }
 
+#if CONFIG_IDMS_UI_ENABLE
 static void send_power_alert(bool loss, float a)
 {
     if (loss) {
         char msg[96];
-        snprintf(msg, sizeof(msg), "⚠️ ALERT: Machine power loss detected. Current: %.1fA", a);
+        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Machine power loss detected. Current: %.1fA", a);
         telegram_broadcast_text(msg);
-        /* Ringing alert to all technicians */
         uint8_t n = config_get_tech_count();
         for (int i = 0; i < n; i++) {
             char id[64];
@@ -76,7 +86,7 @@ static void send_power_alert(bool loss, float a)
             }
         }
     } else {
-        telegram_broadcast_text("✅ Machine power has been restored.");
+        telegram_broadcast_text("\xe2\x9c\x85 Machine power has been restored.");
     }
 }
 
@@ -84,12 +94,11 @@ static void send_cool_alert(bool low_side, float dt)
 {
     char msg[96];
     if (low_side) {
-        snprintf(msg, sizeof(msg), "⚠️ ALERT: Cooling failure. ΔT = %.1f°C (below minimum).", dt);
+        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xce\x94T = %.1f\xc2\xb0C (below minimum).", dt);
     } else {
-        snprintf(msg, sizeof(msg), "⚠️ ALERT: Thermal overload. ΔT = %.1f°C (above maximum).", dt);
+        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xce\x94T = %.1f\xc2\xb0C (above maximum).", dt);
     }
     telegram_broadcast_text(msg);
-    /* Ringing alert to all technicians */
     uint8_t n = config_get_tech_count();
     for (int i = 0; i < n; i++) {
         char id[64];
@@ -101,8 +110,9 @@ static void send_cool_alert(bool low_side, float dt)
 
 static void send_cool_restored(void)
 {
-    telegram_broadcast_text("✅ Cooling system has returned to normal operation.");
+    telegram_broadcast_text("\xe2\x9c\x85 Cooling system has returned to normal operation.");
 }
+#endif
 
 static void monitor_task(void *arg)
 {
@@ -114,6 +124,11 @@ static void monitor_task(void *arg)
     const int dt_low = CONFIG_IDMS_DT_LOW_C;
     const int dt_high = CONFIG_IDMS_DT_HIGH_C;
 
+#if CONFIG_IDMS_TEMP_SENSOR_MAX31865
+    int sensor_count = max31865_sensor_count();
+    ESP_LOGI(TAG, "MAX31865 sensors: %d", sensor_count);
+#endif
+
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -122,6 +137,8 @@ static void monitor_task(void *arg)
 
         float t_in = 0.0f, t_out = 0.0f;
         bool v_in = false, v_out = false;
+
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20
         if (s_conv_pending_read) {
             if (ds18b20_device_count() >= 1) {
                 v_in = ds18b20_read_temperature_c(0, &t_in);
@@ -132,6 +149,10 @@ static void monitor_task(void *arg)
         }
         ds18b20_request_conversion();
         s_conv_pending_read = true;
+#elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
+        v_in = max31865_read_temperature_c(0, &t_in);
+        v_out = max31865_read_temperature_c(1, &t_out);
+#endif
 
         float dt = 0.0f;
         bool v_dt = v_in && v_out;
@@ -148,10 +169,13 @@ static void monitor_task(void *arg)
         s_metrics.t_out_valid = v_out;
         s_metrics.delta_t_c = dt;
         s_metrics.delta_valid = v_dt;
+#if CONFIG_IDMS_UI_ENABLE
         s_metrics.wifi_connected = wifi_manager_is_connected();
         wifi_manager_get_ip(s_metrics.wifi_ip, sizeof(s_metrics.wifi_ip));
+#endif
         portEXIT_CRITICAL(&s_metrics_lock);
 
+#if CONFIG_IDMS_UI_ENABLE
         if (wifi_manager_is_connected()) {
             s_heartbeat_ticks++;
             if (s_heartbeat_ticks >= 120) {
@@ -165,12 +189,15 @@ static void monitor_task(void *arg)
         if (!wifi_manager_is_connected()) {
             continue;
         }
+#endif
 
         if (amps < i_thresh) {
             s_power_low_ms += 500;
         } else {
             if (s_power_st == POWER_FAULT) {
+#if CONFIG_IDMS_UI_ENABLE
                 send_power_alert(false, amps);
+#endif
                 s_power_st = POWER_OK;
             }
             s_power_low_ms = 0;
@@ -178,7 +205,9 @@ static void monitor_task(void *arg)
         }
 
         if (amps < i_thresh && s_power_low_ms >= 5000 && s_power_st != POWER_FAULT) {
+#if CONFIG_IDMS_UI_ENABLE
             send_power_alert(true, amps);
+#endif
             s_power_st = POWER_FAULT;
         }
 
@@ -191,7 +220,9 @@ static void monitor_task(void *arg)
                 s_cool_bad_ms += 500;
             } else {
                 if (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH) {
+#if CONFIG_IDMS_UI_ENABLE
                     send_cool_restored();
+#endif
                     s_cool_st = COOL_OK;
                 }
                 s_cool_bad_ms = 0;
@@ -200,10 +231,14 @@ static void monitor_task(void *arg)
 
             if (bad && s_cool_bad_ms >= 5000) {
                 if (bad_low && s_cool_st != COOL_FAULT_LOW) {
+#if CONFIG_IDMS_UI_ENABLE
                     send_cool_alert(true, dt);
+#endif
                     s_cool_st = COOL_FAULT_LOW;
                 } else if (bad_high && s_cool_st != COOL_FAULT_HIGH) {
+#if CONFIG_IDMS_UI_ENABLE
                     send_cool_alert(false, dt);
+#endif
                     s_cool_st = COOL_FAULT_HIGH;
                 }
             }
@@ -234,6 +269,15 @@ void monitor_init(void)
         .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, s_adc_channel, &chcfg));
+
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20
+    ds18b20_init();
+    ESP_LOGI(TAG, "Temperature sensors: DS18B20 1-Wire (GPIO%d)", CONFIG_IDMS_PIN_ONEWIRE);
+#elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
+    max31865_init(IDMS_SPI_HOST);
+    ESP_LOGI(TAG, "Temperature sensors: PT100 via MAX31865 (CS0=GPIO%d, CS1=GPIO%d)",
+             CONFIG_IDMS_MAX31865_CS0, CONFIG_IDMS_MAX31865_CS1);
+#endif
 
     memset(&s_metrics, 0, sizeof(s_metrics));
     xTaskCreatePinnedToCore(monitor_task, "monitor", 8192, NULL, 5, NULL, tskNO_AFFINITY);

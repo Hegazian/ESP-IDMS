@@ -104,7 +104,6 @@ bool tg_is_cmd(const char *json, const char *cmd)
 bool tg_is_authorized(const char *json)
 {
     char fid[32];
-    bool found = false;
 
     /* For callback_query: the from.id is inside callback_query, NOT inside
      * the embedded message object (which belongs to the bot, not the user).
@@ -113,10 +112,8 @@ bool tg_is_authorized(const char *json)
     if (cq) {
         const char *from = strstr(cq, "\"from\":");
         if (from) {
-            /* Find "id": within the from object — search for "id": after "from":{ */
             const char *idp = strstr(from, "\"id\":");
             if (idp && tg_json_val(idp, "\"id\":", fid, sizeof(fid))) {
-                found = true;
                 goto check;
             }
         }
@@ -129,7 +126,6 @@ bool tg_is_authorized(const char *json)
         if (from) {
             const char *idp = strstr(from, "\"id\":");
             if (idp && tg_json_val(idp, "\"id\":", fid, sizeof(fid))) {
-                found = true;
                 goto check;
             }
         }

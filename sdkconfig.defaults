@@ -12,6 +12,7 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # LVGL (managed component)
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
 
 # NVS encryption for secrets — STRONGLY recommended for production deployment.
 # When enabled, the "secrets" and "idms" NVS namespaces are encrypted at rest,

@@ -8,5 +8,3 @@
 #else
 #define IDMS_SPI_HOST SPI2_HOST
 #endif
-
-#define IDMS_PIN_ONEWIRE CONFIG_IDMS_PIN_ONEWIRE

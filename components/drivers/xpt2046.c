@@ -23,7 +23,12 @@ static esp_err_t xfer(uint8_t cmd, uint16_t *out12)
         .rx_buffer = rx,
     };
 
-    esp_err_t err = spi_device_polling_transmit(s_dev, &t);
+    spi_transaction_t *ret_trans;
+    esp_err_t err = spi_device_queue_trans(s_dev, &t, pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = spi_device_get_trans_result(s_dev, &ret_trans, pdMS_TO_TICKS(100));
     if (err != ESP_OK) {
         return err;
     }

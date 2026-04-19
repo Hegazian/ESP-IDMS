@@ -2,11 +2,11 @@ menu "ESP-IDMS Configuration"
 
     config IDMS_WIFI_SSID
         string "Wi-Fi SSID"
-        default "myssid"
+        default "POCO F3"
 
     config IDMS_WIFI_PASSWORD
         string "Wi-Fi password"
-        default "mypassword"
+        default "12345678"
 
     config IDMS_TELEGRAM_BOT_TOKEN
         string "Telegram bot token (empty disables outbound messages)"
@@ -36,65 +36,294 @@ menu "ESP-IDMS Configuration"
         range 10 80
         default 15
 
+    # ------------------------------------------------------------------
+    #  ADC / Current sensor GPIO — defaults differ per target
+    # ------------------------------------------------------------------
+
     config IDMS_ADC_GPIO
         int "GPIO for SCT-013 biased ADC input (must be ADC-capable on this chip)"
         range 0 48
         default 34 if IDF_TARGET_ESP32
-        default 3 if IDF_TARGET_ESP32S3
-        default 34
+        default 6 if IDF_TARGET_ESP32S3
+
+    choice IDMS_TEMP_SENSOR
+        prompt "Temperature sensor type"
+        default IDMS_TEMP_SENSOR_MAX31865
+
+        config IDMS_TEMP_SENSOR_DS18B20
+            bool "DS18B20 1-Wire digital sensor"
+            help
+                Original DS18B20 waterproof probes on shared 1-Wire bus.
+                Uses a configurable GPIO with 4.7K pull-up.
+
+        config IDMS_TEMP_SENSOR_MAX31865
+            bool "PT100 RTD via MAX31865 SPI"
+            help
+                PT100/PT1000 RTD sensors connected via MAX31865 RTD-to-digital converters.
+                Two MAX31865 chips on shared SPI bus for T_in and T_out.
+                Higher accuracy (±0.1°C) and industrial-grade reliability.
+    endchoice
 
     config IDMS_PIN_ONEWIRE
         int "DS18B20 1-Wire GPIO"
         range 0 48
-        default 4
+        default 5 if IDF_TARGET_ESP32S3
+        default 4 if IDF_TARGET_ESP32
+        default 5
+        depends on IDMS_TEMP_SENSOR_DS18B20
 
-    config IDMS_LCD_HOST
+    config IDMS_MAX31865_CS0
+        int "MAX31865 chip-select GPIO for T_in sensor"
+        range 0 48
+        default 7 if IDF_TARGET_ESP32S3
+        default 5 if IDF_TARGET_ESP32
+        default 7
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    config IDMS_MAX31865_CS1
+        int "MAX31865 chip-select GPIO for T_out sensor"
+        range 0 48
+        default 16
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    config IDMS_MAX31865_SPI_CLK_KHZ
+        int "MAX31865 SPI clock speed (kHz)"
+        range 100 5000
+        default 1000
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    config IDMS_MAX31865_RREF_X10
+        int "Reference resistor value x10 (430 = 43.0 ohm for PT100, 4300 = 430.0 for PT1000)"
+        range 100 43000
+        default 4300
+        depends on IDMS_TEMP_SENSOR_MAX31865
+        help
+            RREF reference resistor on the MAX31865 board, multiplied by 10.
+            For PT100 with 430 ohm reference: enter 4300.
+            For PT100 with 400 ohm reference: enter 4000.
+            Check your MAX31865 breakout board's reference resistor value.
+
+    choice IDMS_MAX31865_WIRE
+        prompt "RTD wire mode"
+        default IDMS_MAX31865_WIRE_3
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+        config IDMS_MAX31865_WIRE_2
+            bool "2-wire RTD"
+        config IDMS_MAX31865_WIRE_3
+            bool "3-wire RTD"
+        config IDMS_MAX31865_WIRE_4
+            bool "4-wire RTD"
+    endchoice
+
+    # ------------------------------------------------------------------
+    #  Display — controller choice applies to both targets
+    # ------------------------------------------------------------------
+
+choice IDMS_DISPLAY_CONTROLLER
+        prompt "LCD display controller"
+        default IDMS_DISPLAY_ST7796S
+
+        config IDMS_DISPLAY_ILI9341
+            bool "ILI9341 (2.8\" 320x240)"
+            help
+                Original 2.8" 320x240 ILI9341 SPI TFT display with XPT2046 resistive touch.
+                Uses managed component espressim/esp_lcd_ili9341.
+
+        config IDMS_DISPLAY_ST7796S
+            bool "ST7796/S (3.5\" 320x480)"
+            help
+                3.5" 320x480 ST7796/ST7796S TFT display.
+                Uses built-in driver in components/drivers/esp_lcd_st7796s.
+                Supports both SPI (4-wire) and I80 (8080 parallel) interface.
+
+        config IDMS_DISPLAY_ILI9488
+            bool "ILI9488 (3.5\" 320x480)"
+            help
+                3.5" 320x480 ILI9488 TFT display.
+                Alternative controller found on some 3.5" modules.
+                Uses built-in driver in components/drivers/esp_lcd_ili9488.
+    endchoice
+
+    # ------------------------------------------------------------------
+    #  Display bus interface — SPI (4-wire) or I80 (8080 parallel)
+    #  Use I80 if your 3.5" module has an 8080 FPC connector and
+    #  SPI produces a white screen (IM pins may not be set for SPI).
+    # ------------------------------------------------------------------
+
+    choice IDMS_LCD_BUS
+        prompt "LCD bus interface"
+        default IDMS_LCD_BUS_SPI if IDF_TARGET_ESP32
+        default IDMS_LCD_BUS_I80 if IDF_TARGET_ESP32S3
+
+        config IDMS_LCD_BUS_SPI
+            bool "SPI (4-wire serial)"
+            help
+                Use SPI with SCLK, MOSI, CS, DC pins. Requires IM[2:0]=111
+                on the display module for 4-wire SPI mode.
+
+        config IDMS_LCD_BUS_I80
+            bool "I80 (8080 8-bit parallel)"
+            help
+                Use Intel 8080 8-bit parallel interface with D0-D7, WR, RD pins.
+                Recommended for 3.5" TFT modules with 8080 FPC connector.
+                Uses ESP32-S3 LCD_CAM peripheral for high-speed DMA transfers.
+    endchoice
+
+config IDMS_LCD_HOST
         int "SPI host ID (2 = FSPI / common SPI2, 3 = SPI3)"
         range 1 3
         default 2
 
+    # ------------------------------------------------------------------
+    #  SPI bus pins — always needed (shared by MAX31865, XPT2046, and
+    #  LCD when in SPI mode).
+    #  ESP32-S3: avoid GPIO 19/20 (USB D+/D-), 26-32 (flash/PSRAM),
+    #  0/3/45/46 (strapping). Safe range: 1-18, 21-25, 33-42, 47-48.
+    # ------------------------------------------------------------------
+
     config IDMS_PIN_LCD_SCLK
-        int "LCD SPI SCLK GPIO"
+        int "SPI SCLK GPIO (shared by LCD + sensors)"
         range 0 48
         default 18
 
     config IDMS_PIN_LCD_MOSI
-        int "LCD SPI MOSI GPIO"
+        int "SPI MOSI GPIO (shared by LCD + sensors)"
         range 0 48
+        default 23 if IDF_TARGET_ESP32
+        default 9 if IDF_TARGET_ESP32S3
         default 23
 
     config IDMS_PIN_LCD_MISO
-        int "LCD SPI MISO GPIO (touch shares bus)"
+        int "SPI MISO GPIO (touch and MAX31865)"
         range 0 48
+        default 19 if IDF_TARGET_ESP32
+        default 8 if IDF_TARGET_ESP32S3
         default 19
+        depends on IDMS_LCD_BUS_SPI
+
+    # ------------------------------------------------------------------
+    #  I80 LCD pins (only when IDMS_LCD_BUS_I80)
+    #  ESP32-S3: avoid GPIO 19/20 (USB D+/D-), 26-32 (flash/PSRAM),
+    #  0/3/45/46 (strapping). Safe range: 1-18, 21-25, 33-42, 47-48.
+    # ------------------------------------------------------------------
+
+    config IDMS_PIN_LCD_I80_D0
+        int "LCD I80 D0 GPIO"
+        range 0 48
+        default 33
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D1
+        int "LCD I80 D1 GPIO"
+        range 0 48
+        default 34
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D2
+        int "LCD I80 D2 GPIO"
+        range 0 48
+        default 35
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D3
+        int "LCD I80 D3 GPIO"
+        range 0 48
+        default 36
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D4
+        int "LCD I80 D4 GPIO"
+        range 0 48
+        default 37
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D5
+        int "LCD I80 D5 GPIO"
+        range 0 48
+        default 39
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D6
+        int "LCD I80 D6 GPIO"
+        range 0 48
+        default 40
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_D7
+        int "LCD I80 D7 GPIO"
+        range 0 48
+        default 41
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_WR
+        int "LCD I80 WR (write strobe) GPIO"
+        range 0 48
+        default 5
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_RD
+        int "LCD I80 RD (read strobe) GPIO (-1 if tied to VCC)"
+        range -1 48
+        default 21
+        depends on IDMS_LCD_BUS_I80
+
+    config IDMS_PIN_LCD_I80_PCLK_HZ
+        int "LCD I80 pixel clock speed (Hz)"
+        default 10000000
+        depends on IDMS_LCD_BUS_I80
+        help
+            I80 bus clock in Hz. 10 MHz is safe; increase to 20 MHz for
+            faster refresh if the display supports it.
+
+    # ------------------------------------------------------------------
+    #  Common LCD pins (shared by SPI and I80)
+    # ------------------------------------------------------------------
 
     config IDMS_PIN_LCD_DC
-        int "LCD D/C GPIO"
+        int "LCD D/C (SPI) or RS (I80) GPIO"
         range 0 48
+        default 2 if IDF_TARGET_ESP32
+        default 4 if IDF_TARGET_ESP32S3
         default 2
 
     config IDMS_PIN_LCD_CS
         int "LCD chip select GPIO"
         range 0 48
+        default 15 if IDF_TARGET_ESP32
+        default 10 if IDF_TARGET_ESP32S3
         default 15
 
     config IDMS_PIN_LCD_BL
         int "LCD backlight GPIO (-1 to skip)"
         range -1 48
+        default 21 if IDF_TARGET_ESP32
+        default 38 if IDF_TARGET_ESP32S3
         default 21
 
+    config IDMS_PIN_LCD_RST
+        int "LCD reset GPIO (-1 to tie to EN)"
+        range -1 48
+        default -1 if IDF_TARGET_ESP32
+        default 12 if IDF_TARGET_ESP32S3
+        default -1
+
     config IDMS_PIN_TOUCH_CS
-        int "XPT2046 chip select GPIO"
-        range 0 48
+        int "XPT2046 chip select GPIO (-1 to disable touch)"
+        range -1 48
+        default 33 if IDF_TARGET_ESP32
+        default 11 if IDF_TARGET_ESP32S3
         default 33
 
     config IDMS_PIN_TOUCH_IRQ
         int "XPT2046 IRQ GPIO (-1 if unused)"
         range -1 48
+        default 36 if IDF_TARGET_ESP32
+        default 14 if IDF_TARGET_ESP32S3
         default 36
 
     config IDMS_LCD_SWAP_XY
-        bool "Swap X/Y for 320x240 landscape"
+        bool "Swap X/Y for landscape orientation"
         default y
 
     config IDMS_LCD_MIRROR_X
@@ -103,10 +332,10 @@ menu "ESP-IDMS Configuration"
 
     config IDMS_LCD_MIRROR_Y
         bool "Mirror Y"
-        default y
+        default n
 
     config IDMS_UI_ENABLE
-        bool "Enable LVGL + ILI9341 UI"
+        bool "Enable LVGL + display UI"
         default y
         help
             When disabled, the firmware runs without the display stack (monitoring + Telegram still active).
@@ -132,10 +361,7 @@ menu "ESP-IDMS Configuration"
             default n
             help
                 When enabled, the OTA HTTP server uses TLS with an embedded self-signed
-                certificate. Browsers will show a security warning — accept it or use
-                curl with --insecure. Credentials are encrypted in transit regardless of
-                the basic-auth layer. For production, replace the embedded certificate
-                with your own CA-signed cert.
+                certificate.
 
         config IDMS_OTA_HTTP_AUTH_USER
             string "OTA HTTP admin username"

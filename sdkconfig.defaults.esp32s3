@@ -17,3 +17,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota_16m.csv"
 
 # Reduce internal DRAM pressure when Wi-Fi is enabled
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Default LCD bus to I80 on ESP32-S3 (3.5" TFT modules with 8080 FPC connector)
+CONFIG_IDMS_LCD_BUS_I80=y
