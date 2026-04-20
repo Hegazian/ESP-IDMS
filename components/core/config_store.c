@@ -105,14 +105,25 @@ esp_err_t config_add_tech_id(const char *id)
     if (!id || id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* Validate ID length to prevent buffer overflow */
+    size_t id_len = strlen(id);
+    if (id_len < 3 || id_len >= 60) {
+        ESP_LOGE(TAG, "Invalid technician ID length: %zu (must be 3-59 chars)", id_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     uint8_t count = config_get_tech_count();
     if (count >= 5) {
+        ESP_LOGW(TAG, "Maximum technician IDs (5) reached");
         return ESP_ERR_NO_MEM;
     }
 
+    /* Check for duplicates */
     for (int i = 0; i < count; i++) {
         char existing[64];
         if (config_get_tech_id(i, existing, sizeof(existing)) == ESP_OK && strcmp(existing, id) == 0) {
+            ESP_LOGI(TAG, "Technician ID already exists: %s", id);
             return ESP_OK;
         }
     }
@@ -126,5 +137,97 @@ esp_err_t config_add_tech_id(const char *id)
         err = nvs_commit(h);
     }
     nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Added technician ID: %s (count: %u)", id, count);
+    }
     return err;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Secrets: Wi-Fi & Telegram credentials stored in NVS "secrets" NS   */
+/*  Falls back to Kconfig defaults if not set in NVS.                  */
+/* ------------------------------------------------------------------ */
+
+static const char *SECRETS_NS = "secrets";
+
+static esp_err_t secrets_get(const char *key, const char *fallback, char *out, size_t out_len)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SECRETS_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        strncpy(out, fallback, out_len - 1);
+        out[out_len - 1] = '\0';
+        return ESP_OK;
+    }
+    size_t required = out_len;
+    err = nvs_get_str(h, key, out, &required);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        strncpy(out, fallback, out_len - 1);
+        out[out_len - 1] = '\0';
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t secrets_set(const char *key, const char *value)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(SECRETS_NS, NVS_READWRITE, &h), TAG, "secrets open");
+    esp_err_t err = nvs_set_str(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_get_wifi_ssid(char *out, size_t out_len)
+{
+    return secrets_get("wifi_ssid", CONFIG_IDMS_WIFI_SSID, out, out_len);
+}
+
+esp_err_t config_set_wifi_ssid(const char *ssid)
+{
+    return secrets_set("wifi_ssid", ssid);
+}
+
+esp_err_t config_get_wifi_password(char *out, size_t out_len)
+{
+    return secrets_get("wifi_pass", CONFIG_IDMS_WIFI_PASSWORD, out, out_len);
+}
+
+esp_err_t config_set_wifi_password(const char *password)
+{
+    return secrets_set("wifi_pass", password);
+}
+
+esp_err_t config_get_telegram_token(char *out, size_t out_len)
+{
+    return secrets_get("tg_token", CONFIG_IDMS_TELEGRAM_BOT_TOKEN, out, out_len);
+}
+
+esp_err_t config_set_telegram_token(const char *token)
+{
+    return secrets_set("tg_token", token);
+}
+
+esp_err_t config_get_ota_user(char *out, size_t out_len)
+{
+    return secrets_get("ota_user", CONFIG_IDMS_OTA_HTTP_AUTH_USER, out, out_len);
+}
+
+esp_err_t config_set_ota_user(const char *user)
+{
+    return secrets_set("ota_user", user);
+}
+
+esp_err_t config_get_ota_pass(char *out, size_t out_len)
+{
+    return secrets_get("ota_pass", CONFIG_IDMS_OTA_HTTP_AUTH_PASS, out, out_len);
+}
+
+esp_err_t config_set_ota_pass(const char *pass)
+{
+    return secrets_set("ota_pass", pass);
 }

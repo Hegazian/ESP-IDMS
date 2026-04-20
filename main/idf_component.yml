@@ -1,4 +1,4 @@
 ## Managed dependencies (ESP-IDF Component Manager)
 dependencies:
-  espressif/esp_lcd_ili9341: "^2.0.2"
   lvgl/lvgl: "8.3.11"
+  espressif/esp_lcd_ili9341: "^2.0.2"

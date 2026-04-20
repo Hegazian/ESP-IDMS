@@ -12,8 +12,7 @@ static const char *TAG = "tg_parse";
 
 const char *tg_json_val(const char *json, const char *key, char *out, size_t out_sz)
 {
-    static char sbuf[64];
-    if (!out) { out = sbuf; out_sz = sizeof(sbuf); }
+    if (!out || out_sz == 0) return NULL;
 
     const char *kp = strstr(json, key);
     if (!kp) return NULL;
@@ -46,8 +45,7 @@ const char *tg_json_val(const char *json, const char *key, char *out, size_t out
  */
 const char *tg_json_cb_id(const char *json, char *out, size_t out_sz)
 {
-    static char sbuf[64];
-    if (!out) { out = sbuf; out_sz = sizeof(sbuf); }
+    if (!out || out_sz == 0) return NULL;
 
     const char *cq = strstr(json, "\"callback_query\":");
     if (!cq) return NULL;
@@ -74,12 +72,11 @@ const char *tg_json_cb_id(const char *json, char *out, size_t out_sz)
     return out;
 }
 
-const char *tg_json_text(const char *json)
+const char *tg_json_text(const char *json, char *out, size_t out_sz)
 {
-    static char buf[512];
-    const char *t = tg_json_val(json, "\"text\":\"", buf, sizeof(buf));
+    const char *t = tg_json_val(json, "\"text\":\"", out, out_sz);
     if (t) return t;
-    return tg_json_val(json, "\"text\": \"", buf, sizeof(buf));
+    return tg_json_val(json, "\"text\": \"", out, out_sz);
 }
 
 bool tg_is_msg(const char *json)
@@ -94,7 +91,8 @@ bool tg_is_cb(const char *json)
 
 bool tg_is_cmd(const char *json, const char *cmd)
 {
-    const char *text = tg_json_text(json);
+    char text_buf[512];
+    const char *text = tg_json_text(json, text_buf, sizeof(text_buf));
     if (!text || text[0] != '/') return false;
     text++; /* skip / */
     size_t cl = strlen(cmd);
@@ -106,7 +104,6 @@ bool tg_is_cmd(const char *json, const char *cmd)
 bool tg_is_authorized(const char *json)
 {
     char fid[32];
-    bool found = false;
 
     /* For callback_query: the from.id is inside callback_query, NOT inside
      * the embedded message object (which belongs to the bot, not the user).
@@ -115,10 +112,8 @@ bool tg_is_authorized(const char *json)
     if (cq) {
         const char *from = strstr(cq, "\"from\":");
         if (from) {
-            /* Find "id": within the from object — search for "id": after "from":{ */
             const char *idp = strstr(from, "\"id\":");
             if (idp && tg_json_val(idp, "\"id\":", fid, sizeof(fid))) {
-                found = true;
                 goto check;
             }
         }
@@ -131,7 +126,6 @@ bool tg_is_authorized(const char *json)
         if (from) {
             const char *idp = strstr(from, "\"id\":");
             if (idp && tg_json_val(idp, "\"id\":", fid, sizeof(fid))) {
-                found = true;
                 goto check;
             }
         }
@@ -156,12 +150,11 @@ check:
     return false;
 }
 
-const char *tg_json_chat(const char *json)
+const char *tg_json_chat(const char *json, char *out, size_t out_sz)
 {
-    static char buf[32];
-    const char *t = tg_json_val(json, "\"chat\":{\"id\"", buf, sizeof(buf));
+    const char *t = tg_json_val(json, "\"chat\":{\"id\"", out, out_sz);
     if (t) return t;
-    t = tg_json_val(json, "\"chat\": {\"id\"", buf, sizeof(buf));
+    t = tg_json_val(json, "\"chat\": {\"id\"", out, out_sz);
     if (t) return t;
 
     /* callback_query.message.chat.id */
@@ -170,9 +163,9 @@ const char *tg_json_chat(const char *json)
         const char *msg = strstr(cq, "\"message\":");
         if (msg) {
             const char *ch = strstr(msg, "\"chat\":{\"id\"");
-            if (ch) return tg_json_val(ch, "\"chat\":{\"id\"", buf, sizeof(buf));
+            if (ch) return tg_json_val(ch, "\"chat\":{\"id\"", out, out_sz);
             ch = strstr(msg, "\"chat\": {\"id\"");
-            if (ch) return tg_json_val(ch, "\"chat\": {\"id\"", buf, sizeof(buf));
+            if (ch) return tg_json_val(ch, "\"chat\": {\"id\"", out, out_sz);
         }
     }
     return NULL;

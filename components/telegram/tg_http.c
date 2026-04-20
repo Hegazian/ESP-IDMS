@@ -1,4 +1,5 @@
 #include "tg_http.h"
+#include "tg_token.h"
 #include "sdkconfig.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -63,10 +64,12 @@ void tg_http_init(void)
 static esp_http_client_handle_t http_new(const char *path, int method,
                                           const char *ctype, resp_ctx_t *r, const char *post)
 {
-    if (CONFIG_IDMS_TELEGRAM_BOT_TOKEN[0] == '\0') return NULL;
+    char token[128];
+    tg_get_token(token, sizeof(token));
+    if (token[0] == '\0') return NULL;
     char url[256];
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s%s",
-             CONFIG_IDMS_TELEGRAM_BOT_TOKEN, path);
+             token, path);
 
     esp_http_client_config_t cfg = {
         .url = url, .method = method,

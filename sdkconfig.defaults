@@ -12,12 +12,30 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # LVGL (managed component)
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
 
-# NVS encryption for secrets — enable when ready to deploy:
-#   CONFIG_NVS_ENCRYPTION=y
-#   CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=1
-# Then burn the key block with espefuse.py. Not enabled by default.
-# CONFIG_NVS_ENCRYPTION is not set
+# NVS encryption for secrets — RECOMMENDED for production deployment.
+# When enabled, the "secrets" and "idms" NVS namespaces are encrypted at rest,
+# protecting Wi-Fi credentials, Telegram tokens, and technician IDs from flash extraction.
+#
+# For development, encryption can be disabled. For production, enable and follow setup:
+#   1. Uncomment the two lines below
+#   2. Generate an NVS encryption key: python $IDF_PATH/components/nvs_flash/nvs_partition_gen/nvs_partition_gen.py generate-key ...
+#   3. Burn the HMAC key eFuse: espefuse.py burn_key BLOCK_KEY_NVS_HMAC <key_file> HMAC
+#   4. Flash the encrypted NVS key partition alongside your firmware
+#
+# WARNING: Once eFuse key is burned, it CANNOT be reversed. The device will
+# permanently require this key to decrypt NVS. Test thoroughly before deploying.
+#
+# For development without encryption, set credentials via serial console at runtime:
+#   > set_ssid MyNetwork
+#   > set_pass MyPassword
+#   > set_token 123456:ABC-DEF
+#   > set_ota_user admin
+#   > set_ota_pass secure_password
+#
+# CONFIG_NVS_ENCRYPTION=y
+# CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=1
 
 # OTA: enable boot tracking + rollback
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
