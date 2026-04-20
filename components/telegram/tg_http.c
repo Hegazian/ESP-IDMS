@@ -42,16 +42,20 @@ void tg_urlenc_append(char *dst, size_t sz, const char *src)
 /*  HTTP helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char *buf; size_t max; size_t got; } resp_ctx_t;
+typedef struct { char *buf; size_t max; size_t got; bool overflow; } resp_ctx_t;
 
 static esp_err_t http_event(esp_http_client_event_t *evt)
 {
     resp_ctx_t *ctx = (resp_ctx_t *)evt->user_data;
     if (!ctx || !ctx->buf) return ESP_OK;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && ctx->got + evt->data_len < ctx->max) {
-        memcpy(ctx->buf + ctx->got, evt->data, evt->data_len);
-        ctx->got += evt->data_len;
-        ctx->buf[ctx->got] = '\0';
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (ctx->got + evt->data_len < ctx->max) {
+            memcpy(ctx->buf + ctx->got, evt->data, evt->data_len);
+            ctx->got += evt->data_len;
+            ctx->buf[ctx->got] = '\0';
+        } else {
+            ctx->overflow = true;
+        }
     }
     return ESP_OK;
 }
@@ -75,7 +79,7 @@ static esp_http_client_handle_t http_new(const char *path, int method,
         .url = url, .method = method,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size = 1024,
+        .buffer_size = 2048,
         .event_handler = r ? http_event : NULL,
         .user_data = r,
     };
@@ -94,7 +98,13 @@ esp_err_t tg_http_post_form(const char *path, const char *body)
     esp_err_t err = esp_http_client_perform(c);
     int st = esp_http_client_get_status_code(c);
     if (err == ESP_OK && (st < 200 || st >= 300)) {
-        ESP_LOGW(TAG, "POST %s → %d", path, st);
+        if (st == 404) {
+            ESP_LOGE(TAG, "POST %s → 404 (bot token is invalid — set correct token via serial: set_token <token>)", path);
+        } else if (st == 401) {
+            ESP_LOGE(TAG, "POST %s → 401 (bot token unauthorized)", path);
+        } else {
+            ESP_LOGW(TAG, "POST %s → %d", path, st);
+        }
         err = ESP_FAIL;
     }
     esp_http_client_cleanup(c);
@@ -109,7 +119,13 @@ esp_err_t tg_http_post_json(const char *path, const char *body)
     esp_err_t err = esp_http_client_perform(c);
     int st = esp_http_client_get_status_code(c);
     if (err == ESP_OK && (st < 200 || st >= 300)) {
-        ESP_LOGW(TAG, "POST %s → %d", path, st);
+        if (st == 404) {
+            ESP_LOGE(TAG, "POST %s → 404 (bot token is invalid — set correct token via serial: set_token <token>)", path);
+        } else if (st == 401) {
+            ESP_LOGE(TAG, "POST %s → 401 (bot token unauthorized)", path);
+        } else {
+            ESP_LOGW(TAG, "POST %s → %d", path, st);
+        }
         err = ESP_FAIL;
     }
     esp_http_client_cleanup(c);
@@ -119,12 +135,26 @@ esp_err_t tg_http_post_json(const char *path, const char *body)
 esp_err_t tg_http_get(const char *path, char *buf, size_t sz, int *st_out)
 {
     if (buf) buf[0] = '\0';
-    resp_ctx_t ctx = { .buf = buf, .max = sz - 1, .got = 0 };
+    resp_ctx_t ctx = { .buf = buf, .max = sz - 1, .got = 0, .overflow = false };
     esp_http_client_handle_t c = http_new(path, HTTP_METHOD_GET, NULL, &ctx, NULL);
-    if (!c) return ESP_FAIL;
+    if (!c) {
+        ESP_LOGE(TAG, "GET %s — failed to create HTTP client (token empty?)", path);
+        if (st_out) *st_out = 0;
+        return ESP_FAIL;
+    }
     esp_err_t err = esp_http_client_perform(c);
     int st = esp_http_client_get_status_code(c);
+    int content_len = esp_http_client_get_content_length(c);
     if (st_out) *st_out = st;
+    if (ctx.overflow) {
+        ESP_LOGW(TAG, "GET %s: response truncated (%d/%d bytes, buffer %zu) — increase buffer size",
+                 path, (int)ctx.got, content_len, sz);
+    }
+    if (st == 404) {
+        ESP_LOGE(TAG, "GET %s → 404 (bot token is invalid)", path);
+    } else if (st == 401) {
+        ESP_LOGE(TAG, "GET %s → 401 (bot token unauthorized)", path);
+    }
     esp_http_client_cleanup(c);
     return err;
 }

@@ -114,7 +114,7 @@ void app_main(void)
     serial_console_start();
 
     ESP_ERROR_CHECK(ota_init());
-    ota_mark_app_valid();
+    ota_schedule_valid_mark(30000);
 
     ESP_LOGI(TAG, "All subsystems started (version: %s)", ota_get_version());
 }

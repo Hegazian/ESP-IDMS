@@ -2,14 +2,6 @@
 
 #include <stddef.h>
 
-/**
- * tg_ui.c — Report builders and inline keyboard definitions.
- *
- * Produces formatted text buffers for status, OTA, and technician reports.
- * Provides keyboard JSON macros for the bot menu system.
- */
-
-/* Inline keyboard JSON definitions — use directly in send_kb() calls */
 #define TG_KB_MAIN \
 "[" \
 "[{\"text\":\"📊 Status\",\"callback_data\":\"cmd_status\"}," \
@@ -28,21 +20,23 @@
 
 #define TG_KB_TECHS \
 "[" \
-"[{\"text\":\"📋 List IDs\",\"callback_data\":\"tech_list\"}]," \
+"[{\"text\":\"📋 List IDs\",\"callback_data\":\"tech_list\"}," \
+" {\"text\":\"❌ Remove ID\",\"callback_data\":\"tech_remove\"}]," \
 "[{\"text\":\"◀️ Back\",\"callback_data\":\"back_main\"}]" \
 "]"
 
-/**
- * Build a status report into buf.
- */
+#define TG_KB_REBOOT_CONFIRM \
+"[" \
+"[{\"text\":\"✅ Yes, Reboot\",\"callback_data\":\"confirm_reboot\"}," \
+" {\"text\":\"❌ Cancel\",\"callback_data\":\"cancel_reboot\"}]" \
+"]"
+
 void tg_build_status(char *buf, size_t sz);
 
-/**
- * Build an OTA report into buf.
- */
 void tg_build_ota(char *buf, size_t sz);
 
-/**
- * Build a technician list report into buf.
- */
 void tg_build_techs(char *buf, size_t sz);
+
+void tg_build_reboot_confirm(char *buf, size_t sz);
+
+void tg_build_tech_remove(char *buf, size_t sz);

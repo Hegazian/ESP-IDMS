@@ -83,7 +83,6 @@ static void send_power_alert(bool loss, float a)
         char msg[ALERT_MSG_BUF_SIZE];
         int written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Machine power loss detected. Current: %.2fA", (double)a);
         if (written > 0 && written < (int)sizeof(msg)) {
-            telegram_broadcast_text(msg);
             uint8_t n = config_get_tech_count();
             for (int i = 0; i < n; i++) {
                 char id[64];
@@ -107,7 +106,6 @@ static void send_cool_alert(bool low_side, float dt)
         written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0C (above maximum).", (double)dt);
     }
     if (written > 0 && written < (int)sizeof(msg)) {
-        telegram_broadcast_text(msg);
         uint8_t n = config_get_tech_count();
         for (int i = 0; i < n; i++) {
             char id[64];

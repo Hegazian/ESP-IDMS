@@ -7,18 +7,23 @@
 #include "esp_app_format.h"
 #include "esp_system.h"
 #include "esp_http_server.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "mbedtls/sha256.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
 #include <string.h>
 #include <stdlib.h>
 
 static const char *TAG = "ota";
 
 #define OTA_RECV_BUFSZ 4096
-#define OTA_NVS_NAMESPACE "ota_state"
+#define TOKEN_EXPIRY_S 300
+#define AUTH_FAIL_LIMIT 5
+#define AUTH_LOCKOUT_S 60
 
-/* Version string built at compile time */
 #ifndef PROJECT_VER
 #define PROJECT_VER "unknown"
 #endif
@@ -26,20 +31,36 @@ static const char *TAG = "ota";
 static char s_version[96];
 static char s_status[32];
 static char s_partition[16];
-static volatile bool s_telegram_trigger = false;
+static esp_ota_handle_t s_ota_handle = 0;
 static volatile bool s_update_in_progress = false;
 
-/* ------------------------------------------------------------------ */
-/*  Basic-auth helper (RFC 7617 — Base64 + constant-time compare)     */
-/* ------------------------------------------------------------------ */
+static char s_cached_user[64] = {0};
+static char s_cached_pass[64] = {0};
+static bool s_creds_cached = false;
+
+static struct {
+    char token[17];
+    uint32_t created_tick;
+} s_ota_token;
+
+static struct {
+    int fail_count;
+    uint32_t locked_until_tick;
+} s_auth_rate;
+
+static void load_cached_creds(void)
+{
+    if (s_creds_cached) return;
+    config_get_ota_user(s_cached_user, sizeof(s_cached_user));
+    config_get_ota_pass(s_cached_pass, sizeof(s_cached_pass));
+    s_creds_cached = true;
+}
 
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static int b64_encode(char *out, size_t out_sz, const uint8_t *in, size_t in_len)
 {
-    if (out_sz < 4 * ((in_len + 2) / 3) + 1) {
-        return -1;
-    }
+    if (out_sz < 4 * ((in_len + 2) / 3) + 1) return -1;
     size_t i = 0, j = 0;
     while (i < in_len) {
         uint32_t octet_a = i < in_len ? in[i++] : 0;
@@ -66,88 +87,160 @@ static bool ct_memcmp(const void *a, const void *b, size_t len)
     return diff == 0;
 }
 
+static bool is_rate_limited(void)
+{
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+    if (s_auth_rate.locked_until_tick > 0 && now < s_auth_rate.locked_until_tick) {
+        return true;
+    }
+    if (s_auth_rate.locked_until_tick > 0 && now >= s_auth_rate.locked_until_tick) {
+        s_auth_rate.locked_until_tick = 0;
+        s_auth_rate.fail_count = 0;
+    }
+    return false;
+}
+
+static void record_auth_fail(void)
+{
+    s_auth_rate.fail_count++;
+    if (s_auth_rate.fail_count >= AUTH_FAIL_LIMIT) {
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+        s_auth_rate.locked_until_tick = now + AUTH_LOCKOUT_S;
+        ESP_LOGW(TAG, "Rate limited: %d auth failures, locked for %d s",
+                 s_auth_rate.fail_count, AUTH_LOCKOUT_S);
+    }
+}
+
+static void record_auth_success(void)
+{
+    s_auth_rate.fail_count = 0;
+    s_auth_rate.locked_until_tick = 0;
+}
+
+bool ota_generate_token(char *out, size_t out_sz)
+{
+    if (!out || out_sz < 17) return false;
+    uint32_t r1 = esp_random();
+    uint32_t r2 = esp_random();
+    snprintf(out, out_sz, "%08lx%08lx", (unsigned long)r1, (unsigned long)r2);
+    s_ota_token.created_tick = xTaskGetTickCount();
+    strncpy(s_ota_token.token, out, sizeof(s_ota_token.token) - 1);
+    s_ota_token.token[sizeof(s_ota_token.token) - 1] = '\0';
+    return true;
+}
+
+bool ota_check_token(const char *token)
+{
+    if (!token || s_ota_token.token[0] == '\0') return false;
+    TickType_t elapsed = (xTaskGetTickCount() - s_ota_token.created_tick) * portTICK_PERIOD_MS;
+    if (elapsed > TOKEN_EXPIRY_S * 1000) {
+        ESP_LOGW(TAG, "OTA token expired");
+        s_ota_token.token[0] = '\0';
+        return false;
+    }
+    if (ct_memcmp(token, s_ota_token.token, strlen(s_ota_token.token))) {
+        s_ota_token.token[0] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static bool extract_token_from_uri(httpd_req_t *req, char *token, size_t token_sz)
+{
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len <= 1) return false;
+    char *buf = malloc(buf_len);
+    if (!buf) return false;
+    if (httpd_req_get_url_query_str(req, buf, buf_len) != ESP_OK) {
+        free(buf);
+        return false;
+    }
+    bool found = false;
+    if (httpd_query_key_value(buf, "token", token, token_sz) == ESP_OK) {
+        found = true;
+    }
+    free(buf);
+    return found;
+}
+
 static bool check_basic_auth(httpd_req_t *req)
 {
+    load_cached_creds();
+
+    if (s_cached_user[0] == '\0' || s_cached_pass[0] == '\0') {
+        ESP_LOGE(TAG, "OTA credentials not configured");
+        return false;
+    }
+
     char auth_header[256];
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth_header, sizeof(auth_header)) != ESP_OK) {
-        ESP_LOGW(TAG, "No Authorization header");
         return false;
     }
-    if (strncmp(auth_header, "Basic ", 6) != 0) {
-        ESP_LOGW(TAG, "Invalid Authorization format");
-        return false;
-    }
+    if (strncmp(auth_header, "Basic ", 6) != 0) return false;
+
     const char *creds = auth_header + 6;
     size_t creds_len = strlen(creds);
 
-    char ota_user[64], ota_pass[64];
-    config_get_ota_user(ota_user, sizeof(ota_user));
-    config_get_ota_pass(ota_pass, sizeof(ota_pass));
-
-    /* Reject if credentials are not configured */
-    if (ota_user[0] == '\0' || ota_pass[0] == '\0') {
-        ESP_LOGE(TAG, "OTA credentials not configured! Use serial console:");
-        ESP_LOGE(TAG, "  > set_ota_user <username>");
-        ESP_LOGE(TAG, "  > set_ota_pass <password>");
-        return false;
-    }
-
-    /* Validate credential lengths to prevent buffer overflow */
-    size_t user_len = strlen(ota_user);
-    size_t pass_len = strlen(ota_pass);
-    if (user_len == 0 || user_len >= sizeof(ota_user) - 1 ||
-        pass_len == 0 || pass_len >= sizeof(ota_pass) - 1) {
-        ESP_LOGE(TAG, "Invalid credential length");
-        return false;
-    }
-
     char expected_creds[256];
-    int written = snprintf(expected_creds, sizeof(expected_creds), "%s:%s", ota_user, ota_pass);
-    if (written < 0 || written >= (int)sizeof(expected_creds)) {
-        ESP_LOGE(TAG, "Credential buffer overflow prevented");
-        return false;
-    }
+    int written = snprintf(expected_creds, sizeof(expected_creds), "%s:%s", s_cached_user, s_cached_pass);
+    if (written < 0 || written >= (int)sizeof(expected_creds)) return false;
 
     char expected_b64[384];
     int n = b64_encode(expected_b64, sizeof(expected_b64),
                        (const uint8_t *)expected_creds, strlen(expected_creds));
-    if (n < 0) {
-        ESP_LOGE(TAG, "Base64 encoding failed");
-        return false;
-    }
+    if (n < 0) return false;
 
     if (creds_len != (size_t)n) {
-        /* Constant-time comparison even on length mismatch to prevent timing attacks */
         ct_memcmp(creds, expected_b64, (creds_len > (size_t)n) ? creds_len : (size_t)n);
         return false;
     }
     return ct_memcmp(creds, expected_b64, (size_t)n);
 }
 
-/* ------------------------------------------------------------------ */
-/*  HTTP OTA upload handler                                            */
-/* ------------------------------------------------------------------ */
+static bool check_auth(httpd_req_t *req)
+{
+    if (is_rate_limited()) {
+        ESP_LOGW(TAG, "Auth rate limited");
+        return false;
+    }
 
-static esp_ota_handle_t s_ota_handle = 0;
-static const esp_partition_t *s_update_part = NULL;
+    char token[32] = {0};
+    if (extract_token_from_uri(req, token, sizeof(token))) {
+        if (ota_check_token(token)) {
+            record_auth_success();
+            return true;
+        }
+        ESP_LOGW(TAG, "Invalid or expired OTA token");
+    }
 
-/* Simple multipart parser — finds the file part boundary and streams it to OTA */
+    if (check_basic_auth(req)) {
+        record_auth_success();
+        return true;
+    }
+
+    record_auth_fail();
+    return false;
+}
+
+static void send_401(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP-IDMS OTA\"");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Authentication required");
+}
 
 static bool is_end_boundary(const char *line, const char *boundary)
 {
-    if (strncmp(line, boundary, strlen(boundary)) != 0) {
-        return false;
-    }
+    if (strncmp(line, boundary, strlen(boundary)) != 0) return false;
     const char *after = line + strlen(boundary);
     return (strncmp(after, "--", 2) == 0);
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
-    if (!check_basic_auth(req)) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_type(req, "text/plain");
-        httpd_resp_sendstr(req, "Authentication required");
+    if (!check_auth(req)) {
+        send_401(req);
         return ESP_OK;
     }
 
@@ -158,7 +251,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Get Content-Type to extract boundary */
     char content_type[256];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -174,17 +266,15 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "Missing boundary in Content-Type");
         return ESP_OK;
     }
-    boundary_start += 9; /* skip "boundary=" */
+    boundary_start += 9;
 
     char boundary[128];
     snprintf(boundary, sizeof(boundary), "--%s", boundary_start);
-    /* Strip trailing whitespace / quotes */
     size_t blen = strlen(boundary);
     while (blen > 0 && (boundary[blen - 1] == '\r' || boundary[blen - 1] == '\n' || boundary[blen - 1] == '\"')) {
         boundary[--blen] = '\0';
     }
 
-    /* Optional: client can send X-Expected-SHA256 header for integrity verification */
     char expected_sha256[65] = {0};
     bool has_expected_hash = false;
     if (httpd_req_get_hdr_value_str(req, "X-Expected-SHA256", expected_sha256, sizeof(expected_sha256)) == ESP_OK) {
@@ -194,7 +284,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "OTA upload started, boundary: %s", boundary);
 
-    /* Determine target partition */
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) {
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -203,7 +292,9 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx", update->label, (unsigned long)update->address);
+    uint32_t max_size = update->size;
+    ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx (max %lu bytes)",
+             update->label, (unsigned long)update->address, (unsigned long)max_size);
 
     esp_err_t err = esp_ota_begin(update, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
     if (err != ESP_OK) {
@@ -214,10 +305,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    s_update_part = update;
     s_update_in_progress = true;
 
-    /* Initialize SHA256 digest for integrity verification */
     mbedtls_sha256_context sha256_ctx;
     mbedtls_sha256_init(&sha256_ctx);
     mbedtls_sha256_starts(&sha256_ctx, 0);
@@ -239,30 +328,26 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     char line_buf[256];
     size_t line_pos = 0;
     bool upload_ok = true;
+    esp_ota_handle_t ota_h = s_ota_handle;
 
     while ((recv_len = httpd_req_recv(req, buf, OTA_RECV_BUFSZ)) > 0) {
         int buf_offset = 0;
 
         while (buf_offset < recv_len) {
             if (!in_file_data) {
-                /* Parse lines looking for multipart boundaries */
                 while (buf_offset < recv_len && line_pos < sizeof(line_buf) - 1) {
                     char c = buf[buf_offset++];
                     line_buf[line_pos++] = c;
                     if (c == '\n') {
                         line_buf[line_pos] = '\0';
-
                         if (strncmp(line_buf, boundary, strlen(boundary)) == 0) {
                             if (is_end_boundary(line_buf, boundary)) {
-                                /* End of multipart — done */
                                 goto upload_complete;
                             }
-                            /* Start of a new part — reset */
                             in_file_data = false;
                             skip_headers = true;
                             line_pos = 0;
                         } else if (skip_headers) {
-                            /* Empty line = end of headers for this part */
                             if (line_pos <= 2) {
                                 skip_headers = false;
                                 in_file_data = true;
@@ -273,38 +358,36 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                     }
                 }
             } else {
-                /* Inside the file part — stream data to OTA until next boundary */
                 int write_start = buf_offset;
                 size_t remaining = recv_len - buf_offset;
 
-                /* Search for boundary in remaining data */
                 char *found = memmem(buf + buf_offset, remaining, boundary, strlen(boundary));
                 if (found) {
                     size_t before = (size_t)(found - buf);
                     if (before > (size_t)write_start) {
                         size_t chunk = before - write_start;
-                        err = esp_ota_write(s_ota_handle, buf + write_start, chunk);
-                        if (err != ESP_OK) {
-                            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                        if (total + chunk > max_size) {
+                            ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + chunk, (unsigned long)max_size);
                             upload_ok = false;
                             goto upload_complete;
                         }
+                        err = esp_ota_write(ota_h, buf + write_start, chunk);
+                        if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
                         mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), chunk);
                         total += chunk;
                     }
-                    /* Resume boundary parsing from the boundary */
                     in_file_data = false;
                     skip_headers = true;
                     line_pos = 0;
                     buf_offset = (int)before;
                 } else {
-                    /* No boundary — write entire remaining chunk */
-                    err = esp_ota_write(s_ota_handle, buf + write_start, remaining);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                    if (total + remaining > max_size) {
+                        ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + remaining, (unsigned long)max_size);
                         upload_ok = false;
                         goto upload_complete;
                     }
+                    err = esp_ota_write(ota_h, buf + write_start, remaining);
+                    if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
                     mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), remaining);
                     total += remaining;
                     buf_offset = recv_len;
@@ -315,16 +398,13 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 upload_complete:
     if (recv_len < 0 && upload_ok) {
-        /* Connection dropped before end — treat as failure */
         upload_ok = false;
     }
 
-    /* Finalize SHA256 */
     unsigned char sha256_hash[32];
     mbedtls_sha256_finish(&sha256_ctx, sha256_hash);
     mbedtls_sha256_free(&sha256_ctx);
 
-    /* Convert SHA256 to hex string */
     char sha256_hex[65];
     for (int i = 0; i < 32; i++) {
         snprintf(sha256_hex + i * 2, 3, "%02x", sha256_hash[i]);
@@ -332,23 +412,22 @@ upload_complete:
     sha256_hex[64] = '\0';
 
     if (!upload_ok) {
-        esp_ota_abort(s_ota_handle);
+        esp_ota_abort(ota_h);
         s_ota_handle = 0;
         s_update_in_progress = false;
         free(buf);
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
-        char msg[80];
+        char msg[128];
         snprintf(msg, sizeof(msg), "Upload failed (received %zu bytes)", total);
         httpd_resp_sendstr(req, msg);
         return ESP_OK;
     }
 
-    /* Verify SHA256 if client provided expected hash */
     if (has_expected_hash) {
         if (!ct_memcmp(expected_sha256, sha256_hex, 64)) {
             ESP_LOGE(TAG, "SHA256 mismatch: expected %s, got %s", expected_sha256, sha256_hex);
-            esp_ota_abort(s_ota_handle);
+            esp_ota_abort(ota_h);
             s_ota_handle = 0;
             s_update_in_progress = false;
             free(buf);
@@ -366,8 +445,7 @@ upload_complete:
         ESP_LOGI(TAG, "Upload SHA256: %s (no client verification requested)", sha256_hex);
     }
 
-    /* Finalize OTA */
-    err = esp_ota_end(s_ota_handle);
+    err = esp_ota_end(ota_h);
     s_ota_handle = 0;
     s_update_in_progress = false;
     free(buf);
@@ -380,7 +458,8 @@ upload_complete:
         return ESP_OK;
     }
 
-    err = esp_ota_set_boot_partition(s_update_part);
+    const esp_partition_t *update_part = update;
+    err = esp_ota_set_boot_partition(update_part);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -398,22 +477,21 @@ upload_complete:
              total, sha256_hex);
     httpd_resp_sendstr(req, msg);
 
-    /* Notify technicians via Telegram */
-    telegram_broadcast_text("🔄 OTA update successful. Rebooting into new firmware.");
+    telegram_broadcast_text("\xf0\x9f\x9b\x9c OTA update successful. Rebooting into new firmware.");
 
-    /* Delay so the HTTP response is sent, then reboot */
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 
     return ESP_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/*  HTTP status / info endpoint                                        */
-/* ------------------------------------------------------------------ */
-
 static esp_err_t ota_info_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+
     httpd_resp_set_type(req, "application/json");
 
     char body[768];
@@ -421,7 +499,6 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
     esp_app_desc_t app_desc;
     esp_ota_get_partition_description(running, &app_desc);
 
-    /* Compute SHA256 of running partition */
     char sha256_hex[65] = {0};
     unsigned char hash[32];
     if (esp_partition_get_sha256(running, hash) == ESP_OK) {
@@ -458,12 +535,13 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Simple HTML upload page                                            */
-/* ------------------------------------------------------------------ */
-
 static esp_err_t ota_page_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+
 #if CONFIG_IDMS_OTA_HTTPS_ENABLE
     const char *proto_note = "<p>Connection is TLS-encrypted (self-signed certificate — accept browser warning).</p>";
 #else
@@ -489,7 +567,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         "<input type=\"file\" name=\"firmware\" accept=\".bin\" required><br>"
         "<input type=\"submit\" value=\"Upload &amp; Update\">"
         "</form>"
-        "<p class=\"warn\">⚠ The device will reboot after a successful update.</p>"
+        "<p class=\"warn\">&#9888; The device will reboot after a successful update.</p>"
         "</body></html>";
 
     char *html = malloc(2048);
@@ -504,34 +582,15 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Server startup (HTTP or HTTPS based on Kconfig)                   */
-/* ------------------------------------------------------------------ */
-
 static void register_uri_handlers(httpd_handle_t server)
 {
-    httpd_uri_t page_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = ota_page_handler,
-        .user_ctx = NULL,
-    };
+    httpd_uri_t page_uri = { .uri = "/", .method = HTTP_GET, .handler = ota_page_handler };
     httpd_register_uri_handler(server, &page_uri);
 
-    httpd_uri_t upload_uri = {
-        .uri = "/",
-        .method = HTTP_POST,
-        .handler = ota_upload_handler,
-        .user_ctx = NULL,
-    };
+    httpd_uri_t upload_uri = { .uri = "/", .method = HTTP_POST, .handler = ota_upload_handler };
     httpd_register_uri_handler(server, &upload_uri);
 
-    httpd_uri_t info_uri = {
-        .uri = "/info",
-        .method = HTTP_GET,
-        .handler = ota_info_handler,
-        .user_ctx = NULL,
-    };
+    httpd_uri_t info_uri = { .uri = "/info", .method = HTTP_GET, .handler = ota_info_handler };
     httpd_register_uri_handler(server, &info_uri);
 }
 
@@ -596,10 +655,6 @@ static esp_err_t start_ota_http_server(uint16_t port)
 
 #endif
 
-/* ------------------------------------------------------------------ */
-/*  Boot validation / rollback check                                   */
-/* ------------------------------------------------------------------ */
-
 static void check_boot_state(void)
 {
     esp_ota_img_states_t state;
@@ -608,10 +663,8 @@ static void check_boot_state(void)
 
     if (err == ESP_OK) {
         if (state == ESP_OTA_IMG_PENDING_VERIFY) {
-            /* This is the first boot after an OTA — mark as valid */
-            ESP_LOGI(TAG, "First boot after OTA on %s — marking as valid", running->label);
-            esp_ota_mark_app_valid_cancel_rollback();
-            strncpy(s_status, "ready", sizeof(s_status) - 1);
+            ESP_LOGI(TAG, "First boot after OTA on %s — will validate before marking valid", running->label);
+            strncpy(s_status, "validating", sizeof(s_status) - 1);
         } else if (state == ESP_OTA_IMG_ABORTED) {
             strncpy(s_status, "rollback occurred", sizeof(s_status) - 1);
             ESP_LOGW(TAG, "Previous OTA was aborted — rolled back to %s", running->label);
@@ -624,10 +677,6 @@ static void check_boot_state(void)
 
     strncpy(s_partition, running->label, sizeof(s_partition) - 1);
 }
-
-/* ------------------------------------------------------------------ */
-/*  Version string construction                                        */
-/* ------------------------------------------------------------------ */
 
 static void build_version_string(void)
 {
@@ -649,12 +698,19 @@ static void build_version_string(void)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Public API                                                         */
-/* ------------------------------------------------------------------ */
+static void valid_mark_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+    esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "App marked valid after delay — rollback cancelled");
+    strncpy(s_status, "ready", sizeof(s_status) - 1);
+}
 
 esp_err_t ota_init(void)
 {
+    memset(&s_ota_token, 0, sizeof(s_ota_token));
+    memset(&s_auth_rate, 0, sizeof(s_auth_rate));
+
     build_version_string();
     check_boot_state();
 
@@ -672,41 +728,45 @@ esp_err_t ota_init(void)
     return ESP_OK;
 }
 
-const char *ota_get_version(void)
-{
-    return s_version;
-}
+const char *ota_get_version(void) { return s_version; }
 
 const char *ota_get_status(void)
 {
-    if (s_update_in_progress) {
-        return "updating";
-    }
+    if (s_update_in_progress) return "updating";
     return s_status;
 }
 
-const char *ota_get_partition(void)
-{
-    return s_partition;
-}
+const char *ota_get_partition(void) { return s_partition; }
 
 void ota_mark_app_valid(void)
 {
     esp_ota_mark_app_valid_cancel_rollback();
     ESP_LOGI(TAG, "App marked valid — rollback cancelled");
+    strncpy(s_status, "ready", sizeof(s_status) - 1);
 }
 
-void ota_trigger_from_telegram(void)
+void ota_schedule_valid_mark(uint32_t delay_ms)
 {
-    s_telegram_trigger = true;
-    ESP_LOGI(TAG, "OTA update requested via Telegram");
-}
-
-bool ota_is_requested(void)
-{
-    if (s_telegram_trigger) {
-        s_telegram_trigger = false;
-        return true;
+    esp_ota_img_states_t state;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        TimerHandle_t timer = xTimerCreate("ota_valid", pdMS_TO_TICKS(delay_ms),
+                                           pdFALSE, NULL, valid_mark_timer_cb);
+        if (timer) {
+            xTimerStart(timer, 0);
+            ESP_LOGI(TAG, "OTA valid mark scheduled in %lu ms", (unsigned long)delay_ms);
+        } else {
+            ESP_LOGE(TAG, "Failed to create OTA valid mark timer");
+            ota_mark_app_valid();
+        }
+    } else {
+        ota_mark_app_valid();
     }
-    return false;
+}
+
+uint32_t ota_get_max_app_size(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    return running ? running->size : 0;
 }

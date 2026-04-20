@@ -9,6 +9,7 @@ set(priv_requires
     telegram
     mbedtls
     core
+    freertos
 )
 
 if(CONFIG_IDMS_OTA_HTTPS_ENABLE)
