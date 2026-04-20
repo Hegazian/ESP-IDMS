@@ -2,11 +2,11 @@ menu "ESP-IDMS Configuration"
 
     config IDMS_WIFI_SSID
         string "Wi-Fi SSID"
-        default "POCO F3"
+        default ""
 
     config IDMS_WIFI_PASSWORD
         string "Wi-Fi password"
-        default "12345678"
+        default ""
 
     config IDMS_TELEGRAM_BOT_TOKEN
         string "Telegram bot token (empty disables outbound messages)"
@@ -15,6 +15,8 @@ menu "ESP-IDMS Configuration"
     config IDMS_DEFAULT_TECH_CHAT_ID
         string "Default technician Telegram chat_id (copied to NVS on first boot if empty)"
         default ""
+        help
+            Optional default technician chat ID. If empty, add technicians via serial console or Telegram.
 
     config IDMS_CURRENT_THRESHOLD_MA
         int "RMS current below this = machine off (milliamps)"
@@ -143,6 +145,14 @@ choice IDMS_DISPLAY_CONTROLLER
                 3.5" 320x480 ILI9488 TFT display.
                 Alternative controller found on some 3.5" modules.
                 Uses built-in driver in components/drivers/esp_lcd_ili9488.
+
+        config IDMS_DISPLAY_TOPWAY
+            bool "Topway Smart LCD (UART, 800x480)"
+            help
+                Topway Smart LCD module with built-in graphics engine.
+                Uses UART serial interface with command protocol.
+                800x480 resolution. Does NOT use LVGL - uses Topway native commands.
+                Set IM pins to 111 if using SPI mode on the display.
     endchoice
 
     # ------------------------------------------------------------------
@@ -334,11 +344,45 @@ config IDMS_LCD_HOST
         bool "Mirror Y"
         default n
 
+    # ------------------------------------------------------------------
+    #  UART pins for Topway Smart LCD
+    # ------------------------------------------------------------------
+
+    config IDMS_PIN_UART_TX
+        int "UART TX GPIO for Topway Smart LCD"
+        range 0 48
+        default 17 if IDF_TARGET_ESP32S3
+        default 1 if IDF_TARGET_ESP32
+        default 17
+        help
+            TX pin for UART communication with Topway Smart LCD.
+            ESP32-S3: Safe pins include 1-18, 21-25, 33-42, 47-48.
+
+    config IDMS_PIN_UART_RX
+        int "UART RX GPIO for Topway Smart LCD"
+        range 0 48
+        default 18 if IDF_TARGET_ESP32S3
+        default 3 if IDF_TARGET_ESP32
+        default 18
+        help
+            RX pin for UART communication with Topway Smart LCD.
+            ESP32-S3: Safe pins include 1-18, 21-25, 33-42, 47-48.
+
+    config IDMS_TOPWAY_BAUD
+        int "Topway UART baud rate"
+        range 9600 921600
+        default 115200
+        depends on IDMS_DISPLAY_TOPWAY
+        help
+            Baud rate for UART communication with Topway Smart LCD.
+            Default 115200. Check your display documentation for supported rates.
+
     config IDMS_UI_ENABLE
         bool "Enable LVGL + display UI"
         default y
         help
             When disabled, the firmware runs without the display stack (monitoring + Telegram still active).
+            Note: Topway displays use native UI (no LVGL).
 
     menu "OTA Firmware Update"
 
@@ -365,17 +409,19 @@ config IDMS_LCD_HOST
 
         config IDMS_OTA_HTTP_AUTH_USER
             string "OTA HTTP admin username"
-            default "admin"
+            default ""
             help
                 HTTP basic auth username for OTA upload endpoint.
-                Can be overridden at runtime via serial console: set_ota_user <name>
+                If empty, must be set via serial console before first OTA update:
+                > set_ota_user <username>
 
         config IDMS_OTA_HTTP_AUTH_PASS
             string "OTA HTTP admin password"
-            default "ota_admin"
+            default ""
             help
                 HTTP basic auth password for OTA upload endpoint.
-                Can be overridden at runtime via serial console: set_ota_pass <pass>
+                If empty, must be set via serial console before first OTA update:
+                > set_ota_pass <password>
 
         config IDMS_OTA_TELEGRAM_COMMAND
             bool "Enable OTA trigger via Telegram command"

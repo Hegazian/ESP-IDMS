@@ -20,7 +20,7 @@
 #include "esp_lcd_ili9488.h"
 #endif
 #if CONFIG_IDMS_LCD_BUS_I80
-#include "esp_lcd_panel_io_i80.h"
+#include "esp_lcd_io_i80.h"
 #endif
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -107,6 +107,9 @@ static bool on_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_
 
 static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
+    static int flush_count = 0;
+    flush_count++;
+    
 #if CONFIG_IDMS_DISPLAY_ILI9341
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
     int x1 = area->x1;
@@ -121,10 +124,21 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *colo
     int y2 = area->y2 + 1;
     uint8_t col[4] = { (x1 >> 8) & 0xFF, x1 & 0xFF, ((x2 - 1) >> 8) & 0xFF, (x2 - 1) & 0xFF };
     uint8_t row[4] = { (y1 >> 8) & 0xFF, y1 & 0xFF, ((y2 - 1) >> 8) & 0xFF, (y2 - 1) & 0xFF };
-    esp_lcd_panel_io_tx_param(s_io, 0x2A, col, 4);
-    esp_lcd_panel_io_tx_param(s_io, 0x2B, row, 4);
+    
+    if (flush_count <= 5 || flush_count % 50 == 0) {
+        ESP_LOGI(TAG, "flush #%d: area(%d,%d)-(%d,%d), len=%zu", 
+                 flush_count, area->x1, area->y1, area->x2, area->y2,
+                 (x2 - x1) * (y2 - y1) * sizeof(lv_color_t));
+    }
+    
+    esp_err_t err;
+    err = esp_lcd_panel_io_tx_param(s_io, 0x2A, col, 4);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "CASET failed"); return; }
+    err = esp_lcd_panel_io_tx_param(s_io, 0x2B, row, 4);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "RASET failed"); return; }
     size_t len = (x2 - x1) * (y2 - y1) * sizeof(lv_color_t);
-    esp_lcd_panel_io_tx_color(s_io, 0x2C, color_map, len);
+    err = esp_lcd_panel_io_tx_color(s_io, 0x2C, color_map, len);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "RAMWR failed"); return; }
 #endif
 }
 
@@ -481,54 +495,41 @@ void idms_ui_init(void)
     ESP_ERROR_CHECK(ili9488_lcd_init(s_io));
 #endif
 
-#if CONFIG_IDMS_LCD_SWAP_XY
-    uint8_t madctl_swap = 0x00;
-    madctl_swap |= (1 << 3); /* BGR */
-    madctl_swap |= (1 << 5); /* MV: row/column exchange (landscape) */
-    if (CONFIG_IDMS_LCD_MIRROR_X) madctl_swap |= (1 << 6); /* MX */
-    if (CONFIG_IDMS_LCD_MIRROR_Y) madctl_swap |= (1 << 7); /* MY */
-    esp_lcd_panel_io_tx_param(s_io, 0x36, &madctl_swap, 1);
-    uint8_t col_landscape[4] = {0x00, 0x00, 0x01, 0xDF}; /* 0..479 */
-    uint8_t row_landscape[4] = {0x00, 0x00, 0x01, 0x3F}; /* 0..319 */
-    esp_lcd_panel_io_tx_param(s_io, 0x2A, col_landscape, 4);
-    esp_lcd_panel_io_tx_param(s_io, 0x2B, row_landscape, 4);
-#if CONFIG_IDMS_DISPLAY_ST7796S
-    ESP_LOGI(TAG, "ST7796 landscape: MADCTL=0x%02X", madctl_swap);
-#elif CONFIG_IDMS_DISPLAY_ILI9488
-    ESP_LOGI(TAG, "ILI9488 landscape: MADCTL=0x%02X", madctl_swap);
-#endif
-#else
+    /* MADCTL is already set by driver init with MV bit for landscape.
+     * Only apply mirror overrides if needed. */
     if (CONFIG_IDMS_LCD_MIRROR_X || CONFIG_IDMS_LCD_MIRROR_Y) {
         uint8_t madctl_mirror = 0x00;
         madctl_mirror |= (1 << 3); /* BGR */
+        madctl_mirror |= (1 << 5); /* MV: keep landscape rotation */
         if (CONFIG_IDMS_LCD_MIRROR_X) madctl_mirror |= (1 << 6); /* MX */
         if (CONFIG_IDMS_LCD_MIRROR_Y) madctl_mirror |= (1 << 7); /* MY */
         esp_lcd_panel_io_tx_param(s_io, 0x36, &madctl_mirror, 1);
+        ESP_LOGI(TAG, "Applied mirror MADCTL=0x%02X", madctl_mirror);
     }
-#endif
     s_panel = NULL;
 
+    /* Color test - quick verification that display works */
 #if CONFIG_IDMS_DISPLAY_ST7796S
 #if CONFIG_IDMS_LCD_BUS_SPI
     st7796s_lcd_test_read_id(s_io);
 #endif
-    st7796s_lcd_fill_color(s_io, 0xF800, 320, 480);
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    st7796s_lcd_fill_color(s_io, 0x07E0, 320, 480);
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    st7796s_lcd_fill_color(s_io, 0x001F, 320, 480);
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    st7796s_lcd_fill_color(s_io, 0x0000, 320, 480);
+    st7796s_lcd_fill_color(s_io, 0xF800, LCD_H_RES, LCD_V_RES);
     vTaskDelay(pdMS_TO_TICKS(500));
+    st7796s_lcd_fill_color(s_io, 0x07E0, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    st7796s_lcd_fill_color(s_io, 0x001F, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    st7796s_lcd_fill_color(s_io, 0x0000, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(100));
 #elif CONFIG_IDMS_DISPLAY_ILI9488
     ili9488_lcd_fill_color(s_io, 0xF800, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ili9488_lcd_fill_color(s_io, 0x07E0, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ili9488_lcd_fill_color(s_io, 0x001F, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ili9488_lcd_fill_color(s_io, 0x0000, LCD_H_RES, LCD_V_RES);
     vTaskDelay(pdMS_TO_TICKS(500));
+    ili9488_lcd_fill_color(s_io, 0x07E0, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ili9488_lcd_fill_color(s_io, 0x001F, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ili9488_lcd_fill_color(s_io, 0x0000, LCD_H_RES, LCD_V_RES);
+    vTaskDelay(pdMS_TO_TICKS(100));
 #endif
 #endif
 

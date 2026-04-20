@@ -70,9 +70,11 @@ static bool check_basic_auth(httpd_req_t *req)
 {
     char auth_header[256];
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth_header, sizeof(auth_header)) != ESP_OK) {
+        ESP_LOGW(TAG, "No Authorization header");
         return false;
     }
     if (strncmp(auth_header, "Basic ", 6) != 0) {
+        ESP_LOGW(TAG, "Invalid Authorization format");
         return false;
     }
     const char *creds = auth_header + 6;
@@ -82,16 +84,40 @@ static bool check_basic_auth(httpd_req_t *req)
     config_get_ota_user(ota_user, sizeof(ota_user));
     config_get_ota_pass(ota_pass, sizeof(ota_pass));
 
+    /* Reject if credentials are not configured */
+    if (ota_user[0] == '\0' || ota_pass[0] == '\0') {
+        ESP_LOGE(TAG, "OTA credentials not configured! Use serial console:");
+        ESP_LOGE(TAG, "  > set_ota_user <username>");
+        ESP_LOGE(TAG, "  > set_ota_pass <password>");
+        return false;
+    }
+
+    /* Validate credential lengths to prevent buffer overflow */
+    size_t user_len = strlen(ota_user);
+    size_t pass_len = strlen(ota_pass);
+    if (user_len == 0 || user_len >= sizeof(ota_user) - 1 ||
+        pass_len == 0 || pass_len >= sizeof(ota_pass) - 1) {
+        ESP_LOGE(TAG, "Invalid credential length");
+        return false;
+    }
+
     char expected_creds[256];
-    snprintf(expected_creds, sizeof(expected_creds), "%s:%s", ota_user, ota_pass);
+    int written = snprintf(expected_creds, sizeof(expected_creds), "%s:%s", ota_user, ota_pass);
+    if (written < 0 || written >= (int)sizeof(expected_creds)) {
+        ESP_LOGE(TAG, "Credential buffer overflow prevented");
+        return false;
+    }
+
     char expected_b64[384];
     int n = b64_encode(expected_b64, sizeof(expected_b64),
                        (const uint8_t *)expected_creds, strlen(expected_creds));
     if (n < 0) {
+        ESP_LOGE(TAG, "Base64 encoding failed");
         return false;
     }
 
     if (creds_len != (size_t)n) {
+        /* Constant-time comparison even on length mismatch to prevent timing attacks */
         ct_memcmp(creds, expected_b64, (creds_len > (size_t)n) ? creds_len : (size_t)n);
         return false;
     }

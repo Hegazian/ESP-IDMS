@@ -105,14 +105,25 @@ esp_err_t config_add_tech_id(const char *id)
     if (!id || id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* Validate ID length to prevent buffer overflow */
+    size_t id_len = strlen(id);
+    if (id_len < 3 || id_len >= 60) {
+        ESP_LOGE(TAG, "Invalid technician ID length: %zu (must be 3-59 chars)", id_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     uint8_t count = config_get_tech_count();
     if (count >= 5) {
+        ESP_LOGW(TAG, "Maximum technician IDs (5) reached");
         return ESP_ERR_NO_MEM;
     }
 
+    /* Check for duplicates */
     for (int i = 0; i < count; i++) {
         char existing[64];
         if (config_get_tech_id(i, existing, sizeof(existing)) == ESP_OK && strcmp(existing, id) == 0) {
+            ESP_LOGI(TAG, "Technician ID already exists: %s", id);
             return ESP_OK;
         }
     }
@@ -126,6 +137,9 @@ esp_err_t config_add_tech_id(const char *id)
         err = nvs_commit(h);
     }
     nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Added technician ID: %s (count: %u)", id, count);
+    }
     return err;
 }
 

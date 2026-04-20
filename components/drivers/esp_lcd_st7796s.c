@@ -20,7 +20,7 @@ static esp_err_t send_data(esp_lcd_panel_io_handle_t io, uint8_t cmd, const uint
 
 esp_err_t st7796s_lcd_init(esp_lcd_panel_io_handle_t io)
 {
-    ESP_LOGI(TAG, "Initializing ST7796 LCD (320x480)");
+    ESP_LOGI(TAG, "Initializing ST7796 LCD (480x320 landscape)");
 
     /* Software Reset */
     send_cmd(io, 0x01);
@@ -30,9 +30,10 @@ esp_err_t st7796s_lcd_init(esp_lcd_panel_io_handle_t io)
     send_cmd(io, 0x11);
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    /* Memory Data Access Control: BGR */
+    /* Memory Data Access Control: BGR + MV (landscape rotation) */
     uint8_t madctl = 0x00;
     madctl |= (1 << 3); /* BGR */
+    madctl |= (1 << 5); /* MV: row/column exchange for landscape */
     send_data(io, 0x36, &madctl, 1);
 
     /* Interface Pixel Format: 16-bit RGB565 */
@@ -78,21 +79,45 @@ esp_err_t st7796s_lcd_init(esp_lcd_panel_io_handle_t io)
         (uint8_t[]){0xD0, 0x08, 0x0E, 0x09, 0x09, 0x15, 0x31, 0x33,
                      0x48, 0x17, 0x14, 0x15, 0x31, 0x34}, 14);
 
-    /* Column Address Set: 0..319 */
-    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0x3F}, 4);
+    /* Column Address Set: 0..479 (landscape width) */
+    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4);
 
-    /* Row Address Set: 0..479 */
-    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4);
+    /* Row Address Set: 0..319 (landscape height) */
+    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0x3F}, 4);
 
-    /* NOTE: Inversion OFF for now - try both IPS and TFT modes */
-    /* Do NOT enable inversion (0x21) — white screen may be caused by wrong inversion */
-    /* If display shows colors inverted, we'll enable it later */
-
-    /* Display On */
+    /* Display On first */
     send_cmd(io, 0x29);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    ESP_LOGI(TAG, "ST7796 initialized (MADCTL=0x%02X, inversion=OFF)", madctl);
+    /* Then Enable Color Inversion - CRITICAL: Most TFT panels need this ON */
+    send_cmd(io, 0x21);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Turn on backlight control (if available) */
+    send_cmd(io, 0x53); /* Write CTRL Display */
+    {
+        uint8_t ctrl = 0x24; /* BL=1, D=1 */
+        send_data(io, 0x53, &ctrl, 1);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Test: Write a small red rectangle to verify SPI is working */
+    ESP_LOGI(TAG, "Writing test pattern to verify SPI...");
+    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x00, 0x4F}, 4);  /* Column: 0-79 */
+    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x00, 0x4F}, 4);  /* Row: 0-79 */
+    
+    /* Fill 80x80 = 6400 pixels with red (0xF800) */
+    uint16_t *test_buf = heap_caps_malloc(6400 * 2, MALLOC_CAP_DMA);
+    if (test_buf) {
+        for (int i = 0; i < 6400; i++) test_buf[i] = 0xF800; /* Red */
+        send_cmd(io, 0x2C); /* Memory Write */
+        esp_lcd_panel_io_tx_color(io, 0x2C, test_buf, 6400 * 2);
+        free(test_buf);
+        ESP_LOGI(TAG, "Test pattern sent (red 80x80 rect)");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "ST7796 initialized (MADCTL=0x%02X, inversion=ON)", madctl);
     return ESP_OK;
 }
 

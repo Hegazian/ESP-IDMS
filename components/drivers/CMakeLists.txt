@@ -16,6 +16,10 @@ if(CONFIG_IDMS_DISPLAY_ILI9488)
     list(APPEND driver_srcs "esp_lcd_ili9488.c")
 endif()
 
+if(CONFIG_IDMS_DISPLAY_TOPWAY)
+    list(APPEND driver_srcs "topway_lcd.c")
+endif()
+
 idf_component_register(
     SRCS ${driver_srcs}
     INCLUDE_DIRS "include"

@@ -21,7 +21,7 @@ static esp_err_t send_data(esp_lcd_panel_io_handle_t io, uint8_t cmd, const uint
 
 esp_err_t ili9488_lcd_init(esp_lcd_panel_io_handle_t io)
 {
-    ESP_LOGI(TAG, "Initializing ILI9488 LCD (320x480)");
+    ESP_LOGI(TAG, "Initializing ILI9488 LCD (480x320 landscape)");
 
     /* Software Reset */
     send_cmd(io, 0x01);
@@ -31,18 +31,18 @@ esp_err_t ili9488_lcd_init(esp_lcd_panel_io_handle_t io)
     send_cmd(io, 0x11);
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    /* Interface Pixel Format: 16-bit RGB565 (0x55) or 18-bit (0x66) */
-    /* Use 16-bit for SPI RGB565 */
+    /* Interface Pixel Format: 16-bit RGB565 (0x55) */
     uint8_t pixfmt = 0x55;
     send_data(io, 0x3A, &pixfmt, 1);
 
-    /* Memory Data Access Control: BGR */
+    /* Memory Data Access Control: BGR + MV (landscape rotation) */
     uint8_t madctl = 0x00;
     madctl |= (1 << 3); /* BGR */
+    madctl |= (1 << 5); /* MV: row/column exchange for landscape */
     send_data(io, 0x36, &madctl, 1);
 
     /* Porch Setting - Normal mode */
-    send_data(io, 0xF2, (uint8_t[]){0x00}, 1); /* Porch adjustment: disable */
+    send_data(io, 0xF2, (uint8_t[]){0x00}, 1);
 
     /* Frame Rate Control: 60Hz */
     send_data(io, 0xB4, (uint8_t[]){0x00, 0x00, 0x00}, 3);
@@ -69,20 +69,21 @@ esp_err_t ili9488_lcd_init(esp_lcd_panel_io_handle_t io)
         (uint8_t[]){0x00, 0x28, 0x25, 0x01, 0x0E, 0x04, 0x48, 0x84,
                      0x42, 0x04, 0x0C, 0x02, 0x00, 0x00, 0x00, 0x00}, 16);
 
-    /* Column Address Set: 0..319 */
-    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0x3F}, 4);
+    /* Column Address Set: 0..479 (landscape width) */
+    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4);
 
-    /* Row Address Set: 0..479 */
-    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4);
+    /* Row Address Set: 0..319 (landscape height) */
+    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0x3F}, 4);
+
+    /* Enable Color Inversion - CRITICAL: Most TFT panels need this ON */
+    send_cmd(io, 0x21);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     /* Display On */
     send_cmd(io, 0x29);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* Inversion OFF for TFT panels — some ILI9488 panels need it ON */
-    /* Try OFF first; if colors look inverted, enable 0x21 */
-
-    ESP_LOGI(TAG, "ILI9488 initialized (MADCTL=0x%02X)", madctl);
+    ESP_LOGI(TAG, "ILI9488 initialized (MADCTL=0x%02X, inversion=ON)", madctl);
     return ESP_OK;
 }
 

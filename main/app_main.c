@@ -5,15 +5,19 @@
 #include "config_store.h"
 #include "wifi_manager.h"
 #include "monitor.h"
+
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+#include "ui_topway.h"
+#else
 #include "ui_lvgl.h"
+#endif
+
 #include "telegram.h"
 #include "ota.h"
 #include "serial_console.h"
 #include "pins.h"
 
 #if CONFIG_IDMS_LCD_BUS_SPI
-#include "lcd_diag.h"
-#elif CONFIG_IDMS_LCD_BUS_I80
 #include "lcd_diag.h"
 #endif
 
@@ -27,10 +31,16 @@ static const char *TAG = "app";
 
 static void init_spi_bus(void)
 {
+#if CONFIG_IDMS_LCD_BUS_SPI
+    int miso_pin = CONFIG_IDMS_PIN_LCD_MISO;
+#else
+    int miso_pin = -1;  /* I80 mode doesn't use SPI MISO */
+#endif
+
     spi_bus_config_t buscfg = {
         .sclk_io_num = CONFIG_IDMS_PIN_LCD_SCLK,
         .mosi_io_num = CONFIG_IDMS_PIN_LCD_MOSI,
-        .miso_io_num = CONFIG_IDMS_PIN_LCD_MISO,
+        .miso_io_num = miso_pin,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
 #if CONFIG_IDMS_DISPLAY_ST7796S || CONFIG_IDMS_DISPLAY_ILI9488
@@ -45,9 +55,15 @@ static void init_spi_bus(void)
     buscfg.max_transfer_sz = 4096;
 #endif
     ESP_ERROR_CHECK(spi_bus_initialize(IDMS_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+#if CONFIG_IDMS_LCD_BUS_SPI
     ESP_LOGI(TAG, "SPI bus initialized (host=%d, SCLK=%d, MOSI=%d, MISO=%d)",
              (int)IDMS_SPI_HOST, (int)CONFIG_IDMS_PIN_LCD_SCLK,
              (int)CONFIG_IDMS_PIN_LCD_MOSI, (int)CONFIG_IDMS_PIN_LCD_MISO);
+#else
+    ESP_LOGI(TAG, "SPI bus initialized (host=%d, SCLK=%d, MOSI=%d, I80 mode)",
+             (int)IDMS_SPI_HOST, (int)CONFIG_IDMS_PIN_LCD_SCLK,
+             (int)CONFIG_IDMS_PIN_LCD_MOSI);
+#endif
 }
 
 void app_main(void)
@@ -57,6 +73,13 @@ void app_main(void)
     ESP_ERROR_CHECK(config_store_init());
     ESP_ERROR_CHECK(wifi_manager_init());
 
+/* SPI bus initialization for sensors (MAX31865, touch, etc.) */
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20 || CONFIG_IDMS_TEMP_SENSOR_MAX31865 || CONFIG_IDMS_PIN_TOUCH_CS >= 0
+    init_spi_bus();
+#endif
+
+/* LCD diagnostics only for non-Topway displays */
+#if !CONFIG_IDMS_DISPLAY_TOPWAY
 #if CONFIG_IDMS_LCD_BUS_SPI
     /* Read LCD controller ID via bit-bang BEFORE SPI bus init */
     uint32_t lcd_id = lcd_diag_read_rddi(
@@ -68,20 +91,10 @@ void app_main(void)
         CONFIG_IDMS_PIN_LCD_RST);
     lcd_diag_print_rddi(lcd_id);
 #elif CONFIG_IDMS_LCD_BUS_I80
-    /* Read LCD controller ID via I80 bit-bang BEFORE bus init */
-    uint32_t lcd_id = lcd_diag_read_rddi_i80(
-        CONFIG_IDMS_PIN_LCD_I80_D0, CONFIG_IDMS_PIN_LCD_I80_D1,
-        CONFIG_IDMS_PIN_LCD_I80_D2, CONFIG_IDMS_PIN_LCD_I80_D3,
-        CONFIG_IDMS_PIN_LCD_I80_D4, CONFIG_IDMS_PIN_LCD_I80_D5,
-        CONFIG_IDMS_PIN_LCD_I80_D6, CONFIG_IDMS_PIN_LCD_I80_D7,
-        CONFIG_IDMS_PIN_LCD_I80_WR, CONFIG_IDMS_PIN_LCD_I80_RD,
-        CONFIG_IDMS_PIN_LCD_CS, CONFIG_IDMS_PIN_LCD_DC,
-        CONFIG_IDMS_PIN_LCD_RST);
-    lcd_diag_print_rddi(lcd_id);
+    /* Skip slow I80 diagnostic - LCD will be initialized by UI driver */
+    ESP_LOGI(TAG, "I80 mode: skipping RDDID diagnostic (LCD will init in UI driver)");
 #endif
-
-    /* SPI bus must be initialized before MAX31865 and touch */
-    init_spi_bus();
+#endif /* !CONFIG_IDMS_DISPLAY_TOPWAY */
 
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20
     ds18b20_init();
@@ -90,7 +103,12 @@ void app_main(void)
 #endif
 
     monitor_init();
+    
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+    idms_ui_topway_init();
+#else
     idms_ui_init();
+#endif
 
     telegram_command_poll_start();
     serial_console_start();

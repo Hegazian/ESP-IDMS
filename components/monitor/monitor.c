@@ -52,37 +52,44 @@ static float sample_current_rms_volts(void)
 {
     const int n = 256;
     int32_t sum = 0;
-    int buf[256];
+    int32_t sum_sq = 0;
+    
+    /* Single-pass RMS calculation using integer math where possible */
     for (int i = 0; i < n; i++) {
         int v = 0;
         if (adc_oneshot_read(s_adc, s_adc_channel, &v) != ESP_OK) {
             v = 0;
         }
-        buf[i] = v;
         sum += v;
+        sum_sq += v * v;
     }
+    
+    /* Calculate RMS: sqrt((sum_sq/n) - (sum/n)^2) */
     float mean = (float)sum / (float)n;
-    double acc = 0.0;
-    for (int i = 0; i < n; i++) {
-        double d = (double)buf[i] - (double)mean;
-        acc += d * d;
-    }
-    float rms_counts = (float)sqrt(acc / (double)n);
+    float mean_sq = (float)sum_sq / (float)n;
+    float variance = mean_sq - (mean * mean);
+    if (variance < 0.0f) variance = 0.0f;  /* Prevent negative due to floating point errors */
+    float rms_counts = sqrtf(variance);
+    
     return rms_counts * (3.3f / 4095.0f);
 }
 
 #if CONFIG_IDMS_UI_ENABLE
+#define ALERT_MSG_BUF_SIZE 256
+
 static void send_power_alert(bool loss, float a)
 {
     if (loss) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Machine power loss detected. Current: %.1fA", a);
-        telegram_broadcast_text(msg);
-        uint8_t n = config_get_tech_count();
-        for (int i = 0; i < n; i++) {
-            char id[64];
-            if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
-                telegram_send_ringing_alert(id, msg);
+        char msg[ALERT_MSG_BUF_SIZE];
+        int written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Machine power loss detected. Current: %.2fA", (double)a);
+        if (written > 0 && written < (int)sizeof(msg)) {
+            telegram_broadcast_text(msg);
+            uint8_t n = config_get_tech_count();
+            for (int i = 0; i < n; i++) {
+                char id[64];
+                if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                    telegram_send_ringing_alert(id, msg);
+                }
             }
         }
     } else {
@@ -92,18 +99,21 @@ static void send_power_alert(bool loss, float a)
 
 static void send_cool_alert(bool low_side, float dt)
 {
-    char msg[96];
+    char msg[ALERT_MSG_BUF_SIZE];
+    int written;
     if (low_side) {
-        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xce\x94T = %.1f\xc2\xb0C (below minimum).", dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xe2\x96\xb3T = %.2f\xc2\xb0C (below minimum).", (double)dt);
     } else {
-        snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xce\x94T = %.1f\xc2\xb0C (above maximum).", dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0C (above maximum).", (double)dt);
     }
-    telegram_broadcast_text(msg);
-    uint8_t n = config_get_tech_count();
-    for (int i = 0; i < n; i++) {
-        char id[64];
-        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
-            telegram_send_ringing_alert(id, msg);
+    if (written > 0 && written < (int)sizeof(msg)) {
+        telegram_broadcast_text(msg);
+        uint8_t n = config_get_tech_count();
+        for (int i = 0; i < n; i++) {
+            char id[64];
+            if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                telegram_send_ringing_alert(id, msg);
+            }
         }
     }
 }
@@ -191,26 +201,31 @@ static void monitor_task(void *arg)
         }
 #endif
 
+        /* Power fault detection with proper state management */
         if (amps < i_thresh) {
             s_power_low_ms += 500;
+            /* Check for new fault condition */
+            if (s_power_low_ms >= 5000 && s_power_st == POWER_OK) {
+                s_power_st = POWER_LOW_PENDING;
+            }
+            if (s_power_low_ms >= 5000 && s_power_st == POWER_LOW_PENDING) {
+#if CONFIG_IDMS_UI_ENABLE
+                send_power_alert(true, amps);
+#endif
+                s_power_st = POWER_FAULT;
+            }
         } else {
+            /* Current is normal - reset fault state if was in fault */
             if (s_power_st == POWER_FAULT) {
 #if CONFIG_IDMS_UI_ENABLE
                 send_power_alert(false, amps);
 #endif
-                s_power_st = POWER_OK;
             }
             s_power_low_ms = 0;
             s_power_st = POWER_OK;
         }
 
-        if (amps < i_thresh && s_power_low_ms >= 5000 && s_power_st != POWER_FAULT) {
-#if CONFIG_IDMS_UI_ENABLE
-            send_power_alert(true, amps);
-#endif
-            s_power_st = POWER_FAULT;
-        }
-
+        /* Cooling fault detection with proper state management */
         if (v_dt) {
             bool bad_low = dt < (float)dt_low;
             bool bad_high = dt > (float)dt_high;
@@ -218,30 +233,39 @@ static void monitor_task(void *arg)
 
             if (bad) {
                 s_cool_bad_ms += 500;
+                /* Transition to pending fault after debounce */
+                if (s_cool_bad_ms >= 5000 && s_cool_st == COOL_OK) {
+                    if (bad_low) {
+#if CONFIG_IDMS_UI_ENABLE
+                        send_cool_alert(true, dt);
+#endif
+                        s_cool_st = COOL_FAULT_LOW;
+                    } else if (bad_high) {
+#if CONFIG_IDMS_UI_ENABLE
+                        send_cool_alert(false, dt);
+#endif
+                        s_cool_st = COOL_FAULT_HIGH;
+                    }
+                }
             } else {
+                /* Delta-T is normal - reset if was in fault */
                 if (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH) {
 #if CONFIG_IDMS_UI_ENABLE
                     send_cool_restored();
 #endif
-                    s_cool_st = COOL_OK;
                 }
                 s_cool_bad_ms = 0;
                 s_cool_st = COOL_OK;
             }
-
-            if (bad && s_cool_bad_ms >= 5000) {
-                if (bad_low && s_cool_st != COOL_FAULT_LOW) {
+        } else {
+            /* Sensor data invalid - reset cooling fault state */
+            if (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH) {
 #if CONFIG_IDMS_UI_ENABLE
-                    send_cool_alert(true, dt);
+                ESP_LOGW(TAG, "Temperature sensor data invalid, resetting cooling fault state");
 #endif
-                    s_cool_st = COOL_FAULT_LOW;
-                } else if (bad_high && s_cool_st != COOL_FAULT_HIGH) {
-#if CONFIG_IDMS_UI_ENABLE
-                    send_cool_alert(false, dt);
-#endif
-                    s_cool_st = COOL_FAULT_HIGH;
-                }
             }
+            s_cool_bad_ms = 0;
+            s_cool_st = COOL_OK;
         }
     }
 }
