@@ -7,6 +7,7 @@
 #include "config_store.h"
 #include "ota.h"
 #include "wifi_manager.h"
+#include "telegram.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -84,6 +85,7 @@ static void handle_cmd(const char *chat, const char *cmd)
     } else if (strcmp(cmd, "status") == 0) {
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+        telegram_cancel_alerts(chat);
     } else if (strcmp(cmd, "test") == 0) {
         tg_broadcast_alert(
             "\xf0\x9f\x94\x94 <b>TEST ALERT</b>\n\n"
@@ -158,6 +160,7 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
     if (strcmp(data, "cmd_status") == 0) {
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+        telegram_cancel_alerts(chat);
     } else if (strcmp(data, "cmd_test") == 0) {
         tg_broadcast_alert("\xf0\x9f\x94\x94 <b>TEST ALERT</b>\n\nTest notification. \xe2\x9c\x85");
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Test alert sent.");
@@ -339,6 +342,7 @@ static void poll_task(void *arg)
     int fail_n = 0;
     bool was_off = false;
     bool dns_available = false;
+    bool boot_notified = false;
 
     for (;;) {
         if (!dns_available) {
@@ -349,9 +353,32 @@ static void poll_task(void *arg)
                 continue;
             }
             register_cmds();
+            if (!boot_notified) {
+                boot_notified = true;
+                char _bip[16] = {0};
+                wifi_manager_get_ip(_bip, sizeof(_bip));
+                char boot_msg[512];
+                snprintf(boot_msg, sizeof(boot_msg),
+                    "\xf0\x9f\x9f\xa2 <b>ESP-IDMS Online</b>\n\n"
+                    "Device started successfully.\n"
+                    "Firmware: %s\n"
+                    "IP: %s\n\n"
+                    "Monitoring is active. Use the menu below.",
+                    ota_get_version(), _bip[0] ? _bip : "N/A");
+                uint8_t n = config_get_tech_count();
+                for (int i = 0; i < n; i++) {
+                    char id[64];
+                    if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                        tg_send_kb(id, boot_msg, TG_KB_MAIN);
+                    }
+                }
+                ESP_LOGI(TAG, "Boot notification sent to %u technicians", n);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(poll_int * 1000));
+
+        tg_send_process_reminders();
 
         char path[256];
         if (s_update_offset < 0) {
@@ -476,5 +503,5 @@ static void poll_task(void *arg)
 
 void tg_bot_start(void)
 {
-    xTaskCreatePinnedToCore(poll_task, "tg_bot", 20480, NULL, 3, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(poll_task, "tg_bot", 24576, NULL, 3, NULL, tskNO_AFFINITY);
 }

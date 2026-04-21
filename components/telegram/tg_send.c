@@ -13,8 +13,20 @@ static const char *TAG = "tg_send";
 #define RING_COOLDOWN_MS        60000
 #define MAX_RING_COOLDOWNS      8
 #define MAX_OFFLINE_QUEUE       8
+#define RING_REMIND_INTERVAL_S  120
+#define RING_MAX_REMINDERS      3
 
 static struct { uint32_t id; uint32_t tick; } s_ring_cd[MAX_RING_COOLDOWNS];
+
+static struct {
+    char chat_id[32];
+    char text[256];
+    uint32_t last_ring_tick;
+    uint8_t reminders_sent;
+    bool active;
+} s_ring_remind[8];
+
+static int s_ring_remind_count = 0;
 
 static struct {
     char chat_id[32];
@@ -148,22 +160,112 @@ esp_err_t tg_send_ring_alert(const char *chat_id, const char *alert_text)
         return ESP_OK;
     }
 
-    const char *rings[] = {
-        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
-        "\xf0\x9f\x94\x94 <b>INCOMING ALERT</b> \xf0\x9f\x94\x94\nESP-IDMS has detected a fault!",
-        "\xe2\x9a\xa0\xef\xb8\x8f <b>DEVICE ALERT</b> \xe2\x9a\xa0\xef\xb8\x8f\nPlease check the device immediately!",
-        "\xf0\x9f\x9a\xa8 <b>FAULT DETECTED</b> \xf0\x9f\x9a\xa8\nAttention required now!",
-        "\xf0\x9f\x93\xa1 <b>ESP-IDMS ALERT</b> \xf0\x9f\x93\xa1\nFault condition requires immediate attention!"
+    uint32_t now_s = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+
+    const char *burst1[] = {
+        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
+        "\xf0\x9f\x94\x94 <b>INCOMING ALERT</b> \xf0\x9f\x94\x94",
+        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
+        "\xf0\x9f\x94\x94 <b>INCOMING ALERT</b> \xf0\x9f\x94\x94",
+        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
     };
     for (int i = 0; i < 5; i++) {
-        esp_err_t e = tg_send_text(chat_id, rings[i]);
-        if (e != ESP_OK) {
-            tg_queue_message(chat_id, rings[i]);
-        }
+        tg_send_text(chat_id, burst1[i]);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    const char *burst2[] = {
+        "\xf0\x9f\x9a\xa8 <b>FAULT DETECTED</b> \xf0\x9f\x9a\xa8",
+        "\xe2\x9a\xa0\xef\xb8\x8f <b>DEVICE ALERT</b> \xe2\x9a\xa0\xef\xb8\x8f",
+        "\xf0\x9f\x9a\xa8 <b>FAULT DETECTED</b> \xf0\x9f\x9a\xa8",
+        "\xe2\x9a\xa0\xef\xb8\x8f <b>DEVICE ALERT</b> \xe2\x9a\xa0\xef\xb8\x8f",
+    };
+    for (int i = 0; i < 4; i++) {
+        tg_send_text(chat_id, burst2[i]);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+
+    vTaskDelay(pdMS_TO_TICKS(600));
+
     tg_send_text_ext(chat_id, alert_text, true);
+
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    tg_send_text(chat_id, "\xf0\x9f\x94\xb4 <b>ALERT ACTIVE</b> \xf0\x9f\x94\xb4\nThis alert will repeat until acknowledged.");
+
+    for (int i = 0; i < s_ring_remind_count; i++) {
+        if (s_ring_remind[i].active && strcmp(s_ring_remind[i].chat_id, chat_id) == 0) {
+            s_ring_remind[i].last_ring_tick = now_s;
+            s_ring_remind[i].reminders_sent = 0;
+            strncpy(s_ring_remind[i].text, alert_text, sizeof(s_ring_remind[i].text) - 1);
+            s_ring_remind[i].text[sizeof(s_ring_remind[i].text) - 1] = '\0';
+            return ESP_OK;
+        }
+    }
+    if (s_ring_remind_count < 8) {
+        int idx = s_ring_remind_count;
+        strncpy(s_ring_remind[idx].chat_id, chat_id, sizeof(s_ring_remind[idx].chat_id) - 1);
+        s_ring_remind[idx].chat_id[sizeof(s_ring_remind[idx].chat_id) - 1] = '\0';
+        strncpy(s_ring_remind[idx].text, alert_text, sizeof(s_ring_remind[idx].text) - 1);
+        s_ring_remind[idx].text[sizeof(s_ring_remind[idx].text) - 1] = '\0';
+        s_ring_remind[idx].last_ring_tick = now_s;
+        s_ring_remind[idx].reminders_sent = 0;
+        s_ring_remind[idx].active = true;
+        s_ring_remind_count++;
+    }
+
     return ESP_OK;
+}
+
+void tg_send_process_reminders(void)
+{
+    uint32_t now_s = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+
+    for (int i = 0; i < s_ring_remind_count; i++) {
+        if (!s_ring_remind[i].active) continue;
+
+        uint32_t elapsed = now_s - s_ring_remind[i].last_ring_tick;
+        if (elapsed < (uint32_t)RING_REMIND_INTERVAL_S) continue;
+        if (s_ring_remind[i].reminders_sent >= RING_MAX_REMINDERS) continue;
+
+        s_ring_remind[i].reminders_sent++;
+        s_ring_remind[i].last_ring_tick = now_s;
+
+        ESP_LOGI(TAG, "Alert reminder %d/%d for %s",
+                 s_ring_remind[i].reminders_sent, RING_MAX_REMINDERS,
+                 s_ring_remind[i].chat_id);
+
+        const char *remind_burst[] = {
+            "\xf0\x9f\x93\xb2 \xf0\x9f\x94\xb4 <b>ALERT STILL ACTIVE</b> \xf0\x9f\x94\xb4 \xf0\x9f\x93\xb2",
+            "\xf0\x9f\x9a\xa8 <b>UNACKNOWLEDGED ALERT</b> \xf0\x9f\x9a\xa8",
+            "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
+        };
+        for (int j = 0; j < 3; j++) {
+            tg_send_text(s_ring_remind[i].chat_id, remind_burst[j]);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+        tg_send_text_ext(s_ring_remind[i].chat_id, s_ring_remind[i].text, true);
+
+        char footer[128];
+        snprintf(footer, sizeof(footer),
+                 "\n\xf0\x9f\x94\x81 Reminder %d of %d. Send /status to check.",
+                 s_ring_remind[i].reminders_sent, RING_MAX_REMINDERS);
+        tg_send_text(s_ring_remind[i].chat_id, footer);
+    }
+}
+
+void tg_send_cancel_alert(const char *chat_id)
+{
+    for (int i = 0; i < s_ring_remind_count; i++) {
+        if (s_ring_remind[i].active && strcmp(s_ring_remind[i].chat_id, chat_id) == 0) {
+            s_ring_remind[i].active = false;
+            ESP_LOGI(TAG, "Alert reminders cancelled for %s", chat_id);
+        }
+    }
 }
 
 esp_err_t tg_queue_message(const char *chat_id, const char *text)

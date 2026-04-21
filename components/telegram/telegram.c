@@ -64,3 +64,8 @@ void telegram_flush_offline_queue(void)
 {
     tg_flush_offline_queue();
 }
+
+void telegram_cancel_alerts(const char *chat_id)
+{
+    tg_send_cancel_alert(chat_id);
+}

@@ -92,7 +92,7 @@ static void send_power_alert(bool loss, float a)
             }
         }
     } else {
-        telegram_broadcast_text("\xe2\x9c\x85 Machine power has been restored.");
+        telegram_broadcast_text("\xe2\x9c\x85 \xf0\x9f\x94\xb4 Machine power has been RESTORED. Alert cancelled.");
     }
 }
 
@@ -101,9 +101,9 @@ static void send_cool_alert(bool low_side, float dt)
     char msg[ALERT_MSG_BUF_SIZE];
     int written;
     if (low_side) {
-        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xe2\x96\xb3T = %.2f\xc2\xb0C (below minimum).", (double)dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xe2\x96\xb3T = %.2f\xc2\xb0" "C (below minimum).", (double)dt);
     } else {
-        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0C (above maximum).", (double)dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0" "C (above maximum).", (double)dt);
     }
     if (written > 0 && written < (int)sizeof(msg)) {
         uint8_t n = config_get_tech_count();
@@ -118,7 +118,7 @@ static void send_cool_alert(bool low_side, float dt)
 
 static void send_cool_restored(void)
 {
-    telegram_broadcast_text("\xe2\x9c\x85 Cooling system has returned to normal operation.");
+    telegram_broadcast_text("\xe2\x9c\x85 \xf0\x9f\x94\xb4 Cooling system has returned to NORMAL. Alert cancelled.");
 }
 #endif
 

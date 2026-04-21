@@ -25,3 +25,7 @@ void tg_flush_offline_queue(void);
 esp_err_t tg_queue_message(const char *chat_id, const char *text);
 
 void tg_send_init(void);
+
+void tg_send_process_reminders(void);
+
+void tg_send_cancel_alert(const char *chat_id);
