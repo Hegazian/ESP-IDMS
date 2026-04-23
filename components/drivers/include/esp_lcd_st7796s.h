@@ -32,4 +32,11 @@ esp_err_t st7796s_lcd_fill_color(esp_lcd_panel_io_handle_t io, uint16_t color, i
  * Read the display ID (command 0x04) to verify SPI communication.
  * Expected: 0x00 0x77 0x96 0x00 for ST7796S.
  */
-esp_err_t st7796s_lcd_test_read_id(esp_lcd_panel_io_handle_t io);
+esp_err_t st7796s_lcd_read_id(esp_lcd_panel_io_handle_t io, uint8_t *out_id, size_t out_sz);
+
+/**
+ * Validate that the ST7796S is actually listening on SPI (IM pins = 111).
+ * Reads RDDID and checks for expected controller ID.
+ * Logs detailed diagnostics if the display does not respond.
+ */
+esp_err_t st7796s_lcd_validate_im_pins(esp_lcd_panel_io_handle_t io);

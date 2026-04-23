@@ -413,12 +413,17 @@ void idms_ui_init(void)
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits = LCD_CMD_BITS,
         .lcd_param_bits = LCD_PARAM_BITS,
-        .spi_mode = 0,
+        .spi_mode = 3,          /* ST7796S Chinese modules often need Mode 3 (CPOL=1,CPHA=1) */
         .trans_queue_depth = 10,
         .on_color_trans_done = on_flush_ready,
         .user_ctx = &s_disp_drv,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)IDMS_LCD_SPI_HOST, &io_cfg, &s_io));
+
+#if CONFIG_IDMS_DISPLAY_ST7796S
+    /* Validate that the display is actually listening on SPI (checks IM pins) */
+    st7796s_lcd_validate_im_pins(s_io);
+#endif
 
 #elif CONFIG_IDMS_LCD_BUS_I80
     ESP_LOGI(TAG, "Creating I80 bus (D0=%d..D7=%d, WR=%d, DC=%d, CS=%d)",

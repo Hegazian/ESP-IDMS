@@ -214,6 +214,12 @@ choice IDMS_DISPLAY_CONTROLLER
                 Uses built-in driver in components/drivers/esp_lcd_st7796s.
                 Supports both SPI (4-wire) and I80 (8080 parallel) interface.
 
+                IMPORTANT: If using SPI, the module MUST have IM[2:0]=111.
+                If the module does not expose IM jumpers, the firmware will
+                validate SPI communication by reading the controller ID (RDDID).
+                A white screen usually means IM pins are NOT set to 111 or the
+                module requires SPI Mode 3 (CPOL=1,CPHA=1) instead of Mode 0.
+
         config IDMS_DISPLAY_ILI9488
             bool "ILI9488 (3.5\" 320x480)"
             help
