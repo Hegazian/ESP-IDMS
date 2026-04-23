@@ -15,7 +15,7 @@
 
 static const char *TAG = "console";
 
-#define CMD_BUF_SIZE 128
+#define CMD_BUF_SIZE 256
 
 static void handle_cmd(const char *cmd)
 {
@@ -122,8 +122,30 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "Set Wi-Fi password: %s (%s)", err == ESP_OK ? "****" : val, esp_err_to_name(err));
     } else if (strncmp(cmd, "set_token ", 10) == 0) {
         const char *val = cmd + 10;
-        esp_err_t err = config_set_telegram_token(val);
-        ESP_LOGI(TAG, "Set Telegram token: %s (%s)", err == ESP_OK ? "****" : val, esp_err_to_name(err));
+        size_t vlen = strlen(val);
+        if (vlen < 20) {
+            ESP_LOGW(TAG, "Token too short (%zu chars). Expected format: 1234567890:AAHxxxxxxxxxxxxxxxx", vlen);
+            ESP_LOGW(TAG, "Get your token from @BotFather on Telegram");
+        } else if (!strchr(val, ':')) {
+            ESP_LOGW(TAG, "Invalid token format — must contain ':' (e.g. 1234567890:AAHxxxxxxxxx)");
+        } else {
+            esp_err_t err = config_set_telegram_token(val);
+            ESP_LOGI(TAG, "Set Telegram token: **** (%s)", esp_err_to_name(err));
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Token set! Reboot to activate: type 'reboot'");
+            }
+        }
+    } else if (strncmp(cmd, "show_token", 10) == 0) {
+        char tok[128];
+        config_get_telegram_token(tok, sizeof(tok));
+        size_t tlen = strlen(tok);
+        if (tlen == 0) {
+            ESP_LOGI(TAG, "Telegram token: (not set)");
+        } else if (tlen < 20) {
+            ESP_LOGW(TAG, "Telegram token: %s (%zu chars — TOO SHORT, expected ~45)", tok, tlen);
+        } else {
+            ESP_LOGI(TAG, "Telegram token: %.5s...%s (%zu chars)", tok, &tok[tlen-3], tlen);
+        }
     } else if (strncmp(cmd, "set_ota_user ", 13) == 0) {
         const char *val = cmd + 13;
         if (strlen(val) < 3) {
@@ -158,7 +180,8 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  status           — Show device status");
         ESP_LOGI(TAG, "  set_ssid <ssid>  — Set Wi-Fi SSID (NVS)");
         ESP_LOGI(TAG, "  set_pass <pass>  — Set Wi-Fi password (NVS)");
-        ESP_LOGI(TAG, "  set_token <tok>  — Set Telegram bot token (NVS)");
+        ESP_LOGI(TAG, "  set_token <tok>  — Set Telegram bot token (format: 1234567890:AAHxxxxx)");
+        ESP_LOGI(TAG, "  show_token       — Show current token (first/last chars only)");
         ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
         ESP_LOGI(TAG, "  set_ota_pass <p> — Set OTA HTTP password (NVS)");
         ESP_LOGI(TAG, "  show_secrets     — Show secret status (values hidden)");
@@ -190,25 +213,31 @@ static void console_task(void *arg)
         }
 
         if (c == '\r' || c == '\n') {
-            buf[pos] = '\0';
             if (pos > 0) {
-                printf("\n");
+                buf[pos] = '\0';
+                printf("\r\n");
+                fflush(stdout);
                 handle_cmd(buf);
-                printf("> ");
-                fflush(stdout);
-            } else {
-                printf("> ");
-                fflush(stdout);
             }
             pos = 0;
+            buf[0] = '\0';
+            printf("> ");
+            fflush(stdout);
         } else if (c == '\b' || c == 0x7F) {
             if (pos > 0) {
                 pos--;
+                buf[pos] = '\0';
                 printf("\b \b");
                 fflush(stdout);
             }
-        } else if (c >= 0x20 && c < 0x7F && pos < CMD_BUF_SIZE - 1) {
+        } else if (c == 0x03) {
+            pos = 0;
+            buf[0] = '\0';
+            printf("^C\r\n> ");
+            fflush(stdout);
+        } else if (c >= 0x20 && c < 0x7F && pos < CMD_BUF_SIZE - 2) {
             buf[pos++] = (char)c;
+            buf[pos] = '\0';
             putchar(c);
             fflush(stdout);
         }

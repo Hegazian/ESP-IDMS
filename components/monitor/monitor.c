@@ -10,11 +10,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#if CONFIG_IDMS_TEMP_SENSOR_DS18B20
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20 || CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
 #include "ds18b20.h"
-#elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
+#endif
+#if CONFIG_IDMS_TEMP_SENSOR_MAX31865
 #include "max31865.h"
 #include "pins.h"
+#endif
+#if CONFIG_IDMS_TEMP_SENSOR_PT100_ADC || CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+#include "adc_pt100.h"
 #endif
 
 #if CONFIG_IDMS_UI_ENABLE
@@ -30,6 +34,13 @@ static adc_oneshot_unit_handle_t s_adc;
 static adc_channel_t s_adc_channel;
 static portMUX_TYPE s_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
 static idms_metrics_t s_metrics;
+
+#if CONFIG_IDMS_TEMP_SENSOR_PT100_ADC || CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+static pt100_adc_t s_pt100_in;
+#if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
+static pt100_adc_t s_pt100_out;
+#endif
+#endif
 
 static bool s_conv_pending_read;
 static uint32_t s_heartbeat_ticks;
@@ -83,7 +94,6 @@ static void send_power_alert(bool loss, float a)
         char msg[ALERT_MSG_BUF_SIZE];
         int written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Machine power loss detected. Current: %.2fA", (double)a);
         if (written > 0 && written < (int)sizeof(msg)) {
-            telegram_broadcast_text(msg);
             uint8_t n = config_get_tech_count();
             for (int i = 0; i < n; i++) {
                 char id[64];
@@ -93,7 +103,7 @@ static void send_power_alert(bool loss, float a)
             }
         }
     } else {
-        telegram_broadcast_text("\xe2\x9c\x85 Machine power has been restored.");
+        telegram_broadcast_text("\xe2\x9c\x85 \xf0\x9f\x94\xb4 Machine power has been RESTORED. Alert cancelled.");
     }
 }
 
@@ -102,12 +112,11 @@ static void send_cool_alert(bool low_side, float dt)
     char msg[ALERT_MSG_BUF_SIZE];
     int written;
     if (low_side) {
-        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xe2\x96\xb3T = %.2f\xc2\xb0C (below minimum).", (double)dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Cooling failure. \xe2\x96\xb3T = %.2f\xc2\xb0" "C (below minimum).", (double)dt);
     } else {
-        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0C (above maximum).", (double)dt);
+        written = snprintf(msg, sizeof(msg), "\xe2\x9a\xa0\xef\xb8\x8f ALERT: Thermal overload. \xe2\x96\xb3T = %.2f\xc2\xb0" "C (above maximum).", (double)dt);
     }
     if (written > 0 && written < (int)sizeof(msg)) {
-        telegram_broadcast_text(msg);
         uint8_t n = config_get_tech_count();
         for (int i = 0; i < n; i++) {
             char id[64];
@@ -120,7 +129,7 @@ static void send_cool_alert(bool low_side, float dt)
 
 static void send_cool_restored(void)
 {
-    telegram_broadcast_text("\xe2\x9c\x85 Cooling system has returned to normal operation.");
+    telegram_broadcast_text("\xe2\x9c\x85 \xf0\x9f\x94\xb4 Cooling system has returned to NORMAL. Alert cancelled.");
 }
 #endif
 
@@ -162,6 +171,42 @@ static void monitor_task(void *arg)
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
         v_in = max31865_read_temperature_c(0, &t_in);
         v_out = max31865_read_temperature_c(1, &t_out);
+#elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
+        v_in = pt100_adc_read_celsius(&s_pt100_in, &t_in);
+        v_out = false;
+#elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+        {
+            bool ds18b20_read_done = s_conv_pending_read;
+            float ds_t = 0.0f;
+            bool ds_v = false;
+
+            if (ds18b20_read_done && ds18b20_device_count() >= 1) {
+                ds_v = ds18b20_read_temperature_c(0, &ds_t);
+            }
+            ds18b20_request_conversion();
+            s_conv_pending_read = true;
+
+    #if CONFIG_IDMS_COMBO_T_IN_DS18B20
+            v_in = ds_v;
+            t_in = ds_t;
+    #elif CONFIG_IDMS_COMBO_T_IN_PT100
+            v_in = pt100_adc_read_celsius(&s_pt100_in, &t_in);
+    #endif
+
+    #if CONFIG_IDMS_COMBO_T_OUT_DS18B20
+            if (ds18b20_read_done && ds18b20_device_count() >= 2) {
+                float ds_t2 = 0.0f;
+                v_out = ds18b20_read_temperature_c(1, &ds_t2);
+                t_out = ds_t2;
+            }
+    #elif CONFIG_IDMS_COMBO_T_OUT_PT100
+        #if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
+            v_out = pt100_adc_read_celsius(&s_pt100_out, &t_out);
+        #else
+            v_out = pt100_adc_read_celsius(&s_pt100_in, &t_out);
+        #endif
+    #endif
+        }
 #endif
 
         float dt = 0.0f;
@@ -298,9 +343,27 @@ void monitor_init(void)
     ds18b20_init();
     ESP_LOGI(TAG, "Temperature sensors: DS18B20 1-Wire (GPIO%d)", CONFIG_IDMS_PIN_ONEWIRE);
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
-    max31865_init(IDMS_SPI_HOST);
+    max31865_init(IDMS_SENSOR_SPI_HOST);
     ESP_LOGI(TAG, "Temperature sensors: PT100 via MAX31865 (CS0=GPIO%d, CS1=GPIO%d)",
              CONFIG_IDMS_MAX31865_CS0, CONFIG_IDMS_MAX31865_CS1);
+#elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
+    pt100_adc_init(&s_pt100_in, s_adc, CONFIG_IDMS_PIN_PT100_ADC,
+                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    ESP_LOGI(TAG, "Temperature sensors: PT100 via ADC (GPIO%d, R_ref=%.1fΩ)",
+             CONFIG_IDMS_PIN_PT100_ADC, (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f);
+#elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+    ds18b20_init();
+    pt100_adc_init(&s_pt100_in, s_adc, CONFIG_IDMS_PIN_PT100_ADC,
+                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+#if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
+    pt100_adc_init(&s_pt100_out, s_adc, CONFIG_IDMS_PIN_PT100_ADC2,
+                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+#endif
+    ESP_LOGI(TAG, "Temperature sensors: DS18B20+PT100 combo (1-Wire=GPIO%d, PT100 ADC=GPIO%d)",
+             CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_PT100_ADC);
 #endif
 
     memset(&s_metrics, 0, sizeof(s_metrics));

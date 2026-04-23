@@ -47,11 +47,11 @@ static const char *TAG = "ui";
 #define LCD_H_RES 480
 #define LCD_V_RES 320
 #if CONFIG_IDMS_LCD_BUS_SPI
-#define LCD_PIXEL_CLOCK_HZ (10 * 1000 * 1000)
+#define LCD_PIXEL_CLOCK_HZ (15 * 1000 * 1000)
 #elif CONFIG_IDMS_LCD_BUS_I80
 #define LCD_PIXEL_CLOCK_HZ (CONFIG_IDMS_PIN_LCD_I80_PCLK_HZ)
 #endif
-#define LV_BUF_LINES 50
+#define LV_BUF_LINES 20
 #elif CONFIG_IDMS_DISPLAY_ILI9488
 #define LCD_H_RES 480
 #define LCD_V_RES 320
@@ -60,7 +60,7 @@ static const char *TAG = "ui";
 #elif CONFIG_IDMS_LCD_BUS_I80
 #define LCD_PIXEL_CLOCK_HZ (CONFIG_IDMS_PIN_LCD_I80_PCLK_HZ)
 #endif
-#define LV_BUF_LINES 50
+#define LV_BUF_LINES 60
 #elif CONFIG_IDMS_DISPLAY_ILI9341
 #define LCD_H_RES 320
 #define LCD_V_RES 240
@@ -129,6 +129,11 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *colo
         ESP_LOGI(TAG, "flush #%d: area(%d,%d)-(%d,%d), len=%zu", 
                  flush_count, area->x1, area->y1, area->x2, area->y2,
                  (x2 - x1) * (y2 - y1) * sizeof(lv_color_t));
+    }
+    if (flush_count <= 3) {
+        uint16_t *px = (uint16_t *)color_map;
+        ESP_LOGI(TAG, "  px[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
+                 px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7]);
     }
     
     esp_err_t err;
@@ -362,18 +367,33 @@ void idms_ui_init(void)
 
     lv_init();
 
-    lv_color_t *buf1 = heap_caps_malloc(LCD_H_RES * LV_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    size_t buf_sz = LCD_H_RES * LV_BUF_LINES * sizeof(lv_color_t);
+#if CONFIG_IDMS_LCD_BUS_SPI
+    lv_color_t *buf1 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!buf1) {
-        ESP_LOGW(TAG, "LVGL buf1: DMA alloc failed, trying SPIRAM");
-        buf1 = heap_caps_malloc(LCD_H_RES * LV_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "LVGL buf1: internal DMA failed (%zu bytes), trying PSRAM", buf_sz);
+        buf1 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    lv_color_t *buf2 = heap_caps_malloc(LCD_H_RES * LV_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+#elif CONFIG_IDMS_LCD_BUS_I80
+    lv_color_t *buf1 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+    if (!buf1) {
+        ESP_LOGE(TAG, "LVGL buf1 alloc failed (%zu bytes)", buf_sz);
+        return;
+    }
+#if CONFIG_IDMS_LCD_BUS_SPI
+    lv_color_t *buf2 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!buf2) {
-        ESP_LOGW(TAG, "LVGL buf2: DMA alloc failed, trying SPIRAM");
-        buf2 = heap_caps_malloc(LCD_H_RES * LV_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "LVGL buf2: internal DMA failed, trying PSRAM");
+        buf2 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    assert(buf1 && buf2);
-    ESP_LOGI(TAG, "LVGL buf1=%p buf2=%p", buf1, buf2);
+#elif CONFIG_IDMS_LCD_BUS_I80
+    lv_color_t *buf2 = heap_caps_aligned_alloc(64, buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+    if (!buf2) {
+        ESP_LOGW(TAG, "LVGL buf2: no memory, running single-buffered");
+    }
+    ESP_LOGI(TAG, "LVGL buf1=%p buf2=%p (%zu bytes each)", buf1, buf2, buf_sz);
     lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LCD_H_RES * LV_BUF_LINES);
 
     lv_disp_drv_init(&s_disp_drv);
@@ -398,7 +418,7 @@ void idms_ui_init(void)
         .on_color_trans_done = on_flush_ready,
         .user_ctx = &s_disp_drv,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)IDMS_SPI_HOST, &io_cfg, &s_io));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)IDMS_LCD_SPI_HOST, &io_cfg, &s_io));
 
 #elif CONFIG_IDMS_LCD_BUS_I80
     ESP_LOGI(TAG, "Creating I80 bus (D0=%d..D7=%d, WR=%d, DC=%d, CS=%d)",
@@ -495,32 +515,35 @@ void idms_ui_init(void)
     ESP_ERROR_CHECK(ili9488_lcd_init(s_io));
 #endif
 
+#if CONFIG_IDMS_DISPLAY_ST7796S
+    {
+        ESP_LOGI(TAG, "POST-INIT TEST: filling screen RED via internal DRAM...");
+        esp_err_t fill_err = st7796s_lcd_fill_color(s_io, 0xF800, 480, 320);
+        if (fill_err == ESP_OK) {
+            ESP_LOGI(TAG, "POST-INIT TEST: RED fill sent — check display NOW!");
+        } else {
+            ESP_LOGE(TAG, "POST-INIT TEST: RED fill FAILED: %s", esp_err_to_name(fill_err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        st7796s_lcd_fill_color(s_io, 0x0000, 480, 320);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+#endif
+
     /* MADCTL is already set by driver init with MV bit for landscape.
      * Only apply mirror overrides if needed. */
     if (CONFIG_IDMS_LCD_MIRROR_X || CONFIG_IDMS_LCD_MIRROR_Y) {
-        uint8_t madctl_mirror = 0x00;
-        madctl_mirror |= (1 << 3); /* BGR */
-        madctl_mirror |= (1 << 5); /* MV: keep landscape rotation */
-        if (CONFIG_IDMS_LCD_MIRROR_X) madctl_mirror |= (1 << 6); /* MX */
-        if (CONFIG_IDMS_LCD_MIRROR_Y) madctl_mirror |= (1 << 7); /* MY */
+        uint8_t madctl_mirror = 0x08;
+        madctl_mirror |= (1 << 5);
+        if (CONFIG_IDMS_LCD_MIRROR_X) madctl_mirror |= (1 << 6);
+        if (CONFIG_IDMS_LCD_MIRROR_Y) madctl_mirror |= (1 << 7);
         esp_lcd_panel_io_tx_param(s_io, 0x36, &madctl_mirror, 1);
         ESP_LOGI(TAG, "Applied mirror MADCTL=0x%02X", madctl_mirror);
     }
     s_panel = NULL;
 
-    /* Color test - quick verification that display works */
-#if CONFIG_IDMS_DISPLAY_ST7796S
-#if CONFIG_IDMS_LCD_BUS_SPI
-    st7796s_lcd_test_read_id(s_io);
-#endif
-    st7796s_lcd_fill_color(s_io, 0xF800, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    st7796s_lcd_fill_color(s_io, 0x07E0, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    st7796s_lcd_fill_color(s_io, 0x001F, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    st7796s_lcd_fill_color(s_io, 0x0000, LCD_H_RES, LCD_V_RES);
-    vTaskDelay(pdMS_TO_TICKS(100));
+#if CONFIG_IDMS_DISPLAY_ST7796S && CONFIG_IDMS_LCD_SELFTEST
+    st7796s_lcd_selftest(s_io);
 #elif CONFIG_IDMS_DISPLAY_ILI9488
     ili9488_lcd_fill_color(s_io, 0xF800, LCD_H_RES, LCD_V_RES);
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -534,7 +557,7 @@ void idms_ui_init(void)
 #endif
 
 #if CONFIG_IDMS_PIN_TOUCH_CS >= 0
-    ESP_ERROR_CHECK(xpt2046_init(IDMS_SPI_HOST));
+    ESP_ERROR_CHECK(xpt2046_init(IDMS_SENSOR_SPI_HOST));
 #endif
 
 #if CONFIG_IDMS_DISPLAY_ILI9341

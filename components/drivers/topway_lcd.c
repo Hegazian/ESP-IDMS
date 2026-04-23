@@ -1,44 +1,81 @@
-/**
- * @file topway_lcd.c
- * @brief Topway Smart LCD driver - VP Memory Protocol Implementation
- */
-
 #include "topway_lcd.h"
 #include "esp_log.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 
 static const char *TAG = "topway";
 
-static uart_port_t s_uart_port = UART_NUM_1;
+static uart_port_t s_uart;
+static int s_rts_pin = -1;
+static SemaphoreHandle_t s_tx_mux;
 
-/**
- * @brief Send raw data to Topway display
- */
-static esp_err_t send_raw(const uint8_t *data, size_t len)
+static esp_err_t wait_busy(uint32_t timeout_ms)
 {
-    return uart_write_bytes(s_uart_port, data, len);
+    if (s_rts_pin < 0) return ESP_OK;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (gpio_get_level(s_rts_pin) == 0) {
+        if (xTaskGetTickCount() >= deadline) {
+            ESP_LOGW(TAG, "BUSY timeout");
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_OK;
 }
 
-/**
- * @brief Calculate float bits for sending
- */
-static uint32_t float_to_bits(float f)
+static esp_err_t send_packet(const uint8_t *payload, size_t len)
 {
-    union { float f; uint32_t u; } converter;
-    converter.f = f;
-    return converter.u;
+    if (!payload || len == 0) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t err = wait_busy(200);
+    if (err != ESP_OK) return err;
+
+    xSemaphoreTake(s_tx_mux, portMAX_DELAY);
+
+    uint8_t hdr = TOPWAY_PKT_HEADER;
+    uart_write_bytes(s_uart, &hdr, 1);
+    uart_write_bytes(s_uart, payload, len);
+    uint8_t tail[4] = { TOPWAY_PKT_TAIL0, TOPWAY_PKT_TAIL1, TOPWAY_PKT_TAIL2, TOPWAY_PKT_TAIL3 };
+    uart_write_bytes(s_uart, tail, 4);
+
+    uart_wait_tx_done(s_uart, pdMS_TO_TICKS(200));
+    xSemaphoreGive(s_tx_mux);
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return ESP_OK;
+}
+
+static esp_err_t read_ack(uint32_t timeout_ms)
+{
+    uint8_t buf[2] = {0};
+    int len = uart_read_bytes(s_uart, buf, 2, pdMS_TO_TICKS(timeout_ms));
+    if (len == 2 && buf[0] == 0x3A && buf[1] == 0x3E) {
+        return ESP_OK;
+    }
+    if (len == 2 && buf[0] == 0x21 && buf[1] == 0x3E) {
+        ESP_LOGW(TAG, "NAK from display");
+        return ESP_FAIL;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static void drain_rx(void)
+{
+    uint8_t tmp[64];
+    while (uart_read_bytes(s_uart, tmp, sizeof(tmp), pdMS_TO_TICKS(10)) > 0) {
+    }
 }
 
 esp_err_t topway_init(const topway_config_t *config)
 {
     if (!config) return ESP_ERR_INVALID_ARG;
 
-    s_uart_port = config->uart_port;
+    s_uart = config->uart_port;
+    s_rts_pin = config->rts_pin;
 
     uart_config_t uart_config = {
         .baud_rate = config->baud_rate ? config->baud_rate : 115200,
@@ -49,150 +86,374 @@ esp_err_t topway_init(const topway_config_t *config)
         .source_clk = UART_SCLK_APB,
     };
 
-    ESP_ERROR_CHECK(uart_param_config(s_uart_port, &uart_config));
-    ESP_ERROR_CHECK(uart_driver_install(s_uart_port, 1024, 1024, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_set_pin(s_uart_port, config->tx_pin, config->rx_pin, 
+    ESP_ERROR_CHECK(uart_param_config(s_uart, &uart_config));
+    ESP_ERROR_CHECK(uart_driver_install(s_uart, 512, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_set_pin(s_uart, config->tx_pin, config->rx_pin,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    if (s_rts_pin >= 0) {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << s_rts_pin,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+        };
+        gpio_config(&io);
+    }
 
-    ESP_LOGI(TAG, "Topway LCD: %dx%d, UART%d @ %d baud (TX=%d, RX=%d)",
-             config->width, config->height, s_uart_port, 
-             config->baud_rate, config->tx_pin, config->rx_pin);
+    s_tx_mux = xSemaphoreCreateMutex();
+    if (!s_tx_mux) return ESP_ERR_NO_MEM;
+
+    ESP_LOGI(TAG, "Topway LCD: UART%d @ %lu baud (TX=%d, RX=%d, RTS=%d)",
+             s_uart, (unsigned long)config->baud_rate,
+             config->tx_pin, config->rx_pin, s_rts_pin);
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    drain_rx();
+
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        ESP_LOGI(TAG, "Handshake attempt %d/5...", attempt);
+        err = topway_handshake();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Handshake OK — display ready");
+            break;
+        }
+        ESP_LOGW(TAG, "Handshake attempt %d failed, retrying in 1s...", attempt);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        drain_rx();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Handshake failed after 5 attempts");
+        ESP_LOGE(TAG, "  Check: RS232-TTL wiring (TX<->RX cross), baud rate, VCC");
+        ESP_LOGE(TAG, "  Display needs 12V on VDD pin, RS232 converter needs 3.3-5V");
+        ESP_LOGE(TAG, "  Try 9600 baud if jumpers changed (JP1,JP8 close; JP2,JP7 open)");
+    }
 
     return ESP_OK;
 }
 
 esp_err_t topway_deinit(void)
 {
-    return uart_driver_delete(s_uart_port);
+    if (s_tx_mux) {
+        vSemaphoreDelete(s_tx_mux);
+        s_tx_mux = NULL;
+    }
+    return uart_driver_delete(s_uart);
 }
 
-esp_err_t topway_write_vp16(uint32_t addr, uint16_t value)
+esp_err_t topway_handshake(void)
 {
-    /* Write 16-bit variable: 5A A5 82 [addr_h] [addr_l] [val_h] [val_l] */
-    uint8_t cmd[7] = {
-        TOPWAY_FRAME_HEAD,
-        TOPWAY_FRAME_TAIL,
-        TOPWAY_CMD_WRITE_8BIT,
-        (addr >> 8) & 0xFF,
-        addr & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF
+    drain_rx();
+    uint8_t cmd = TOPWAY_CMD_HAND_SHAKE;
+    esp_err_t err = send_packet(&cmd, 1);
+    if (err != ESP_OK) return err;
+
+    uint8_t resp[64] = {0};
+    int len = uart_read_bytes(s_uart, resp, sizeof(resp), pdMS_TO_TICKS(1000));
+    if (len <= 0) {
+        ESP_LOGW(TAG, "Handshake: no response (len=%d)", len);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "Handshake: got %d bytes: %02X %02X %02X %02X %02X %02X %02X %02X%s",
+             len, resp[0], resp[1], resp[2], resp[3],
+             len > 4 ? resp[4] : 0, len > 5 ? resp[5] : 0,
+             len > 6 ? resp[6] : 0, len > 7 ? resp[7] : 0,
+             len > 8 ? " ..." : "");
+
+    if (len < 4) return ESP_ERR_TIMEOUT;
+
+    if (resp[0] == TOPWAY_PKT_HEADER && resp[1] == TOPWAY_CMD_HAND_SHAKE) {
+        for (int i = 2; i < len; i++) {
+            if (resp[i] == 0x00) {
+                ESP_LOGI(TAG, "Display: %s", (const char *)&resp[2]);
+                break;
+            }
+        }
+        drain_rx();
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Unexpected handshake response (header=0x%02X, cmd=0x%02X)", resp[0], resp[1]);
+    drain_rx();
+    return ESP_FAIL;
+}
+
+esp_err_t topway_read_version(char *out, size_t out_sz)
+{
+    uint8_t cmd = TOPWAY_CMD_READ_VERSION;
+    esp_err_t err = send_packet(&cmd, 1);
+    if (err != ESP_OK) return err;
+
+    uint8_t resp[32] = {0};
+    int len = uart_read_bytes(s_uart, resp, sizeof(resp), pdMS_TO_TICKS(500));
+    if (len < 4 || resp[0] != TOPWAY_PKT_HEADER || resp[1] != TOPWAY_CMD_READ_VERSION) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (out && out_sz > 0) {
+        size_t i;
+        for (i = 0; i < out_sz - 1 && i + 2 < (size_t)len && resp[2 + i] != 0x00; i++) {
+            out[i] = resp[2 + i];
+        }
+        out[i] = '\0';
+    }
+    drain_rx();
+    return ESP_OK;
+}
+
+esp_err_t topway_read_page_id(uint16_t *page_id)
+{
+    uint8_t cmd = TOPWAY_CMD_READ_PG_ID;
+    esp_err_t err = send_packet(&cmd, 1);
+    if (err != ESP_OK) return err;
+
+    uint8_t resp[16] = {0};
+    int len = uart_read_bytes(s_uart, resp, sizeof(resp), pdMS_TO_TICKS(500));
+    if (len < 7 || resp[0] != TOPWAY_PKT_HEADER || resp[1] != TOPWAY_CMD_READ_PG_ID) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (page_id) *page_id = ((uint16_t)resp[2] << 8) | resp[3];
+    drain_rx();
+    return ESP_OK;
+}
+
+esp_err_t topway_set_sys_config(uint8_t baud_code, uint8_t touch_cfg)
+{
+    uint8_t pkt[7] = {
+        TOPWAY_CMD_SET_SYS_CONFIG,
+        0x55, 0xAA, 0x5A, 0xA5,
+        baud_code,
+        touch_cfg,
     };
-    return send_raw(cmd, sizeof(cmd));
+    return send_packet(pkt, sizeof(pkt));
 }
 
-esp_err_t topway_write_vp32(uint32_t addr, uint32_t value)
+esp_err_t topway_select_project(uint8_t prj_id)
 {
-    /* Write 32-bit variable: 5A A5 83 [addr_h] [addr_l] [val3] [val2] [val1] [val0] */
-    uint8_t cmd[9] = {
-        TOPWAY_FRAME_HEAD,
-        TOPWAY_FRAME_TAIL,
-        TOPWAY_CMD_WRITE_32BIT,
-        (addr >> 8) & 0xFF,
-        addr & 0xFF,
-        (value >> 24) & 0xFF,
-        (value >> 16) & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF
+    uint8_t pkt[2] = { TOPWAY_CMD_SEL_PROJECT, prj_id };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_set_backlight(uint8_t level)
+{
+    if (level > 0x3F) level = 0x3F;
+    uint8_t pkt[2] = { TOPWAY_CMD_BACKLIGHT_CTRL, level };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_screen_saver(uint16_t timeout_s, uint8_t dim_level)
+{
+    if (dim_level > 0x3F) dim_level = 0x3F;
+    uint8_t pkt[4] = {
+        TOPWAY_CMD_SCREEN_SAVER,
+        (timeout_s >> 8) & 0xFF, timeout_s & 0xFF,
+        dim_level,
     };
-    return send_raw(cmd, sizeof(cmd));
+    return send_packet(pkt, sizeof(pkt));
 }
 
-esp_err_t topway_write_float(uint32_t addr, float value)
+esp_err_t topway_buzzer_ctrl(uint8_t loops, uint8_t t1, uint8_t t2, uint8_t freq1, uint8_t freq2)
 {
-    return topway_write_vp32(addr, float_to_bits(value));
+    uint8_t pkt[6] = { TOPWAY_CMD_BUZZER_CTRL, loops, t1, t2, freq1, freq2 };
+    return send_packet(pkt, sizeof(pkt));
 }
 
-esp_err_t topway_write_string(uint32_t addr, const char *str)
+esp_err_t topway_disp_page(uint16_t page_id)
+{
+    uint8_t pkt[3] = {
+        TOPWAY_CMD_DISP_PAGE,
+        (page_id >> 8) & 0xFF,
+        page_id & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_set_element_fg(uint8_t element, uint16_t page_id, uint8_t element_id, uint16_t color)
+{
+    uint8_t pkt[8] = {
+        TOPWAY_CMD_SET_ELEMENT_FG,
+        element,
+        (page_id >> 8) & 0xFF, page_id & 0xFF,
+        element_id,
+        0x00,
+        (color >> 8) & 0xFF, color & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_set_element_bg(uint8_t element, uint16_t page_id, uint8_t element_id, uint8_t mode, uint16_t color)
+{
+    uint8_t pkt[8] = {
+        TOPWAY_CMD_SET_ELEMENT_BG,
+        element,
+        (page_id >> 8) & 0xFF, page_id & 0xFF,
+        element_id,
+        mode,
+        (color >> 8) & 0xFF, color & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_set_codepage(uint8_t country, uint8_t codepage)
+{
+    uint8_t pkt[3] = { TOPWAY_CMD_SET_CODEPAGE, country, codepage };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_suspend_refresh(bool suspend)
+{
+    uint8_t pkt[6] = {
+        TOPWAY_CMD_SUSPEND_REFRESH,
+        0x55, 0xAA, 0x5A, 0xA5,
+        suspend ? 0x01 : 0x00,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_n16_write(uint32_t addr, uint16_t value)
+{
+    uint8_t pkt[7] = {
+        TOPWAY_CMD_N16_WRITE,
+        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_n16_fill(uint32_t addr, uint16_t length, uint16_t value)
+{
+    uint8_t pkt[9] = {
+        TOPWAY_CMD_N16_FILL,
+        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (length >> 8) & 0xFF, length & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_n32_write(uint32_t addr, uint32_t value)
+{
+    uint8_t pkt[9] = {
+        TOPWAY_CMD_N32_WRITE,
+        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (value >> 24) & 0xFF, (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_n64_write(uint32_t addr, uint64_t value)
+{
+    uint8_t pkt[13] = {
+        TOPWAY_CMD_N64_WRITE,
+        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (value >> 56) & 0xFF, (value >> 48) & 0xFF,
+        (value >> 40) & 0xFF, (value >> 32) & 0xFF,
+        (value >> 24) & 0xFF, (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF,
+    };
+    return send_packet(pkt, sizeof(pkt));
+}
+
+esp_err_t topway_str_write(uint32_t addr, const char *str)
 {
     if (!str) return ESP_ERR_INVALID_ARG;
-    
-    size_t len = strlen(str);
-    if (len > 248) len = 248;
-    
-    /* String write: 5A A5 82 [addr_h] [addr_l] [len] [string...] */
-    uint8_t cmd[256];
-    cmd[0] = TOPWAY_FRAME_HEAD;
-    cmd[1] = TOPWAY_FRAME_TAIL;
-    cmd[2] = TOPWAY_CMD_WRITE_8BIT;
-    cmd[3] = (addr >> 8) & 0xFF;
-    cmd[4] = addr & 0xFF;
-    cmd[5] = len;
-    memcpy(&cmd[6], str, len);
-    
-    return send_raw(cmd, len + 6);
+    size_t slen = strlen(str);
+    if (slen > 127) slen = 127;
+
+    uint8_t pkt[5 + 128 + 1];
+    pkt[0] = TOPWAY_CMD_STR_WRITE;
+    pkt[1] = (addr >> 16) & 0xFF;
+    pkt[2] = (addr >> 8) & 0xFF;
+    pkt[3] = addr & 0xFF;
+    memcpy(&pkt[4], str, slen);
+    pkt[4 + slen] = 0x00;
+
+    return send_packet(pkt, 4 + slen + 1);
 }
 
-esp_err_t topway_set_page(uint8_t page)
+esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)
 {
-    return topway_write_vp16(TOPWAY_REG_PAGE, page);
+    if (!str) return ESP_ERR_INVALID_ARG;
+    size_t slen = strlen(str);
+    if (slen > 127) slen = 127;
+
+    uint8_t pkt[7 + 128 + 1];
+    pkt[0] = TOPWAY_CMD_STR_FILL;
+    pkt[1] = (addr >> 16) & 0xFF;
+    pkt[2] = (addr >> 8) & 0xFF;
+    pkt[3] = addr & 0xFF;
+    pkt[4] = (length >> 8) & 0xFF;
+    pkt[5] = length & 0xFF;
+    memcpy(&pkt[6], str, slen);
+    pkt[6 + slen] = 0x00;
+
+    return send_packet(pkt, 6 + slen + 1);
 }
 
-esp_err_t topway_set_brightness(uint8_t brightness)
+esp_err_t topway_successive_write(uint32_t addr, uint8_t length, const uint8_t *data, size_t data_len)
 {
-    if (brightness > 100) brightness = 100;
-    return topway_write_vp16(TOPWAY_REG_BACKLIGHT, brightness);
+    if (!data || length == 0) return ESP_ERR_INVALID_ARG;
+
+    uint8_t pkt[6 + 510];
+    pkt[0] = TOPWAY_CMD_SUCCESSIVE_WRITE;
+    pkt[1] = (addr >> 16) & 0xFF;
+    pkt[2] = (addr >> 8) & 0xFF;
+    pkt[3] = addr & 0xFF;
+    pkt[4] = length;
+    memcpy(&pkt[5], data, data_len);
+
+    return send_packet(pkt, 5 + data_len);
 }
 
-esp_err_t topway_clear_screen(uint16_t color)
+esp_err_t topway_g16_write(uint32_t addr, uint16_t size, const uint16_t *values)
 {
-    /* Fill entire screen with color */
-    return topway_fill_rect(0, 0, 800, 480, color);
+    if (!values || size == 0 || size > 1024) return ESP_ERR_INVALID_ARG;
+
+    uint8_t pkt[7 + 2048];
+    pkt[0] = TOPWAY_CMD_G16_WRITE;
+    pkt[1] = (addr >> 8) & 0xFF;
+    pkt[2] = addr & 0xFF;
+    pkt[3] = ((addr + size * 2 - 2) >> 8) & 0xFF;
+    pkt[4] = (addr + size * 2 - 2) & 0xFF;
+    pkt[5] = (size >> 8) & 0xFF;
+    pkt[6] = size & 0xFF;
+    for (uint16_t i = 0; i < size; i++) {
+        pkt[7 + i * 2] = (values[i] >> 8) & 0xFF;
+        pkt[7 + i * 2 + 1] = values[i] & 0xFF;
+    }
+
+    return send_packet(pkt, 7 + size * 2);
 }
 
-esp_err_t topway_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+esp_err_t topway_g16_write_rotate(uint32_t addr, uint16_t size, uint16_t value)
 {
-    /* Use CMD_DRAW_RECT with fill: 5A A5 25 [x1_h] [x1_l] [y1_h] [y1_l] [x2_h] [x2_l] [y2_h] [y2_l] [color_h] [color_l] */
-    uint8_t cmd[12] = {
-        TOPWAY_FRAME_HEAD,
-        TOPWAY_FRAME_TAIL,
-        0x25,  /* Draw filled rectangle */
-        (x >> 8) & 0xFF, x & 0xFF,
-        (y >> 8) & 0xFF, y & 0xFF,
-        ((x + w - 1) >> 8) & 0xFF, (x + w - 1) & 0xFF,
-        ((y + h - 1) >> 8) & 0xFF, (y + h - 1) & 0xFF,
-        (color >> 8) & 0xFF, color & 0xFF
+    uint8_t pkt[9] = {
+        TOPWAY_CMD_G16_WRITE_ROTATE,
+        (addr >> 8) & 0xFF, addr & 0xFF,
+        ((addr + size * 2 - 2) >> 8) & 0xFF, (addr + size * 2 - 2) & 0xFF,
+        (size >> 8) & 0xFF, size & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF,
     };
-    return send_raw(cmd, sizeof(cmd));
+    return send_packet(pkt, sizeof(pkt));
 }
 
-esp_err_t topway_draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color)
+esp_err_t topway_sys_reg_write(uint32_t addr, uint8_t value)
 {
-    uint8_t cmd[12] = {
-        TOPWAY_FRAME_HEAD,
-        TOPWAY_FRAME_TAIL,
-        0x22,  /* Draw line */
-        (x1 >> 8) & 0xFF, x1 & 0xFF,
-        (y1 >> 8) & 0xFF, y1 & 0xFF,
-        (x2 >> 8) & 0xFF, x2 & 0xFF,
-        (y2 >> 8) & 0xFF, y2 & 0xFF,
-        (color >> 8) & 0xFF, color & 0xFF
+    uint8_t pkt[6] = {
+        TOPWAY_CMD_SYS_REG_WRITE,
+        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        value,
     };
-    return send_raw(cmd, sizeof(cmd));
+    return send_packet(pkt, sizeof(pkt));
 }
 
-esp_err_t topway_draw_text(uint16_t x, uint16_t y, const char *text, uint16_t color, uint8_t font_size)
+esp_err_t topway_rtc_set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec)
 {
-    if (!text) return ESP_ERR_INVALID_ARG;
-    
-    size_t len = strlen(text);
-    if (len > 200) len = 200;
-    
-    /* Text display with position: 5A A5 24 [x] [y] [color] [size] [text...] */
-    uint8_t cmd[256];
-    cmd[0] = TOPWAY_FRAME_HEAD;
-    cmd[1] = TOPWAY_FRAME_TAIL;
-    cmd[2] = 0x24;  /* Display text at position */
-    cmd[3] = (x >> 8) & 0xFF;
-    cmd[4] = x & 0xFF;
-    cmd[5] = (y >> 8) & 0xFF;
-    cmd[6] = y & 0xFF;
-    cmd[7] = (color >> 8) & 0xFF;
-    cmd[8] = color & 0xFF;
-    cmd[9] = font_size;
-    memcpy(&cmd[10], text, len);
-    
-    return send_raw(cmd, len + 10);
+    uint8_t pkt[7] = {
+        TOPWAY_CMD_RTC_SET,
+        year, month, day, hour, min, sec,
+    };
+    return send_packet(pkt, sizeof(pkt));
 }

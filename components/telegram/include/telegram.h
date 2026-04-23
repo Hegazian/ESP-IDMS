@@ -36,7 +36,6 @@ esp_err_t telegram_heartbeat(void);
  */
 void telegram_command_poll_start(void);
 
-/**
- * Flush any queued offline alerts now that connectivity is restored.
- */
 void telegram_flush_offline_queue(void);
+
+void telegram_cancel_alerts(const char *chat_id);
