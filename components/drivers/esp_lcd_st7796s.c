@@ -8,6 +8,9 @@
 
 static const char *TAG = "st7796s";
 
+#define ST7796S_NATIVE_W 320
+#define ST7796S_NATIVE_H 480
+
 static esp_err_t send_cmd(esp_lcd_panel_io_handle_t io, uint8_t cmd)
 {
     return esp_lcd_panel_io_tx_param(io, cmd, NULL, 0);
@@ -20,121 +23,67 @@ static esp_err_t send_data(esp_lcd_panel_io_handle_t io, uint8_t cmd, const uint
 
 esp_err_t st7796s_lcd_init(esp_lcd_panel_io_handle_t io)
 {
-    ESP_LOGI(TAG, "Initializing ST7796 LCD (480x320 landscape)");
+    ESP_LOGI(TAG, "Initializing ST7796S LCD (TFT_eSPI proven sequence)");
 
-    /* Software Reset */
     send_cmd(io, 0x01);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Sleep Out */
     send_cmd(io, 0x11);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Memory Data Access Control: BGR + MV (landscape rotation) */
-    uint8_t madctl = 0x00;
-    madctl |= (1 << 3); /* BGR */
-    madctl |= (1 << 5); /* MV: row/column exchange for landscape */
-    send_data(io, 0x36, &madctl, 1);
+    send_data(io, 0xF0, (uint8_t[]){0xC3}, 1);
+    send_data(io, 0xF0, (uint8_t[]){0x96}, 1);
 
-    /* Interface Pixel Format: 16-bit RGB565 */
-    uint8_t pixfmt = 0x55;
-    send_data(io, 0x3A, &pixfmt, 1);
+    send_data(io, 0x36, (uint8_t[]){0x48}, 1);
+    send_data(io, 0x3A, (uint8_t[]){0x55}, 1);
+    send_data(io, 0xB4, (uint8_t[]){0x01}, 1);
+    send_data(io, 0xB6, (uint8_t[]){0x80, 0x02, 0x3B}, 3);
+    send_data(io, 0xE8, (uint8_t[]){0x40, 0x8A, 0x00, 0x00, 0x29, 0x19, 0xA5, 0x33}, 8);
+    send_data(io, 0xC1, (uint8_t[]){0x06}, 1);
+    send_data(io, 0xC2, (uint8_t[]){0xA7}, 1);
+    send_data(io, 0xC5, (uint8_t[]){0x18}, 1);
 
-    /* Porch Setting */
-    uint8_t porch[5] = {0x0C, 0x0C, 0x00, 0x33, 0x33};
-    send_data(io, 0xB2, porch, 5);
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Gate Control */
-    uint8_t gate = 0x35;
-    send_data(io, 0xB7, &gate, 1);
-
-    /* VCOM Setting */
-    uint8_t vcom = 0x19;
-    send_data(io, 0xBB, &vcom, 1);
-
-    /* LCM Control */
-    send_data(io, 0xC0, (uint8_t[]){0x2C, 0x2C}, 2);
-
-    /* VCOM Voltage Setting */
-    send_data(io, 0xC2, (uint8_t[]){0x01, 0xFF}, 2);
-
-    /* VDV Setting */
-    uint8_t vdv = 0x20;
-    send_data(io, 0xC5, &vdv, 1);
-
-    /* Frame Rate Control: 60Hz */
-    uint8_t frate = 0x0F;
-    send_data(io, 0xC6, &frate, 1);
-
-    /* Power Control 1 */
-    send_data(io, 0xD0, (uint8_t[]){0xA4, 0xA1}, 2);
-
-    /* Positive Gamma */
     send_data(io, 0xE0,
-        (uint8_t[]){0xD0, 0x08, 0x0E, 0x09, 0x09, 0x05, 0x31, 0x33,
-                     0x48, 0x17, 0x14, 0x15, 0x31, 0x34}, 14);
-
-    /* Negative Gamma */
+        (uint8_t[]){0xF0, 0x09, 0x0B, 0x06, 0x04, 0x15, 0x2F, 0x54,
+                     0x42, 0x3C, 0x17, 0x14, 0x18, 0x1B}, 14);
     send_data(io, 0xE1,
-        (uint8_t[]){0xD0, 0x08, 0x0E, 0x09, 0x09, 0x15, 0x31, 0x33,
-                     0x48, 0x17, 0x14, 0x15, 0x31, 0x34}, 14);
+        (uint8_t[]){0xE0, 0x09, 0x0B, 0x06, 0x04, 0x03, 0x2B, 0x43,
+                     0x42, 0x3B, 0x16, 0x14, 0x17, 0x1B}, 14);
 
-    /* Column Address Set: 0..479 (landscape width) */
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    send_data(io, 0xF0, (uint8_t[]){0x3C}, 1);
+    send_data(io, 0xF0, (uint8_t[]){0x69}, 1);
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    uint8_t madctl = 0x28;
+    send_data(io, 0x36, &madctl, 1);
     send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4);
-
-    /* Row Address Set: 0..319 (landscape height) */
     send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0x3F}, 4);
 
-    /* Display On first */
     send_cmd(io, 0x29);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Then Enable Color Inversion - CRITICAL: Most TFT panels need this ON */
-    send_cmd(io, 0x21);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    /* Turn on backlight control (if available) */
-    send_cmd(io, 0x53); /* Write CTRL Display */
-    {
-        uint8_t ctrl = 0x24; /* BL=1, D=1 */
-        send_data(io, 0x53, &ctrl, 1);
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    /* Test: Write a small red rectangle to verify SPI is working */
-    ESP_LOGI(TAG, "Writing test pattern to verify SPI...");
-    send_data(io, 0x2A, (uint8_t[]){0x00, 0x00, 0x00, 0x4F}, 4);  /* Column: 0-79 */
-    send_data(io, 0x2B, (uint8_t[]){0x00, 0x00, 0x00, 0x4F}, 4);  /* Row: 0-79 */
-    
-    /* Fill 80x80 = 6400 pixels with red (0xF800) */
-    uint16_t *test_buf = heap_caps_malloc(6400 * 2, MALLOC_CAP_DMA);
-    if (test_buf) {
-        for (int i = 0; i < 6400; i++) test_buf[i] = 0xF800; /* Red */
-        send_cmd(io, 0x2C); /* Memory Write */
-        esp_lcd_panel_io_tx_color(io, 0x2C, test_buf, 6400 * 2);
-        free(test_buf);
-        ESP_LOGI(TAG, "Test pattern sent (red 80x80 rect)");
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    ESP_LOGI(TAG, "ST7796 initialized (MADCTL=0x%02X, inversion=ON)", madctl);
+    ESP_LOGI(TAG, "ST7796S initialized (MADCTL=0x%02X, no inversion)", madctl);
     return ESP_OK;
 }
 
 esp_err_t st7796s_lcd_mirror(esp_lcd_panel_io_handle_t io, bool mirror_x, bool mirror_y)
 {
-    uint8_t madctl = 0x00;
-    madctl |= (1 << 3); /* BGR always on */
-    if (mirror_x) madctl |= (1 << 6); /* MX: column address order */
-    if (mirror_y) madctl |= (1 << 7); /* MY: row address order */
+    uint8_t madctl = 0x08;
+    madctl |= (1 << 5);
+    if (mirror_x) madctl |= (1 << 6);
+    if (mirror_y) madctl |= (1 << 7);
     return send_data(io, 0x36, &madctl, 1);
 }
 
 esp_err_t st7796s_lcd_swap_xy(esp_lcd_panel_io_handle_t io, bool swap)
 {
-    uint8_t madctl = 0x00;
-    madctl |= (1 << 3); /* BGR */
-    if (swap) madctl |= (1 << 5); /* MV: row/column exchange */
+    uint8_t madctl = 0x08;
+    if (swap) madctl |= (1 << 5);
     return send_data(io, 0x36, &madctl, 1);
 }
 
@@ -147,21 +96,22 @@ esp_err_t st7796s_lcd_fill_color(esp_lcd_panel_io_handle_t io, uint16_t color, i
 {
     ESP_LOGI(TAG, "Fill screen %dx%d with color 0x%04X", width, height, color);
 
-    uint8_t col[4] = {0x00, 0x00, (uint8_t)((width - 1) >> 8), (uint8_t)((width - 1) & 0xFF)};
-    uint8_t row[4] = {0x00, 0x00, (uint8_t)((height - 1) >> 8), (uint8_t)((height - 1) & 0xFF)};
-    esp_err_t err;
+    /* With MV=1 landscape: Column address = native Y range, Row address = native X range
+     * We fill the entire screen: CAS 0..479, RAS 0..319 */
+    uint8_t col[4] = {0x00, 0x00, (uint8_t)((ST7796S_NATIVE_H - 1) >> 8), (uint8_t)((ST7796S_NATIVE_H - 1) & 0xFF)};
+    uint8_t row[4] = {0x00, 0x00, (uint8_t)((ST7796S_NATIVE_W - 1) >> 8), (uint8_t)((ST7796S_NATIVE_W - 1) & 0xFF)};
 
+    esp_err_t err;
     err = esp_lcd_panel_io_tx_param(io, 0x2A, col, 4);
     if (err != ESP_OK) { ESP_LOGE(TAG, "CASET failed: %s", esp_err_to_name(err)); return err; }
-
     err = esp_lcd_panel_io_tx_param(io, 0x2B, row, 4);
     if (err != ESP_OK) { ESP_LOGE(TAG, "RASET failed: %s", esp_err_to_name(err)); return err; }
 
-    int chunk_lines = 10;
-    size_t chunk_px = width * chunk_lines;
+    int total_px = ST7796S_NATIVE_W * ST7796S_NATIVE_H;
+    int chunk_px = ST7796S_NATIVE_W * 10;
     size_t chunk_bytes = chunk_px * sizeof(uint16_t);
 
-    uint16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    uint16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!buf) {
         buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
@@ -169,31 +119,20 @@ esp_err_t st7796s_lcd_fill_color(esp_lcd_panel_io_handle_t io, uint16_t color, i
         ESP_LOGE(TAG, "Failed to allocate fill buffer (%zu bytes)", chunk_bytes);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Fill buffer %zu bytes allocated at %p", chunk_bytes, (void *)buf);
 
     for (int i = 0; i < chunk_px; i++) {
         buf[i] = color;
     }
 
-    for (int y = 0; y < height; y += chunk_lines) {
-        int lines = chunk_lines;
-        if (y + lines > height) lines = height - y;
-
-        uint8_t wr_col[4] = {0x00, 0x00, (uint8_t)((width - 1) >> 8), (uint8_t)((width - 1) & 0xFF)};
-        uint8_t wr_row[4] = {
-            (uint8_t)(y >> 8), (uint8_t)(y & 0xFF),
-            (uint8_t)((y + lines - 1) >> 8), (uint8_t)((y + lines - 1) & 0xFF)
-        };
-        err = esp_lcd_panel_io_tx_param(io, 0x2A, wr_col, 4);
-        if (err != ESP_OK) { ESP_LOGE(TAG, "CASET row failed: %s", esp_err_to_name(err)); break; }
-        err = esp_lcd_panel_io_tx_param(io, 0x2B, wr_row, 4);
-        if (err != ESP_OK) { ESP_LOGE(TAG, "RASET row failed: %s", esp_err_to_name(err)); break; }
-
-        size_t len = width * lines * sizeof(uint16_t);
+    for (int offset = 0; offset < total_px; offset += chunk_px) {
+        int remaining = total_px - offset;
+        int this_px = (remaining < chunk_px) ? remaining : chunk_px;
+        size_t len = this_px * sizeof(uint16_t);
         err = esp_lcd_panel_io_tx_color(io, 0x2C, buf, len);
-        if (err != ESP_OK) { ESP_LOGE(TAG, "Color tx failed at y=%d: %s", y, esp_err_to_name(err)); break; }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Color tx failed at px %d: %s", offset, esp_err_to_name(err));
+            break;
+        }
     }
 
     free(buf);
@@ -201,50 +140,83 @@ esp_err_t st7796s_lcd_fill_color(esp_lcd_panel_io_handle_t io, uint16_t color, i
     return ESP_OK;
 }
 
-esp_err_t st7796s_lcd_test_read_id(esp_lcd_panel_io_handle_t io)
+esp_err_t st7796s_lcd_read_id(esp_lcd_panel_io_handle_t io, uint8_t *out_id, size_t out_sz)
 {
-    ESP_LOGI(TAG, "=== LCD SPI DIAGNOSTIC ===");
-    ESP_LOGI(TAG, "Expected IM[2:0]=111 for 4-wire SPI. Check your display IM pins!");
-    ESP_LOGI(TAG, "If IM pins are wrong, display stays white (commands accepted but no pixel output).");
+    if (!out_id || out_sz < 4) return ESP_ERR_INVALID_ARG;
 
-    /* Verify GPIO states at boot */
-    ESP_LOGI(TAG, "GPIO outputs: DC=%d, CS=%d, SCLK=18, MOSI=9, RST=12",
-             CONFIG_IDMS_PIN_LCD_DC, CONFIG_IDMS_PIN_LCD_CS);
-
-    /* Toggle DC pin to verify it's working */
-    int dc_pin = CONFIG_IDMS_PIN_LCD_DC;
-    gpio_set_level(dc_pin, 1);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    ESP_LOGI(TAG, "DC pin set HIGH, read back: %d", gpio_get_level(dc_pin));
-    gpio_set_level(dc_pin, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    ESP_LOGI(TAG, "DC pin set LOW, read back: %d", gpio_get_level(dc_pin));
-
-    /* Send RDDID command (0x04) and verify SPI bus responds */
-    esp_err_t err = esp_lcd_panel_io_tx_param(io, 0x04, NULL, 0);
+    memset(out_id, 0, out_sz);
+    uint8_t dummy = 0;
+    esp_err_t err = esp_lcd_panel_io_tx_param(io, 0x04, &dummy, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "RDDID command failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "RDDID command send failed: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "RDDID command sent OK (SPI bus responsive)");
 
-    /* Send MADCTL read attempt */
-    uint8_t madctl_val = 0x28;
-    err = esp_lcd_panel_io_tx_param(io, 0x36, &madctl_val, 1);
-    ESP_LOGI(TAG, "MADCTL write (0x28) result: %s", esp_err_to_name(err));
+    err = esp_lcd_panel_io_rx_param(io, 0x04, out_id, 4);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RDDID read failed: %s (display may not support readback over SPI)", esp_err_to_name(err));
+        return err;
+    }
 
-    /* Toggle backlight to verify display power */
+    ESP_LOGI(TAG, "RDDID: %02X %02X %02X %02X", out_id[0], out_id[1], out_id[2], out_id[3]);
+    uint16_t controller = ((uint16_t)out_id[1] << 8) | out_id[2];
+    if (controller == 0x7796) {
+        ESP_LOGI(TAG, "Controller confirmed: ST7796S");
+    } else if (controller == 0x0000 && out_id[0] == 0x00 && out_id[3] == 0x00) {
+        ESP_LOGW(TAG, "RDDID all zeros — display not responding");
+        ESP_LOGW(TAG, "  Possible causes:");
+        ESP_LOGW(TAG, "  1. IM pins wrong (need IM=111 for SPI 4-wire)");
+        ESP_LOGW(TAG, "  2. Display not powered or wiring issue");
+        ESP_LOGW(TAG, "  3. No MISO wire connected (RDDID requires MISO)");
+    } else {
+        ESP_LOGW(TAG, "Unexpected controller ID: 0x%04X (expected 0x7796)", controller);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t st7796s_lcd_selftest(esp_lcd_panel_io_handle_t io)
+{
+    ESP_LOGI(TAG, "=== ST7796S Self-Test ===");
+
+    uint8_t id[4] = {0};
+    esp_err_t err = st7796s_lcd_read_id(io, id, sizeof(id));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RDDID read failed — SPI readback may not be wired");
+    }
+
     if (CONFIG_IDMS_PIN_LCD_BL >= 0) {
-        ESP_LOGI(TAG, "Toggling backlight on pin %d...", CONFIG_IDMS_PIN_LCD_BL);
+        ESP_LOGI(TAG, "Toggling backlight on GPIO %d...", CONFIG_IDMS_PIN_LCD_BL);
         for (int i = 0; i < 3; i++) {
             gpio_set_level(CONFIG_IDMS_PIN_LCD_BL, 0);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(300));
             gpio_set_level(CONFIG_IDMS_PIN_LCD_BL, 1);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
         ESP_LOGI(TAG, "Did the backlight blink? If not, check BL wiring!");
     }
 
-    ESP_LOGI(TAG, "=== END LCD DIAGNOSTIC ===");
+    ESP_LOGI(TAG, "Filling screen RED...");
+    err = st7796s_lcd_fill_color(io, 0xF800, 480, 320);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Red fill failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    ESP_LOGI(TAG, "Filling screen GREEN...");
+    st7796s_lcd_fill_color(io, 0x07E0, 480, 320);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    ESP_LOGI(TAG, "Filling screen BLUE...");
+    st7796s_lcd_fill_color(io, 0x001F, 480, 320);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    ESP_LOGI(TAG, "Clearing screen (black)...");
+    st7796s_lcd_fill_color(io, 0x0000, 480, 320);
+
+    ESP_LOGI(TAG, "=== Self-Test Complete ===");
+    ESP_LOGI(TAG, "If you saw RED/GREEN/BLUE, display is working!");
+    ESP_LOGI(TAG, "If screen stayed WHITE, check IM pins and wiring");
     return ESP_OK;
 }

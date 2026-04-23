@@ -62,8 +62,22 @@ menu "ESP-IDMS Configuration"
             bool "PT100 RTD via MAX31865 SPI"
             help
                 PT100/PT1000 RTD sensors connected via MAX31865 RTD-to-digital converters.
-                Two MAX31865 chips on shared SPI bus for T_in and T_out.
+                Two MAX31865 chips on dedicated SPI bus for T_in and T_out.
                 Higher accuracy (±0.1°C) and industrial-grade reliability.
+
+        config IDMS_TEMP_SENSOR_PT100_ADC
+            bool "PT100 RTD via ADC (single sensor)"
+            help
+                Single PT100 RTD read directly through ESP32 ADC using a voltage
+                divider with a precision reference resistor.
+                Provides T_in only (no T_out). Delta-T unavailable.
+                Lower accuracy (±1-2°C) but no extra IC needed.
+
+        config IDMS_TEMP_SENSOR_DS18B20_PT100
+            bool "DS18B20 + PT100 ADC combo"
+            help
+                Mixed sensor setup: DS18B20 digital probes and PT100 RTD via ADC.
+                Configure which sensor type maps to T_in and T_out below.
     endchoice
 
     config IDMS_PIN_ONEWIRE
@@ -72,7 +86,7 @@ menu "ESP-IDMS Configuration"
         default 5 if IDF_TARGET_ESP32S3
         default 4 if IDF_TARGET_ESP32
         default 5
-        depends on IDMS_TEMP_SENSOR_DS18B20
+        depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
 
     config IDMS_MAX31865_CS0
         int "MAX31865 chip-select GPIO for T_in sensor"
@@ -117,6 +131,67 @@ menu "ESP-IDMS Configuration"
         config IDMS_MAX31865_WIRE_4
             bool "4-wire RTD"
     endchoice
+
+    config IDMS_PIN_PT100_ADC
+        int "PT100 ADC GPIO (must be ADC-capable)"
+        range 0 48
+        default 2 if IDF_TARGET_ESP32S3
+        default 32 if IDF_TARGET_ESP32
+        default 2
+        depends on IDMS_TEMP_SENSOR_PT100_ADC || IDMS_TEMP_SENSOR_DS18B20_PT100
+        help
+            ADC input GPIO reading the PT100 voltage divider midpoint.
+            ESP32-S3: GPIO 1-10 are ADC1 channels. Do NOT overlap with SPI/UART pins.
+
+    config IDMS_PT100_RREF_X10
+        int "Reference resistor value x10 ohms (e.g. 1500 = 150.0Ω)"
+        range 100 100000
+        default 1500
+        depends on IDMS_TEMP_SENSOR_PT100_ADC || IDMS_TEMP_SENSOR_DS18B20_PT100
+        help
+            R_ref in the voltage divider, multiplied by 10.
+            Common values: 150Ω (1500), 220Ω (2200), 330Ω (3300),
+            470Ω (4700), 1kΩ (10000).
+
+    config IDMS_PT100_R0_X10
+        int "PT100 nominal resistance at 0°C x10 (1000 = 100.0Ω for PT100)"
+        range 500 100000
+        default 1000
+        depends on IDMS_TEMP_SENSOR_PT100_ADC || IDMS_TEMP_SENSOR_DS18B20_PT100
+        help
+            Nominal RTD resistance at 0°C, multiplied by 10.
+            PT100 = 1000, PT1000 = 10000.
+
+    choice IDMS_COMBO_T_IN
+        prompt "T_in sensor type (DS18B20 + PT100 combo)"
+        default IDMS_COMBO_T_IN_DS18B20
+        depends on IDMS_TEMP_SENSOR_DS18B20_PT100
+
+        config IDMS_COMBO_T_IN_DS18B20
+            bool "DS18B20 digital probe"
+        config IDMS_COMBO_T_IN_PT100
+            bool "PT100 RTD via ADC"
+    endchoice
+
+    choice IDMS_COMBO_T_OUT
+        prompt "T_out sensor type (DS18B20 + PT100 combo)"
+        default IDMS_COMBO_T_OUT_DS18B20
+        depends on IDMS_TEMP_SENSOR_DS18B20_PT100
+
+        config IDMS_COMBO_T_OUT_DS18B20
+            bool "DS18B20 digital probe"
+        config IDMS_COMBO_T_OUT_PT100
+            bool "PT100 RTD via ADC"
+    endchoice
+
+    config IDMS_PIN_PT100_ADC2
+        int "Second PT100 ADC GPIO for T_out (-1 if same as T_in)"
+        range -1 48
+        default -1
+        depends on IDMS_TEMP_SENSOR_DS18B20_PT100 && IDMS_COMBO_T_OUT_PT100
+        help
+            If T_out also uses PT100 ADC, set this to a different ADC GPIO.
+            Set to -1 if both T_in and T_out share the same PT100 (not recommended).
 
     # ------------------------------------------------------------------
     #  Display — controller choice applies to both targets
@@ -180,37 +255,34 @@ choice IDMS_DISPLAY_CONTROLLER
                 Uses ESP32-S3 LCD_CAM peripheral for high-speed DMA transfers.
     endchoice
 
-config IDMS_LCD_HOST
-        int "SPI host ID (2 = FSPI / common SPI2, 3 = SPI3)"
-        range 1 3
-        default 2
-
     # ------------------------------------------------------------------
-    #  SPI bus pins — always needed (shared by MAX31865, XPT2046, and
-    #  LCD when in SPI mode).
-    #  ESP32-S3: avoid GPIO 19/20 (USB D+/D-), 26-32 (flash/PSRAM),
-    #  0/3/45/46 (strapping). Safe range: 1-18, 21-25, 33-42, 47-48.
+    #  LCD SPI bus — dedicated to LCD only (not shared with anything).
+    #  Uses SPI3_HOST. Only needed when LCD bus is SPI and not Topway.
+    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
+    #  ESP32-S3 avoid: 0/3/45/46 (strapping), 19/20 (USB), 26-32 (flash/PSRAM)
     # ------------------------------------------------------------------
 
     config IDMS_PIN_LCD_SCLK
-        int "SPI SCLK GPIO (shared by LCD + sensors)"
+        int "LCD SPI SCLK GPIO"
         range 0 48
+        default 18 if IDF_TARGET_ESP32
+        default 5 if IDF_TARGET_ESP32S3
         default 18
+        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
 
     config IDMS_PIN_LCD_MOSI
-        int "SPI MOSI GPIO (shared by LCD + sensors)"
+        int "LCD SPI MOSI GPIO"
         range 0 48
         default 23 if IDF_TARGET_ESP32
-        default 9 if IDF_TARGET_ESP32S3
+        default 17 if IDF_TARGET_ESP32S3
         default 23
+        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
 
     config IDMS_PIN_LCD_MISO
-        int "SPI MISO GPIO (touch and MAX31865)"
-        range 0 48
-        default 19 if IDF_TARGET_ESP32
-        default 8 if IDF_TARGET_ESP32S3
-        default 19
-        depends on IDMS_LCD_BUS_SPI
+        int "LCD SPI MISO GPIO (-1 if unused)"
+        range -1 48
+        default -1
+        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
 
     # ------------------------------------------------------------------
     #  I80 LCD pins (only when IDMS_LCD_BUS_I80)
@@ -318,6 +390,39 @@ config IDMS_LCD_HOST
         default 12 if IDF_TARGET_ESP32S3
         default -1
 
+    # ------------------------------------------------------------------
+    #  MAX31865 SPI bus — dedicated to RTD temperature sensors only.
+    #  Uses SPI2_HOST. Shares bus with XPT2046 touch if enabled.
+    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
+    # ------------------------------------------------------------------
+
+    config IDMS_PIN_MAX31865_SCLK
+        int "MAX31865 SPI SCLK GPIO"
+        range 0 48
+        default 18
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    config IDMS_PIN_MAX31865_MOSI
+        int "MAX31865 SPI MOSI GPIO"
+        range 0 48
+        default 9 if IDF_TARGET_ESP32S3
+        default 23 if IDF_TARGET_ESP32
+        default 9
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    config IDMS_PIN_MAX31865_MISO
+        int "MAX31865 SPI MISO GPIO"
+        range 0 48
+        default 8 if IDF_TARGET_ESP32S3
+        default 19 if IDF_TARGET_ESP32
+        default 8
+        depends on IDMS_TEMP_SENSOR_MAX31865
+
+    # ------------------------------------------------------------------
+    #  XPT2046 touch controller — shares MAX31865 SPI bus (SPI2_HOST)
+    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
+    # ------------------------------------------------------------------
+
     config IDMS_PIN_TOUCH_CS
         int "XPT2046 chip select GPIO (-1 to disable touch)"
         range -1 48
@@ -345,37 +450,51 @@ config IDMS_LCD_HOST
         default n
 
     # ------------------------------------------------------------------
-    #  UART pins for Topway Smart LCD
+    #  UART pins for Topway Smart LCD — dedicated, not shared with SPI
+    #  ESP32-S3: GPIO 1 and 3 are safe and NOT used by any SPI bus
     # ------------------------------------------------------------------
 
     config IDMS_PIN_UART_TX
         int "UART TX GPIO for Topway Smart LCD"
         range 0 48
-        default 17 if IDF_TARGET_ESP32S3
+        default 1 if IDF_TARGET_ESP32S3
         default 1 if IDF_TARGET_ESP32
-        default 17
+        default 1
+        depends on IDMS_DISPLAY_TOPWAY
         help
             TX pin for UART communication with Topway Smart LCD.
-            ESP32-S3: Safe pins include 1-18, 21-25, 33-42, 47-48.
+            Must NOT overlap with any SPI pin.
 
     config IDMS_PIN_UART_RX
         int "UART RX GPIO for Topway Smart LCD"
         range 0 48
-        default 18 if IDF_TARGET_ESP32S3
+        default 3 if IDF_TARGET_ESP32S3
         default 3 if IDF_TARGET_ESP32
-        default 18
+        default 3
+        depends on IDMS_DISPLAY_TOPWAY
         help
             RX pin for UART communication with Topway Smart LCD.
-            ESP32-S3: Safe pins include 1-18, 21-25, 33-42, 47-48.
+            Must NOT overlap with any SPI pin.
+
+    config IDMS_PIN_UART_RTS
+        int "UART RTS/BUSY GPIO for Topway Smart LCD (-1 if unused)"
+        range -1 48
+        default -1
+        depends on IDMS_DISPLAY_TOPWAY
+        help
+            RTS (BUSY) pin from Topway display for flow control.
+            The display pulls this LOW when busy processing a command.
+            Set to -1 to skip flow control (not recommended for fast updates).
 
     config IDMS_TOPWAY_BAUD
         int "Topway UART baud rate"
-        range 9600 921600
-        default 115200
+        range 1200 921600
+        default 9600
         depends on IDMS_DISPLAY_TOPWAY
         help
             Baud rate for UART communication with Topway Smart LCD.
-            Default 115200. Check your display documentation for supported rates.
+            Default 9600 (JP1,JP7 close; JP2,JP8 open). Use 115200 for
+            factory default jumper settings (JP1,JP7 close; JP2,JP8 open).
 
     config IDMS_UI_ENABLE
         bool "Enable LVGL + display UI"
