@@ -3,6 +3,7 @@
  * See upstream copyright in https://github.com/PaulStoffregen/OneWire
  *
  * Multi-bus variant: each 1-Wire bus is an independent ow_bus_t instance.
+ * Uses explicit INPUT/OUTPUT direction toggling for maximum compatibility.
  */
 #include "onewire.h"
 #include "esp_rom_sys.h"
@@ -12,12 +13,14 @@
 
 static void ow_drive_low(ow_bus_t *bus)
 {
+    gpio_set_direction(bus->pin, GPIO_MODE_OUTPUT);
     gpio_set_level(bus->pin, 0);
 }
 
 static void ow_release(ow_bus_t *bus)
 {
-    gpio_set_level(bus->pin, 1);
+    gpio_set_direction(bus->pin, GPIO_MODE_INPUT);
+    /* Internal pull-up was enabled during init; external 4.7k must also be present */
 }
 
 void ow_bus_init(ow_bus_t *bus, gpio_num_t pin)
@@ -31,13 +34,12 @@ void ow_bus_init(ow_bus_t *bus, gpio_num_t pin)
 
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << bus->pin,
-        .mode = GPIO_MODE_OUTPUT_OD,
+        .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io);
-    ow_release(bus);
 }
 
 bool ow_bus_reset(ow_bus_t *bus)
@@ -46,24 +48,23 @@ bool ow_bus_reset(ow_bus_t *bus)
     ow_drive_low(bus);
     esp_rom_delay_us(480);
     ow_release(bus);
-    esp_rom_delay_us(70);
+    esp_rom_delay_us(80);
     int level = gpio_get_level(bus->pin);
     taskEXIT_CRITICAL(&bus->mux);
-    esp_rom_delay_us(410);
+    esp_rom_delay_us(400);
     return level == 0;
 }
 
 static void ow_write_bit(ow_bus_t *bus, int b)
 {
     taskENTER_CRITICAL(&bus->mux);
+    ow_drive_low(bus);
     if (b) {
-        ow_drive_low(bus);
         esp_rom_delay_us(6);
         ow_release(bus);
         esp_rom_delay_us(64);
     } else {
-        ow_drive_low(bus);
-        esp_rom_delay_us(60);
+        esp_rom_delay_us(65);
         ow_release(bus);
         esp_rom_delay_us(10);
     }
@@ -77,10 +78,10 @@ static int ow_read_bit(ow_bus_t *bus)
     ow_drive_low(bus);
     esp_rom_delay_us(3);
     ow_release(bus);
-    esp_rom_delay_us(10);
+    esp_rom_delay_us(17);   /* sample at ~20 us, well inside 15-60 us window */
     v = gpio_get_level(bus->pin);
     taskEXIT_CRITICAL(&bus->mux);
-    esp_rom_delay_us(53);
+    esp_rom_delay_us(47);   /* complete 70 us slot */
     return v;
 }
 

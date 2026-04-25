@@ -36,5 +36,6 @@ endif()
 idf_component_register(
     SRCS ${driver_srcs}
     INCLUDE_DIRS "include"
+    REQUIRES esp_driver_uart
     PRIV_REQUIRES ${driver_requires} esp_lcd
 )

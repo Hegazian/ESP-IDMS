@@ -33,31 +33,41 @@ static void update_display_values(void) {
   monitor_get_metrics(&m);
 
   if (m.current_valid) {
-    topway_n16_write(VP_N16_CUR_X10, (uint16_t)(m.current_a * 10.0f + 0.5f));
+    uint16_t cur_x10 = (uint16_t)(m.current_a * 10.0f + 0.5f);
+    topway_n16_write(VP_N16_CUR_X10, cur_x10);
     topway_n16_write(VP_N16_CUR_VALID, 1);
+    ESP_LOGI(TAG, "DISP: Current=%.2fA (VP=0x%06X val=%u)", m.current_a, VP_N16_CUR_X10, cur_x10);
   } else {
     topway_n16_write(VP_N16_CUR_VALID, 0);
     topway_str_write(VP_STR_CURRENT, "--");
+    ESP_LOGI(TAG, "DISP: Current=-- (invalid)");
   }
 
   if (m.t_in_valid) {
-    topway_n16_write(VP_N16_TIN_X10, (uint16_t)(m.t_in_c * 10.0f + 0.5f));
+    uint16_t tin_x10 = (uint16_t)(m.t_in_c * 10.0f + 0.5f);
+    topway_n16_write(VP_N16_TIN_X10, tin_x10);
     topway_n16_write(VP_N16_TIN_VALID, 1);
+    ESP_LOGI(TAG, "DISP: T_in=%.1fC (VP=0x%06X val=%u)", m.t_in_c, VP_N16_TIN_X10, tin_x10);
   } else {
     topway_n16_write(VP_N16_TIN_VALID, 0);
+    ESP_LOGI(TAG, "DISP: T_in=-- (invalid)");
   }
 
   if (m.t_out_valid) {
-    topway_n16_write(VP_N16_TOUT_X10, (uint16_t)(m.t_out_c * 10.0f + 0.5f));
+    uint16_t tout_x10 = (uint16_t)(m.t_out_c * 10.0f + 0.5f);
+    topway_n16_write(VP_N16_TOUT_X10, tout_x10);
     topway_n16_write(VP_N16_TOUT_VALID, 1);
+    ESP_LOGI(TAG, "DISP: T_out=%.1fC (VP=0x%06X val=%u)", m.t_out_c, VP_N16_TOUT_X10, tout_x10);
   } else {
     topway_n16_write(VP_N16_TOUT_VALID, 0);
+    ESP_LOGI(TAG, "DISP: T_out=-- (invalid)");
   }
 
   if (m.delta_valid) {
     int16_t dt_x10 = (int16_t)(m.delta_t_c * 10.0f + 0.5f);
     topway_n16_write(VP_N16_DT_X10, (uint16_t)dt_x10);
     topway_n16_write(VP_N16_DT_VALID, 1);
+    ESP_LOGI(TAG, "DISP: dT=%.1fC (VP=0x%06X val=%d)", m.delta_t_c, VP_N16_DT_X10, dt_x10);
     if (m.delta_t_c < CONFIG_IDMS_DT_LOW_C ||
         m.delta_t_c > CONFIG_IDMS_DT_HIGH_C) {
       topway_n16_write(VP_N16_COOL_FAULT, 1);
@@ -66,6 +76,7 @@ static void update_display_values(void) {
     }
   } else {
     topway_n16_write(VP_N16_DT_VALID, 0);
+    ESP_LOGI(TAG, "DISP: dT=-- (invalid)");
   }
 
   if (wifi_manager_is_connected()) {

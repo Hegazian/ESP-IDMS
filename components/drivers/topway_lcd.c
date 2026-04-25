@@ -45,7 +45,7 @@ static esp_err_t send_packet(const uint8_t *payload, size_t len)
     uart_wait_tx_done(s_uart, pdMS_TO_TICKS(200));
     xSemaphoreGive(s_tx_mux);
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(30));
     return ESP_OK;
 }
 
@@ -315,7 +315,7 @@ esp_err_t topway_n16_write(uint32_t addr, uint16_t value)
 {
     uint8_t pkt[7] = {
         TOPWAY_CMD_N16_WRITE,
-        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
         (value >> 8) & 0xFF, value & 0xFF,
     };
     return send_packet(pkt, sizeof(pkt));
@@ -325,7 +325,7 @@ esp_err_t topway_n16_fill(uint32_t addr, uint16_t length, uint16_t value)
 {
     uint8_t pkt[9] = {
         TOPWAY_CMD_N16_FILL,
-        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
         (length >> 8) & 0xFF, length & 0xFF,
         (value >> 8) & 0xFF, value & 0xFF,
     };
@@ -336,7 +336,7 @@ esp_err_t topway_n32_write(uint32_t addr, uint32_t value)
 {
     uint8_t pkt[9] = {
         TOPWAY_CMD_N32_WRITE,
-        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
         (value >> 24) & 0xFF, (value >> 16) & 0xFF,
         (value >> 8) & 0xFF, value & 0xFF,
     };
@@ -347,7 +347,7 @@ esp_err_t topway_n64_write(uint32_t addr, uint64_t value)
 {
     uint8_t pkt[13] = {
         TOPWAY_CMD_N64_WRITE,
-        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
         (value >> 56) & 0xFF, (value >> 48) & 0xFF,
         (value >> 40) & 0xFF, (value >> 32) & 0xFF,
         (value >> 24) & 0xFF, (value >> 16) & 0xFF,
@@ -362,15 +362,15 @@ esp_err_t topway_str_write(uint32_t addr, const char *str)
     size_t slen = strlen(str);
     if (slen > 127) slen = 127;
 
-    uint8_t pkt[5 + 128 + 1];
+    uint8_t pkt[5 + 128];
     pkt[0] = TOPWAY_CMD_STR_WRITE;
-    pkt[1] = (addr >> 16) & 0xFF;
-    pkt[2] = (addr >> 8) & 0xFF;
-    pkt[3] = addr & 0xFF;
-    memcpy(&pkt[4], str, slen);
-    pkt[4 + slen] = 0x00;
+    pkt[1] = (addr >> 24) & 0xFF;
+    pkt[2] = (addr >> 16) & 0xFF;
+    pkt[3] = (addr >> 8) & 0xFF;
+    pkt[4] = addr & 0xFF;
+    memcpy(&pkt[5], str, slen);
 
-    return send_packet(pkt, 4 + slen + 1);
+    return send_packet(pkt, 5 + slen);
 }
 
 esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)
@@ -379,32 +379,33 @@ esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)
     size_t slen = strlen(str);
     if (slen > 127) slen = 127;
 
-    uint8_t pkt[7 + 128 + 1];
+    uint8_t pkt[7 + 128];
     pkt[0] = TOPWAY_CMD_STR_FILL;
-    pkt[1] = (addr >> 16) & 0xFF;
-    pkt[2] = (addr >> 8) & 0xFF;
-    pkt[3] = addr & 0xFF;
-    pkt[4] = (length >> 8) & 0xFF;
-    pkt[5] = length & 0xFF;
-    memcpy(&pkt[6], str, slen);
-    pkt[6 + slen] = 0x00;
+    pkt[1] = (addr >> 24) & 0xFF;
+    pkt[2] = (addr >> 16) & 0xFF;
+    pkt[3] = (addr >> 8) & 0xFF;
+    pkt[4] = addr & 0xFF;
+    pkt[5] = (length >> 8) & 0xFF;
+    pkt[6] = length & 0xFF;
+    memcpy(&pkt[7], str, slen);
 
-    return send_packet(pkt, 6 + slen + 1);
+    return send_packet(pkt, 7 + slen);
 }
 
 esp_err_t topway_successive_write(uint32_t addr, uint8_t length, const uint8_t *data, size_t data_len)
 {
     if (!data || length == 0) return ESP_ERR_INVALID_ARG;
 
-    uint8_t pkt[6 + 510];
+    uint8_t pkt[7 + 510];
     pkt[0] = TOPWAY_CMD_SUCCESSIVE_WRITE;
-    pkt[1] = (addr >> 16) & 0xFF;
-    pkt[2] = (addr >> 8) & 0xFF;
-    pkt[3] = addr & 0xFF;
-    pkt[4] = length;
-    memcpy(&pkt[5], data, data_len);
+    pkt[1] = (addr >> 24) & 0xFF;
+    pkt[2] = (addr >> 16) & 0xFF;
+    pkt[3] = (addr >> 8) & 0xFF;
+    pkt[4] = addr & 0xFF;
+    pkt[5] = length;
+    memcpy(&pkt[6], data, data_len);
 
-    return send_packet(pkt, 5 + data_len);
+    return send_packet(pkt, 6 + data_len);
 }
 
 esp_err_t topway_g16_write(uint32_t addr, uint16_t size, const uint16_t *values)
@@ -443,7 +444,7 @@ esp_err_t topway_sys_reg_write(uint32_t addr, uint8_t value)
 {
     uint8_t pkt[6] = {
         TOPWAY_CMD_SYS_REG_WRITE,
-        (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
         value,
     };
     return send_packet(pkt, sizeof(pkt));

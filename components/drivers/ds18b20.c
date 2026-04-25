@@ -59,6 +59,12 @@ void ds18b20_init(void)
 
     /* Search each bus for devices */
     for (int b = 0; b < s_num_buses && s_count < MAX_DEVICES; b++) {
+        bool present = ow_bus_reset(&s_buses[b]);
+        ESP_LOGI(TAG, "Bus %d (GPIO%d) reset: %s", b, (int)(b == 0 ? pin1 : pin2),
+                 present ? "PRESENT pulse detected" : "NO presence pulse");
+
+        if (!present) continue;
+
         ow_bus_search_reset_state(&s_buses[b]);
         uint64_t code = 0;
         while (s_count < MAX_DEVICES && ow_bus_search_next(&s_buses[b], &code)) {
@@ -109,6 +115,7 @@ bool ds18b20_read_temperature_c(int index, float *out_c)
     ow_bus_t *bus = &s_buses[s_rom_bus[index]];
 
     if (!ow_bus_reset(bus)) {
+        ESP_LOGW(TAG, "Sensor %d reset failed", index);
         return false;
     }
     ow_match_rom(bus, s_rom[index]);
@@ -117,7 +124,11 @@ bool ds18b20_read_temperature_c(int index, float *out_c)
     for (int i = 0; i < 9; i++) {
         sp[i] = ow_bus_read_byte(bus);
     }
-    if (ow_crc8(sp, 8) != sp[8]) {
+    uint8_t crc = ow_crc8(sp, 8);
+    ESP_LOGI(TAG, "Sensor %d scratchpad: %02X %02X %02X %02X %02X %02X %02X %02X %02X | CRC calc=%02X %s",
+             index, sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], crc,
+             (crc == sp[8]) ? "OK" : "FAIL");
+    if (crc != sp[8]) {
         return false;
     }
     int16_t raw = (int16_t)(sp[0] | (sp[1] << 8));
