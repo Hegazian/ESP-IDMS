@@ -81,6 +81,32 @@ static void init_max31865_spi_bus(void)
 }
 #endif
 
+#if CONFIG_IDMS_PIN_TOUCH_CS >= 0
+#if !defined(IDMS_LCD_SPI_HOST)
+/* Touch gets its own SPI3 bus (no SPI LCD sharing it) */
+static void init_touch_spi_bus(void)
+{
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = CONFIG_IDMS_PIN_TOUCH_SCLK,
+        .mosi_io_num = CONFIG_IDMS_PIN_TOUCH_MOSI,
+        .miso_io_num = CONFIG_IDMS_PIN_TOUCH_MISO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(IDMS_TOUCH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_LOGI(TAG, "Touch SPI bus initialized (host=%d, SCLK=%d, MOSI=%d, MISO=%d)",
+             (int)IDMS_TOUCH_SPI_HOST,
+             (int)CONFIG_IDMS_PIN_TOUCH_SCLK,
+             (int)CONFIG_IDMS_PIN_TOUCH_MOSI,
+             (int)CONFIG_IDMS_PIN_TOUCH_MISO);
+}
+#else
+/* Touch shares SPI bus with LCD — no separate init needed */
+static void init_touch_spi_bus(void) { }
+#endif
+#endif
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP-IDMS firmware boot");
@@ -113,8 +139,12 @@ void app_main(void)
     init_max31865_spi_bus();
 #endif
 
+#if CONFIG_IDMS_PIN_TOUCH_CS >= 0
+    init_touch_spi_bus();
+#endif
+
     monitor_init();
-    
+
 #if CONFIG_IDMS_DISPLAY_TOPWAY
     idms_ui_topway_init();
 #else

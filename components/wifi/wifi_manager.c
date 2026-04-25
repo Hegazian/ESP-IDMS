@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
+#include "esp_sntp.h"
+#endif
+
 static const char *TAG = "wifi";
 
 static esp_netif_t *s_netif;
@@ -107,6 +111,17 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         }
         set_ip();
         ESP_LOGI(TAG, "Got IP: %s", s_ip);
+
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
+        if (esp_sntp_enabled() == 0) {
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_setservername(2, "time.windows.com");
+            esp_sntp_init();
+            ESP_LOGI(TAG, "SNTP initialized");
+        }
+#endif
     }
 }
 

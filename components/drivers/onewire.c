@@ -1,6 +1,8 @@
 /*
  * 1-Wire bit-level driver + Dallas search (adapted from Paul Stoffregen OneWire.cpp, MIT license).
  * See upstream copyright in https://github.com/PaulStoffregen/OneWire
+ *
+ * Multi-bus variant: each 1-Wire bus is an independent ow_bus_t instance.
  */
 #include "onewire.h"
 #include "esp_rom_sys.h"
@@ -8,90 +10,93 @@
 #include "freertos/task.h"
 #include <string.h>
 
-static gpio_num_t s_pin = GPIO_NUM_NC;
-static portMUX_TYPE s_ow_mux = portMUX_INITIALIZER_UNLOCKED;
-
-static void ow_drive_low(void)
+static void ow_drive_low(ow_bus_t *bus)
 {
-    gpio_set_level(s_pin, 0);
+    gpio_set_level(bus->pin, 0);
 }
 
-static void ow_release(void)
+static void ow_release(ow_bus_t *bus)
 {
-    gpio_set_level(s_pin, 1);
+    gpio_set_level(bus->pin, 1);
 }
 
-void ow_init(gpio_num_t pin)
+void ow_bus_init(ow_bus_t *bus, gpio_num_t pin)
 {
-    s_pin = pin;
+    bus->pin = pin;
+    bus->mux = (portMUX_TYPE) portMUX_INITIALIZER_UNLOCKED;
+    bus->last_discrepancy = 0;
+    bus->last_family_discrepancy = 0;
+    bus->last_device_flag = false;
+    memset(bus->rom_no, 0, sizeof(bus->rom_no));
+
     gpio_config_t io = {
-        .pin_bit_mask = 1ULL << s_pin,
+        .pin_bit_mask = 1ULL << bus->pin,
         .mode = GPIO_MODE_OUTPUT_OD,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io);
-    ow_release();
+    ow_release(bus);
 }
 
-bool ow_reset(void)
+bool ow_bus_reset(ow_bus_t *bus)
 {
-    taskENTER_CRITICAL(&s_ow_mux);
-    ow_drive_low();
+    taskENTER_CRITICAL(&bus->mux);
+    ow_drive_low(bus);
     esp_rom_delay_us(480);
-    ow_release();
+    ow_release(bus);
     esp_rom_delay_us(70);
-    int level = gpio_get_level(s_pin);
-    taskEXIT_CRITICAL(&s_ow_mux);
+    int level = gpio_get_level(bus->pin);
+    taskEXIT_CRITICAL(&bus->mux);
     esp_rom_delay_us(410);
     return level == 0;
 }
 
-static void ow_write_bit(int b)
+static void ow_write_bit(ow_bus_t *bus, int b)
 {
-    taskENTER_CRITICAL(&s_ow_mux);
+    taskENTER_CRITICAL(&bus->mux);
     if (b) {
-        ow_drive_low();
+        ow_drive_low(bus);
         esp_rom_delay_us(6);
-        ow_release();
+        ow_release(bus);
         esp_rom_delay_us(64);
     } else {
-        ow_drive_low();
+        ow_drive_low(bus);
         esp_rom_delay_us(60);
-        ow_release();
+        ow_release(bus);
         esp_rom_delay_us(10);
     }
-    taskEXIT_CRITICAL(&s_ow_mux);
+    taskEXIT_CRITICAL(&bus->mux);
 }
 
-static int ow_read_bit(void)
+static int ow_read_bit(ow_bus_t *bus)
 {
     int v;
-    taskENTER_CRITICAL(&s_ow_mux);
-    ow_drive_low();
+    taskENTER_CRITICAL(&bus->mux);
+    ow_drive_low(bus);
     esp_rom_delay_us(3);
-    ow_release();
+    ow_release(bus);
     esp_rom_delay_us(10);
-    v = gpio_get_level(s_pin);
-    taskEXIT_CRITICAL(&s_ow_mux);
+    v = gpio_get_level(bus->pin);
+    taskEXIT_CRITICAL(&bus->mux);
     esp_rom_delay_us(53);
     return v;
 }
 
-void ow_write_byte(uint8_t v)
+void ow_bus_write_byte(ow_bus_t *bus, uint8_t v)
 {
     for (int i = 0; i < 8; i++) {
-        ow_write_bit(v & 1);
+        ow_write_bit(bus, v & 1);
         v >>= 1;
     }
 }
 
-uint8_t ow_read_byte(void)
+uint8_t ow_bus_read_byte(ow_bus_t *bus)
 {
     uint8_t v = 0;
     for (int i = 0; i < 8; i++) {
-        if (ow_read_bit()) {
+        if (ow_read_bit(bus)) {
             v |= 1 << i;
         }
     }
@@ -115,20 +120,15 @@ uint8_t ow_crc8(const uint8_t *addr, uint8_t len)
     return crc;
 }
 
-static uint8_t s_rom_no[8];
-static uint8_t s_last_discrepancy = 0;
-static uint8_t s_last_family_discrepancy = 0;
-static bool s_last_device_flag = false;
-
-void ow_search_reset_state(void)
+void ow_bus_search_reset_state(ow_bus_t *bus)
 {
-    s_last_discrepancy = 0;
-    s_last_family_discrepancy = 0;
-    s_last_device_flag = false;
-    memset(s_rom_no, 0, sizeof(s_rom_no));
+    bus->last_discrepancy = 0;
+    bus->last_family_discrepancy = 0;
+    bus->last_device_flag = false;
+    memset(bus->rom_no, 0, sizeof(bus->rom_no));
 }
 
-bool ow_search_next(uint64_t *rom_code)
+bool ow_bus_search_next(ow_bus_t *bus, uint64_t *rom_code)
 {
     if (!rom_code) {
         return false;
@@ -143,16 +143,16 @@ bool ow_search_next(uint64_t *rom_code)
     unsigned char rom_byte_mask = 1;
     unsigned char search_direction;
 
-    if (!s_last_device_flag) {
-        if (!ow_reset()) {
-            ow_search_reset_state();
+    if (!bus->last_device_flag) {
+        if (!ow_bus_reset(bus)) {
+            ow_bus_search_reset_state(bus);
             return false;
         }
-        ow_write_byte(0xF0);
+        ow_bus_write_byte(bus, 0xF0);
 
         do {
-            id_bit = ow_read_bit();
-            cmp_id_bit = ow_read_bit();
+            id_bit = ow_read_bit(bus);
+            cmp_id_bit = ow_read_bit(bus);
 
             if ((id_bit == 1) && (cmp_id_bit == 1)) {
                 break;
@@ -160,26 +160,26 @@ bool ow_search_next(uint64_t *rom_code)
                 if (id_bit != cmp_id_bit) {
                     search_direction = id_bit;
                 } else {
-                    if (id_bit_number < s_last_discrepancy) {
-                        search_direction = ((s_rom_no[rom_byte_number] & rom_byte_mask) > 0);
+                    if (id_bit_number < bus->last_discrepancy) {
+                        search_direction = ((bus->rom_no[rom_byte_number] & rom_byte_mask) > 0);
                     } else {
-                        search_direction = (id_bit_number == s_last_discrepancy);
+                        search_direction = (id_bit_number == bus->last_discrepancy);
                     }
                     if (search_direction == 0) {
                         last_zero = id_bit_number;
                         if (last_zero < 9) {
-                            s_last_family_discrepancy = last_zero;
+                            bus->last_family_discrepancy = last_zero;
                         }
                     }
                 }
 
                 if (search_direction == 1) {
-                    s_rom_no[rom_byte_number] |= rom_byte_mask;
+                    bus->rom_no[rom_byte_number] |= rom_byte_mask;
                 } else {
-                    s_rom_no[rom_byte_number] &= ~rom_byte_mask;
+                    bus->rom_no[rom_byte_number] &= ~rom_byte_mask;
                 }
 
-                ow_write_bit(search_direction);
+                ow_write_bit(bus, search_direction);
 
                 id_bit_number++;
                 rom_byte_mask <<= 1;
@@ -193,21 +193,21 @@ bool ow_search_next(uint64_t *rom_code)
     }
 
     if (!(id_bit_number < 65)) {
-        s_last_discrepancy = last_zero;
-        if (s_last_discrepancy == 0) {
-            s_last_device_flag = true;
+        bus->last_discrepancy = last_zero;
+        if (bus->last_discrepancy == 0) {
+            bus->last_device_flag = true;
         }
         search_result = true;
     }
 
-    if (!search_result || !s_rom_no[0]) {
-        ow_search_reset_state();
+    if (!search_result || !bus->rom_no[0]) {
+        ow_bus_search_reset_state(bus);
         return false;
     }
 
     uint64_t rom = 0;
     for (int i = 0; i < 8; i++) {
-        rom |= (uint64_t)s_rom_no[i] << (8 * i);
+        rom |= (uint64_t)bus->rom_no[i] << (8 * i);
     }
     *rom_code = rom;
     return true;

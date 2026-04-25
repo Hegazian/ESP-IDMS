@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <time.h>
 
 typedef struct {
     float current_a;
@@ -14,7 +15,13 @@ typedef struct {
     bool delta_valid;
     bool wifi_connected;
     char wifi_ip[16];
+    time_t timestamp_utc;
+    bool time_synced;
 } idms_metrics_t;
 
 void monitor_init(void);
 void monitor_get_metrics(idms_metrics_t *out);
+
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+void monitor_calibrate_zero(void);
+#endif
