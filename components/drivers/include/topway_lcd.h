@@ -110,6 +110,10 @@ extern "C" {
 #define VP_STR_WIFI      0x000200
 #define VP_STR_VERSION   0x000280
 #define VP_STR_OTA       0x000300
+#define VP_STR_STATUS    0x000380
+#define VP_STR_STATUS_ERR 0x000600
+#define VP_STR_STATUS_WARN 0x000700
+#define VP_STR_DIAG      0x000500
 
 #define VP_N16_CUR_X10      0x080000
 #define VP_N16_TIN_X10      0x080002

@@ -362,15 +362,16 @@ esp_err_t topway_str_write(uint32_t addr, const char *str)
     size_t slen = strlen(str);
     if (slen > 127) slen = 127;
 
-    uint8_t pkt[5 + 128];
+    uint8_t pkt[5 + 128 + 1];
     pkt[0] = TOPWAY_CMD_STR_WRITE;
     pkt[1] = (addr >> 24) & 0xFF;
     pkt[2] = (addr >> 16) & 0xFF;
     pkt[3] = (addr >> 8) & 0xFF;
     pkt[4] = addr & 0xFF;
     memcpy(&pkt[5], str, slen);
+    pkt[5 + slen] = 0x00;  /* null terminator required by Topway protocol */
 
-    return send_packet(pkt, 5 + slen);
+    return send_packet(pkt, 5 + slen + 1);
 }
 
 esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)

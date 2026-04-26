@@ -125,10 +125,9 @@ bool ds18b20_read_temperature_c(int index, float *out_c)
         sp[i] = ow_bus_read_byte(bus);
     }
     uint8_t crc = ow_crc8(sp, 8);
-    ESP_LOGI(TAG, "Sensor %d scratchpad: %02X %02X %02X %02X %02X %02X %02X %02X %02X | CRC calc=%02X %s",
-             index, sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], crc,
-             (crc == sp[8]) ? "OK" : "FAIL");
     if (crc != sp[8]) {
+        ESP_LOGW(TAG, "Sensor %d CRC fail: %02X %02X %02X %02X %02X %02X %02X %02X %02X calc=%02X",
+                 index, sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], crc);
         return false;
     }
     int16_t raw = (int16_t)(sp[0] | (sp[1] << 8));
