@@ -110,20 +110,26 @@ extern "C" {
 #define VP_STR_WIFI      0x000200
 #define VP_STR_VERSION   0x000280
 #define VP_STR_OTA       0x000300
+#define VP_STR_STATUS    0x000380
+#define VP_STR_STATUS_ERR 0x000600
+#define VP_STR_STATUS_WARN 0x000700
+#define VP_STR_DIAG      0x000500
 
 #define VP_N16_CUR_X10      0x080000
-#define VP_N16_CUR_VALID    0x080002
-#define VP_N16_TIN_X10      0x080004
-#define VP_N16_TIN_VALID    0x080006
-#define VP_N16_TOUT_X10     0x080008
-#define VP_N16_TOUT_VALID   0x08000A
-#define VP_N16_DT_X10       0x08000C
-#define VP_N16_DT_VALID     0x08000E
-#define VP_N16_WIFI_STATUS  0x080010
-#define VP_N16_OTA_STATUS   0x080012
-#define VP_N16_TECH_COUNT   0x080014
-#define VP_N16_POWER_FAULT  0x080016
-#define VP_N16_COOL_FAULT   0x080018
+#define VP_N16_TIN_X10      0x080002
+#define VP_N16_TOUT_X10     0x080004
+#define VP_N16_DT_X10       0x080006
+
+/* Valid flags and extra status variables - placed after the 4 main display vars */
+#define VP_N16_CUR_VALID    0x080010
+#define VP_N16_TIN_VALID    0x080012
+#define VP_N16_TOUT_VALID   0x080014
+#define VP_N16_DT_VALID     0x080016
+#define VP_N16_WIFI_STATUS  0x080018
+#define VP_N16_OTA_STATUS   0x08001A
+#define VP_N16_TECH_COUNT   0x08001C
+#define VP_N16_POWER_FAULT  0x08001E
+#define VP_N16_COOL_FAULT   0x080020
 
 #define WIFI_STATUS_OFFLINE   0
 #define WIFI_STATUS_CONNECTED 1

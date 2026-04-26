@@ -557,7 +557,7 @@ void idms_ui_init(void)
 #endif
 
 #if CONFIG_IDMS_PIN_TOUCH_CS >= 0
-    ESP_ERROR_CHECK(xpt2046_init(IDMS_SENSOR_SPI_HOST));
+    ESP_ERROR_CHECK(xpt2046_init(IDMS_TOUCH_SPI_HOST));
 #endif
 
 #if CONFIG_IDMS_DISPLAY_ILI9341

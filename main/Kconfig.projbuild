@@ -28,6 +28,24 @@ menu "ESP-IDMS Configuration"
         range 10 500000
         default 3000
 
+    config IDMS_SCT_AUTOZERO_ENABLE
+        bool "Enable SCT-013 auto-zero calibration"
+        default y
+        help
+            When enabled, the monitor samples the ADC at startup with no load
+            to determine the noise floor (RMS offset). This offset is subtracted
+            from all subsequent current readings to improve low-current accuracy.
+            Disable if you do not have a no-load startup condition.
+
+    config IDMS_SCT_AUTOZERO_SAMPLES
+        int "Auto-zero sample count"
+        range 64 4096
+        default 512
+        depends on IDMS_SCT_AUTOZERO_ENABLE
+        help
+            Number of ADC samples to collect for auto-zero calibration.
+            More samples = better accuracy but longer startup time.
+
     config IDMS_DT_LOW_C
         int "Cooling fault: delta-T below (°C)"
         range 1 20
@@ -81,12 +99,24 @@ menu "ESP-IDMS Configuration"
     endchoice
 
     config IDMS_PIN_ONEWIRE
-        int "DS18B20 1-Wire GPIO"
+        int "DS18B20 1-Wire GPIO for T_in sensor"
         range 0 48
         default 5 if IDF_TARGET_ESP32S3
         default 4 if IDF_TARGET_ESP32
         default 5
         depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
+
+    config IDMS_PIN_ONEWIRE2
+        int "DS18B20 1-Wire GPIO for T_out sensor"
+        range 0 48
+        default 7 if IDF_TARGET_ESP32S3
+        default 17 if IDF_TARGET_ESP32
+        default 7
+        depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
+        help
+            Dedicated GPIO for the second DS18B20 sensor (T_out).
+            Must be DIFFERENT from the T_in pin. Each sensor has its own
+            1-Wire bus with its own pull-up resistor — no shared bus.
 
     config IDMS_MAX31865_CS0
         int "MAX31865 chip-select GPIO for T_in sensor"
@@ -135,13 +165,16 @@ menu "ESP-IDMS Configuration"
     config IDMS_PIN_PT100_ADC
         int "PT100 ADC GPIO (must be ADC-capable)"
         range 0 48
-        default 2 if IDF_TARGET_ESP32S3
-        default 32 if IDF_TARGET_ESP32
-        default 2
+        default 15 if IDF_TARGET_ESP32S3
+        default 13 if IDF_TARGET_ESP32
+        default 15
         depends on IDMS_TEMP_SENSOR_PT100_ADC || IDMS_TEMP_SENSOR_DS18B20_PT100
         help
             ADC input GPIO reading the PT100 voltage divider midpoint.
-            ESP32-S3: GPIO 1-10 are ADC1 channels. Do NOT overlap with SPI/UART pins.
+            MUST be on a DIFFERENT ADC unit from the SCT-013 current sensor
+            to avoid sharing the ADC bus.
+            ESP32-S3: SCT-013 defaults to ADC1 (GPIO 6). Use ADC2 (GPIO 11-20) for PT100.
+            ESP32: SCT-013 defaults to ADC1 (GPIO 34). Use ADC2 (GPIO 0,2,4,12-15,25-27) for PT100.
 
     config IDMS_PT100_RREF_X10
         int "Reference resistor value x10 ohms (e.g. 1500 = 150.0Ω)"
@@ -419,7 +452,8 @@ choice IDMS_DISPLAY_CONTROLLER
         depends on IDMS_TEMP_SENSOR_MAX31865
 
     # ------------------------------------------------------------------
-    #  XPT2046 touch controller — shares MAX31865 SPI bus (SPI2_HOST)
+    #  XPT2046 touch controller — dedicated SPI bus (SPI3_HOST)
+    #  Must use different SCLK/MOSI/MISO pins from MAX31865 (SPI2_HOST)
     #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
     # ------------------------------------------------------------------
 
@@ -436,6 +470,30 @@ choice IDMS_DISPLAY_CONTROLLER
         default 36 if IDF_TARGET_ESP32
         default 14 if IDF_TARGET_ESP32S3
         default 36
+
+    config IDMS_PIN_TOUCH_SCLK
+        int "XPT2046 SPI SCLK GPIO"
+        range 0 48
+        default 12 if IDF_TARGET_ESP32S3
+        default 15 if IDF_TARGET_ESP32
+        default 12
+        depends on IDMS_PIN_TOUCH_CS >= 0
+
+    config IDMS_PIN_TOUCH_MOSI
+        int "XPT2046 SPI MOSI GPIO"
+        range 0 48
+        default 13 if IDF_TARGET_ESP32S3
+        default 2 if IDF_TARGET_ESP32
+        default 13
+        depends on IDMS_PIN_TOUCH_CS >= 0
+
+    config IDMS_PIN_TOUCH_MISO
+        int "XPT2046 SPI MISO GPIO"
+        range 0 48
+        default 16 if IDF_TARGET_ESP32S3
+        default 4 if IDF_TARGET_ESP32
+        default 16
+        depends on IDMS_PIN_TOUCH_CS >= 0
 
     config IDMS_LCD_SWAP_XY
         bool "Swap X/Y for landscape orientation"

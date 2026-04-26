@@ -10,8 +10,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+#include "topway_lcd.h"
+#endif
 
 static const char *TAG = "console";
 
@@ -171,6 +176,47 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "Telegram token: ****");
         ESP_LOGI(TAG, "OTA user:       %s", ota_user[0] ? ota_user : "(not set)");
         ESP_LOGI(TAG, "OTA password:   ****");
+    } else if (strcmp(cmd, "topway_test") == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        ESP_LOGI(TAG, "Writing test values to Topway screen...");
+        topway_n16_write(0x080000, 123);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        topway_n16_write(0x080002, 456);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        topway_n16_write(0x080004, 789);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        topway_n16_write(0x080006, 999);
+        ESP_LOGI(TAG, "Test values sent: 123, 456, 789, 999");
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strcmp(cmd, "adc") == 0) {
+        int mean = 0, rms = 0, errors = 0;
+        monitor_adc_debug(&mean, &rms, &errors);
+        ESP_LOGI(TAG, "ADC debug: mean=%d, rms=%d, errors=%d/64 (GPIO%d, unit=1 ch=5)",
+                 mean, rms, errors, CONFIG_IDMS_ADC_GPIO);
+        ESP_LOGI(TAG, "  Expected: mean~2048 with bias circuit, mean~0 if pin floating/0V");
+        ESP_LOGI(TAG, "  If errors>0: GPIO%d may not support ADC or ADC not initialized", CONFIG_IDMS_ADC_GPIO);
+    } else if (strncmp(cmd, "topway_str ", 11) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        const char *arg = cmd + 11;
+        unsigned long addr = 0;
+        int consumed = 0;
+        if (sscanf(arg, "%lx%n", &addr, &consumed) == 1) {
+            const char *text = arg + consumed;
+            while (*text == ' ') text++;
+            if (strlen(text) > 0) {
+                topway_str_write((uint32_t)addr, text);
+                ESP_LOGI(TAG, "Wrote \"%s\" to VP 0x%06lX", text, addr);
+            } else {
+                ESP_LOGW(TAG, "Usage: topway_str <hex_addr> <text>");
+            }
+        } else {
+            ESP_LOGW(TAG, "Usage: topway_str <hex_addr> <text>");
+        }
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
     } else if (strcmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
         ESP_LOGI(TAG, "  add <chat_id>    — Add technician ID to NVS");
@@ -185,6 +231,9 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
         ESP_LOGI(TAG, "  set_ota_pass <p> — Set OTA HTTP password (NVS)");
         ESP_LOGI(TAG, "  show_secrets     — Show secret status (values hidden)");
+        ESP_LOGI(TAG, "  topway_test      — Write test values to Topway screen");
+        ESP_LOGI(TAG, "  topway_str <hex_addr> <text> — Write string to Topway VP address");
+        ESP_LOGI(TAG, "  adc              — Read raw ADC values (diagnose current sensor)");
         ESP_LOGI(TAG, "  reboot           — Reboot device");
         ESP_LOGI(TAG, "  help             — Show this help");
     } else {

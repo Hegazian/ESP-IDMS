@@ -9,6 +9,11 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
+#include "esp_sntp.h"
+#endif
 
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20 || CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
 #include "ds18b20.h"
@@ -53,37 +58,112 @@ static enum cool_state_t s_cool_st = COOL_OK;
 static uint32_t s_power_low_ms;
 static uint32_t s_cool_bad_ms;
 
+#if CONFIG_IDMS_UI_ENABLE
+static bool s_power_alert_pending;
+static bool s_power_restore_pending;
+static bool s_cool_alert_pending;
+static bool s_cool_alert_low_side;
+static float s_cool_alert_pending_dt;
+static bool s_cool_restore_pending;
+#endif
+
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+static float s_adc_offset_volts = 0.0f;
+#endif
+
 static float estimate_current_a_from_adc_rms(float v_rms)
 {
     float scale = (float)CONFIG_IDMS_CT_AMPS_PER_VOLT_X100 / 100.0f;
     return v_rms * scale;
 }
 
+static int s_adc_err_count;
+static bool s_adc_sensor_connected = false;
+static float s_current_ema = 0.0f;
+static bool s_current_ema_initialized = false;
+#define CURRENT_EMA_ALPHA 0.15f
+
 static float sample_current_rms_volts(void)
 {
-    const int n = 256;
+    const int n = 512;
     int32_t sum = 0;
-    int32_t sum_sq = 0;
+    int64_t sum_sq = 0;
+    int err_count = 0;
     
-    /* Single-pass RMS calculation using integer math where possible */
     for (int i = 0; i < n; i++) {
         int v = 0;
-        if (adc_oneshot_read(s_adc, s_adc_channel, &v) != ESP_OK) {
+        esp_err_t ret = adc_oneshot_read(s_adc, s_adc_channel, &v);
+        if (ret != ESP_OK) {
             v = 0;
+            err_count++;
         }
         sum += v;
-        sum_sq += v * v;
+        sum_sq += (int64_t)v * (int64_t)v;
     }
     
-    /* Calculate RMS: sqrt((sum_sq/n) - (sum/n)^2) */
+    s_adc_err_count = err_count;
+    
     float mean = (float)sum / (float)n;
     float mean_sq = (float)sum_sq / (float)n;
     float variance = mean_sq - (mean * mean);
-    if (variance < 0.0f) variance = 0.0f;  /* Prevent negative due to floating point errors */
+    if (variance < 0.0f) variance = 0.0f;
     float rms_counts = sqrtf(variance);
-    
-    return rms_counts * (3.3f / 4095.0f);
+    float vrms = rms_counts * (3.3f / 4095.0f);
+
+    if (mean > 4080.0f || mean < 15.0f) {
+        s_adc_sensor_connected = false;
+    } else {
+        s_adc_sensor_connected = true;
+    }
+
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+    vrms -= s_adc_offset_volts;
+    if (vrms < 0.0f) {
+        vrms = 0.0f;
+    }
+#endif
+
+    return vrms;
 }
+
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+void monitor_calibrate_zero(void)
+{
+    const int n = CONFIG_IDMS_SCT_AUTOZERO_SAMPLES;
+    int32_t sum = 0;
+    int64_t sum_sq = 0;
+    int err_count = 0;
+
+    ESP_LOGI(TAG, "Starting SCT-013 auto-zero calibration (%d samples)...", n);
+    for (int i = 0; i < n; i++) {
+        int v = 0;
+        esp_err_t ret = adc_oneshot_read(s_adc, s_adc_channel, &v);
+        if (ret != ESP_OK) {
+            v = 0;
+            err_count++;
+        }
+        sum += v;
+        sum_sq += (int64_t)v * (int64_t)v;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (err_count > 0) {
+        ESP_LOGE(TAG, "Auto-zero: %d/%d ADC reads FAILED (GPIO%d may not support ADC)",
+                 err_count, n, CONFIG_IDMS_ADC_GPIO);
+    }
+
+    float mean = (float)sum / (float)n;
+    float mean_sq = (float)sum_sq / (float)n;
+    float variance = mean_sq - (mean * mean);
+    if (variance < 0.0f) {
+        variance = 0.0f;
+    }
+    float rms_counts = sqrtf(variance);
+    s_adc_offset_volts = rms_counts * (3.3f / 4095.0f);
+
+    ESP_LOGI(TAG, "Auto-zero complete: offset = %.4f V (%.1f ADC counts), mean = %.1f",
+             s_adc_offset_volts, (double)rms_counts, (double)mean);
+}
+#endif
 
 #if CONFIG_IDMS_UI_ENABLE
 #define ALERT_MSG_BUF_SIZE 256
@@ -152,7 +232,15 @@ static void monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
 
         float vrms = sample_current_rms_volts();
-        float amps = estimate_current_a_from_adc_rms(vrms);
+        float amps_raw = estimate_current_a_from_adc_rms(vrms);
+        float amps;
+        if (!s_current_ema_initialized) {
+            s_current_ema = amps_raw;
+            s_current_ema_initialized = true;
+        } else {
+            s_current_ema = CURRENT_EMA_ALPHA * amps_raw + (1.0f - CURRENT_EMA_ALPHA) * s_current_ema;
+        }
+        amps = s_current_ema;
 
         float t_in = 0.0f, t_out = 0.0f;
         bool v_in = false, v_out = false;
@@ -215,9 +303,17 @@ static void monitor_task(void *arg)
             dt = t_out - t_in;
         }
 
+#if CONFIG_IDMS_UI_ENABLE
+        bool wifi_up = wifi_manager_is_connected();
+#endif
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
+        bool time_synced = (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
+        time_t timestamp_utc = time_synced ? time(NULL) : 0;
+#endif
+
         portENTER_CRITICAL(&s_metrics_lock);
         s_metrics.current_a = amps;
-        s_metrics.current_valid = true;
+        s_metrics.current_valid = s_adc_sensor_connected;
         s_metrics.t_in_c = t_in;
         s_metrics.t_out_c = t_out;
         s_metrics.t_in_valid = v_in;
@@ -225,52 +321,46 @@ static void monitor_task(void *arg)
         s_metrics.delta_t_c = dt;
         s_metrics.delta_valid = v_dt;
 #if CONFIG_IDMS_UI_ENABLE
-        s_metrics.wifi_connected = wifi_manager_is_connected();
+        s_metrics.wifi_connected = wifi_up;
         wifi_manager_get_ip(s_metrics.wifi_ip, sizeof(s_metrics.wifi_ip));
+#endif
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
+        s_metrics.time_synced = time_synced;
+        s_metrics.timestamp_utc = timestamp_utc;
 #endif
         portEXIT_CRITICAL(&s_metrics_lock);
 
-#if CONFIG_IDMS_UI_ENABLE
-        if (wifi_manager_is_connected()) {
-            s_heartbeat_ticks++;
-            if (s_heartbeat_ticks >= 120) {
-                s_heartbeat_ticks = 0;
-                telegram_heartbeat();
-            }
-        } else {
-            s_heartbeat_ticks = 0;
-        }
-
-        if (!wifi_manager_is_connected()) {
-            continue;
-        }
-#endif
-
-        /* Power fault detection with proper state management */
+        /* Power fault detection — ALWAYS runs, independent of Wi-Fi */
         if (amps < i_thresh) {
             s_power_low_ms += 500;
-            /* Check for new fault condition */
             if (s_power_low_ms >= 5000 && s_power_st == POWER_OK) {
                 s_power_st = POWER_LOW_PENDING;
             }
             if (s_power_low_ms >= 5000 && s_power_st == POWER_LOW_PENDING) {
 #if CONFIG_IDMS_UI_ENABLE
-                send_power_alert(true, amps);
+                if (wifi_up) {
+                    send_power_alert(true, amps);
+                } else {
+                    s_power_alert_pending = true;
+                }
 #endif
                 s_power_st = POWER_FAULT;
             }
         } else {
-            /* Current is normal - reset fault state if was in fault */
             if (s_power_st == POWER_FAULT) {
 #if CONFIG_IDMS_UI_ENABLE
-                send_power_alert(false, amps);
+                if (wifi_up) {
+                    send_power_alert(false, amps);
+                } else {
+                    s_power_restore_pending = true;
+                }
 #endif
             }
             s_power_low_ms = 0;
             s_power_st = POWER_OK;
         }
 
-        /* Cooling fault detection with proper state management */
+        /* Cooling fault detection — ALWAYS runs, independent of Wi-Fi */
         if (v_dt) {
             bool bad_low = dt < (float)dt_low;
             bool bad_high = dt > (float)dt_high;
@@ -278,32 +368,36 @@ static void monitor_task(void *arg)
 
             if (bad) {
                 s_cool_bad_ms += 500;
-                /* Transition to pending fault after debounce */
                 if (s_cool_bad_ms >= 5000 && s_cool_st == COOL_OK) {
+#if CONFIG_IDMS_UI_ENABLE
+                    if (wifi_up) {
+                        send_cool_alert(bad_low, dt);
+                    } else {
+                        s_cool_alert_pending = true;
+                        s_cool_alert_low_side = bad_low;
+                        s_cool_alert_pending_dt = dt;
+                    }
+#endif
                     if (bad_low) {
-#if CONFIG_IDMS_UI_ENABLE
-                        send_cool_alert(true, dt);
-#endif
                         s_cool_st = COOL_FAULT_LOW;
-                    } else if (bad_high) {
-#if CONFIG_IDMS_UI_ENABLE
-                        send_cool_alert(false, dt);
-#endif
+                    } else {
                         s_cool_st = COOL_FAULT_HIGH;
                     }
                 }
             } else {
-                /* Delta-T is normal - reset if was in fault */
                 if (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH) {
 #if CONFIG_IDMS_UI_ENABLE
-                    send_cool_restored();
+                    if (wifi_up) {
+                        send_cool_restored();
+                    } else {
+                        s_cool_restore_pending = true;
+                    }
 #endif
                 }
                 s_cool_bad_ms = 0;
                 s_cool_st = COOL_OK;
             }
         } else {
-            /* Sensor data invalid - reset cooling fault state */
             if (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH) {
 #if CONFIG_IDMS_UI_ENABLE
                 ESP_LOGW(TAG, "Temperature sensor data invalid, resetting cooling fault state");
@@ -312,6 +406,36 @@ static void monitor_task(void *arg)
             s_cool_bad_ms = 0;
             s_cool_st = COOL_OK;
         }
+
+#if CONFIG_IDMS_UI_ENABLE
+        /* Wi-Fi dependent operations: heartbeat and flush pending alerts */
+        if (wifi_up) {
+            s_heartbeat_ticks++;
+            if (s_heartbeat_ticks >= 120) {
+                s_heartbeat_ticks = 0;
+                telegram_heartbeat();
+            }
+
+            if (s_power_alert_pending) {
+                send_power_alert(true, amps);
+                s_power_alert_pending = false;
+            }
+            if (s_power_restore_pending) {
+                send_power_alert(false, amps);
+                s_power_restore_pending = false;
+            }
+            if (s_cool_alert_pending) {
+                send_cool_alert(s_cool_alert_low_side, s_cool_alert_pending_dt);
+                s_cool_alert_pending = false;
+            }
+            if (s_cool_restore_pending) {
+                send_cool_restored();
+                s_cool_restore_pending = false;
+            }
+        } else {
+            s_heartbeat_ticks = 0;
+        }
+#endif
     }
 }
 
@@ -328,6 +452,15 @@ void monitor_init(void)
     }
     s_adc_channel = ch;
 
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << adc_gpio,
+        .mode = GPIO_MODE_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
     adc_oneshot_unit_init_cfg_t ucfg = {
         .unit_id = unit_id,
     };
@@ -339,31 +472,48 @@ void monitor_init(void)
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, s_adc_channel, &chcfg));
 
+    int test_val = 0;
+    err = adc_oneshot_read(s_adc, s_adc_channel, &test_val);
+    ESP_LOGI(TAG, "ADC test read: GPIO%d, unit=%d, ch=%d, val=%d, err=%s",
+             (int)adc_gpio, (int)unit_id, (int)ch, test_val,
+             err == ESP_OK ? "OK" : esp_err_to_name(err));
+    if (test_val >= 4090 || test_val <= 5) {
+        ESP_LOGW(TAG, "ADC reading stuck at %d (full range 0-4095)", test_val);
+        ESP_LOGW(TAG, "  If 4095: GPIO%d is floating (read VCC) — check SCT-013 bias circuit", (int)adc_gpio);
+        ESP_LOGW(TAG, "  Bias circuit: 2x10kR divider (3V3-GPIO6-GND) + 10uF cap + 33R burden");
+        ESP_LOGW(TAG, "  If 0: GPIO6 shorted to GND or ADC misconfigured");
+    }
+
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+    monitor_calibrate_zero();
+#endif
+
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20
     ds18b20_init();
-    ESP_LOGI(TAG, "Temperature sensors: DS18B20 1-Wire (GPIO%d)", CONFIG_IDMS_PIN_ONEWIRE);
+    ESP_LOGI(TAG, "Temperature sensors: DS18B20 1-Wire (T_in=GPIO%d, T_out=GPIO%d)",
+             CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_ONEWIRE2);
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
     max31865_init(IDMS_SENSOR_SPI_HOST);
     ESP_LOGI(TAG, "Temperature sensors: PT100 via MAX31865 (CS0=GPIO%d, CS1=GPIO%d)",
              CONFIG_IDMS_MAX31865_CS0, CONFIG_IDMS_MAX31865_CS1);
 #elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
-    pt100_adc_init(&s_pt100_in, s_adc, CONFIG_IDMS_PIN_PT100_ADC,
+    pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
                    (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
                    (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
     ESP_LOGI(TAG, "Temperature sensors: PT100 via ADC (GPIO%d, R_ref=%.1fΩ)",
              CONFIG_IDMS_PIN_PT100_ADC, (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f);
 #elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
     ds18b20_init();
-    pt100_adc_init(&s_pt100_in, s_adc, CONFIG_IDMS_PIN_PT100_ADC,
+    pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
                    (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
                    (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
 #if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
-    pt100_adc_init(&s_pt100_out, s_adc, CONFIG_IDMS_PIN_PT100_ADC2,
+    pt100_adc_init(&s_pt100_out, CONFIG_IDMS_PIN_PT100_ADC2,
                    (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
                    (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
 #endif
-    ESP_LOGI(TAG, "Temperature sensors: DS18B20+PT100 combo (1-Wire=GPIO%d, PT100 ADC=GPIO%d)",
-             CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_PT100_ADC);
+    ESP_LOGI(TAG, "Temperature sensors: DS18B20+PT100 combo (1-Wire=GPIO%d/%d, PT100 ADC=GPIO%d)",
+             CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_ONEWIRE2, CONFIG_IDMS_PIN_PT100_ADC);
 #endif
 
     memset(&s_metrics, 0, sizeof(s_metrics));
@@ -380,4 +530,33 @@ void monitor_get_metrics(idms_metrics_t *out)
     portENTER_CRITICAL(&s_metrics_lock);
     *out = s_metrics;
     portEXIT_CRITICAL(&s_metrics_lock);
+}
+
+void monitor_adc_debug(int *out_mean, int *out_rms, int *out_errors)
+{
+    const int n = 64;
+    int32_t sum = 0;
+    int64_t sum_sq = 0;
+    int err = 0;
+
+    for (int i = 0; i < n; i++) {
+        int v = 0;
+        esp_err_t ret = adc_oneshot_read(s_adc, s_adc_channel, &v);
+        if (ret != ESP_OK) {
+            v = 0;
+            err++;
+        }
+        sum += v;
+        sum_sq += (int64_t)v * (int64_t)v;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    float mean = (float)sum / (float)n;
+    float mean_sq = (float)sum_sq / (float)n;
+    float variance = mean_sq - (mean * mean);
+    if (variance < 0.0f) variance = 0.0f;
+
+    if (out_mean) *out_mean = (int)mean;
+    if (out_rms) *out_rms = (int)sqrtf(variance);
+    if (out_errors) *out_errors = err;
 }

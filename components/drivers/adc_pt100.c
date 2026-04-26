@@ -11,7 +11,7 @@ static const char *TAG = "adc_pt100";
 #define RTD_A 3.9083e-3f
 #define RTD_B -5.775e-7f
 
-esp_err_t pt100_adc_init(pt100_adc_t *ctx, adc_oneshot_unit_handle_t adc, int gpio, float r_ref, float r0)
+esp_err_t pt100_adc_init(pt100_adc_t *ctx, int gpio, float r_ref, float r0)
 {
     if (!ctx) return ESP_ERR_INVALID_ARG;
 
@@ -23,28 +23,51 @@ esp_err_t pt100_adc_init(pt100_adc_t *ctx, adc_oneshot_unit_handle_t adc, int gp
         return err;
     }
 
+    /* Create a dedicated ADC unit handle — no sharing with SCT-013 */
+    adc_oneshot_unit_init_cfg_t ucfg = {
+        .unit_id = unit_id,
+    };
+    err = adc_oneshot_new_unit(&ucfg, &ctx->adc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create dedicated ADC unit %d for GPIO %d: %s. "
+                 "Ensure this GPIO is on a DIFFERENT ADC unit from the SCT-013 sensor.",
+                 (int)unit_id, gpio, esp_err_to_name(err));
+        return err;
+    }
+
     adc_oneshot_chan_cfg_t chcfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12,
     };
-    err = adc_oneshot_config_channel(adc, ch, &chcfg);
+    err = adc_oneshot_config_channel(ctx->adc, ch, &chcfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADC channel config failed for GPIO %d: %s", gpio, esp_err_to_name(err));
+        adc_oneshot_del_unit(ctx->adc);
+        ctx->adc = NULL;
         return err;
     }
 
-    ctx->adc = adc;
     ctx->channel = ch;
     ctx->r_ref = r_ref;
     ctx->r0 = r0;
 
-    ESP_LOGI(TAG, "PT100 ADC initialized (GPIO=%d, R_ref=%.1fΩ, R0=%.1fΩ)", gpio, r_ref, r0);
+    ESP_LOGI(TAG, "PT100 ADC initialized (unit=%d, GPIO=%d, ch=%d, R_ref=%.1fΩ, R0=%.1fΩ)",
+             (int)unit_id, gpio, (int)ch, r_ref, r0);
     return ESP_OK;
+}
+
+void pt100_adc_deinit(pt100_adc_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->adc) {
+        adc_oneshot_del_unit(ctx->adc);
+        ctx->adc = NULL;
+    }
 }
 
 bool pt100_adc_read_celsius(pt100_adc_t *ctx, float *out_c)
 {
-    if (!ctx || !out_c) return false;
+    if (!ctx || !out_c || !ctx->adc) return false;
 
     const int n = 16;
     int32_t sum = 0;
