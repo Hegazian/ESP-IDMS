@@ -1,0 +1,17 @@
+"""
+Keystone 5005 — Test Point Loop 0.063"
+  - Through-hole, 0.063" diameter loop
+  - For oscilloscope probe attachment
+  - No electrical function — just a wire loop
+
+Used for debugging ADC bias, 1-Wire buses, power rails.
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component TestPoint_Loop:
+    trait has_designator_prefix<prefix="TP">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C5207", manufacturer="Keystone", partno="5005">
+    pin 1   # Signal connection (solder pad)

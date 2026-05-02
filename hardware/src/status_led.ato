@@ -1,0 +1,75 @@
+"""
+Status LED Indicator
+
+Module for through-hole 3mm LED with current-limiting resistor.
+Used three times in ESP-IDMS:
+  - LED1 Green: Power OK (always on, tied to 3.3V)
+  - LED2 Blue:  Wi-Fi connected (GPIO5, active high)
+  - LED3 Red:   Fault condition (GPIO2, active high)
+
+Each LED has a 330Ω current-limiting resistor in series.
+"""
+
+#pragma experiment("TRAITS")
+#pragma experiment("BRIDGE_CONNECT")
+import Electrical
+import ElectricPower
+import Resistor
+from "parts/led_3mm/LED_3mm.ato" import LED_3mm_Green
+from "parts/led_3mm/LED_3mm.ato" import LED_3mm_Blue
+from "parts/led_3mm/LED_3mm.ato" import LED_3mm_Red
+
+module LED_Indicator_Green:
+    power = new ElectricPower
+    power.required = True
+
+    led = new LED_3mm_Green
+    r_limit = new Resistor
+
+    # Anode to power, cathode through resistor to GND
+    power.hv ~ led.ANODE
+    led.CATHODE ~> r_limit ~> power.lv
+
+    r_limit.resistance = 330ohm +/- 5%   # (3.3-2.1)/330 = 3.6 mA — bright enough
+    r_limit.package = "0805"
+
+    signal anode ~ led.ANODE
+    signal cathode ~ led.CATHODE
+
+    assert power.voltage within 3.0V to 3.6V
+
+module LED_Indicator_Blue:
+    power = new ElectricPower
+    power.required = True
+
+    led = new LED_3mm_Blue
+    r_limit = new Resistor
+
+    power.hv ~ led.ANODE
+    led.CATHODE ~> r_limit ~> power.lv
+
+    r_limit.resistance = 68ohm +/- 5%    # (3.3-3.2)/68 = 1.5 mA — minimal but visible
+    r_limit.package = "0805"             # Blue Vf=3.2V from 3.3V is marginal; prefer low-Vf LED
+
+    signal anode ~ led.ANODE
+    signal cathode ~ led.CATHODE
+
+    assert power.voltage within 3.0V to 3.6V
+
+module LED_Indicator_Red:
+    power = new ElectricPower
+    power.required = True
+
+    led = new LED_3mm_Red
+    r_limit = new Resistor
+
+    power.hv ~ led.ANODE
+    led.CATHODE ~> r_limit ~> power.lv
+
+    r_limit.resistance = 470ohm +/- 5%   # (3.3-1.8)/470 = 3.2 mA — good brightness
+    r_limit.package = "0805"
+
+    signal anode ~ led.ANODE
+    signal cathode ~ led.CATHODE
+
+    assert power.voltage within 3.0V to 3.6V

@@ -1,0 +1,24 @@
+"""
+Hi-Link HLK-PM01 — Isolated AC-DC Power Module
+  - Input: 100–240 VAC, 50/60 Hz
+  - Output: 5 VDC ±5%, 600 mA max
+  - Isolation: 3000 VAC
+  - Epoxy-potted, 34×20×15 mm
+  - 4 through-hole pins
+
+CAUTION: AC mains voltage present on pins 1 & 2.
+Maintain ≥ 5 mm creepage to DC zone. Add PCB isolation slot.
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component HLK_PM01:
+    trait has_designator_prefix<prefix="PS">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C67467", manufacturer="Hi-Link", partno="HLK-PM01">
+
+    signal AC_L ~ pin 1   # AC Live input
+    signal AC_N ~ pin 2   # AC Neutral input
+    signal VO_PLUS ~ pin 3   # DC 5 V output (+)
+    signal VO_MINUS ~ pin 4  # DC GND output (-)

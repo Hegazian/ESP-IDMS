@@ -115,6 +115,19 @@ extern "C" {
 #define VP_STR_STATUS_WARN 0x000700
 #define VP_STR_DIAG      0x000500
 
+/* Device info VP addresses for INFO page */
+#define VP_STR_DEVICE_MODEL      0x000980  /* Device model */
+#define VP_STR_FIRMWARE_VERSION  0x000A00  /* Firmware version */
+#define VP_STR_HARDWARE_VERSION  0x000A80  /* Hardware version */
+#define VP_STR_SERIAL_NUMBER     0x000B00  /* Serial number */
+#define VP_STR_MANUFACTURE_DATE  0x000B80  /* Manufacture date */
+
+/* WiFi configuration VP addresses */
+#define VP_STR_WIFI_SSID         0x000900  /* WiFi SSID (string) - INPUT ONLY */
+#define VP_STR_WIFI_PASSWORD     0x000080  /* WiFi Password (string) - INPUT ONLY */
+#define VP_N16_WIFI_CONNECT_BTN  0x080020  /* WiFi Connect button - triggers reconnect */
+#define VP_STR_WIFI_STATUS_MSG   0x000400  /* WiFi status message (string) - OUTPUT */
+
 #define VP_N16_CUR_X10      0x080000
 #define VP_N16_TIN_X10      0x080002
 #define VP_N16_TOUT_X10     0x080004
@@ -130,6 +143,16 @@ extern "C" {
 #define VP_N16_TECH_COUNT   0x08001C
 #define VP_N16_POWER_FAULT  0x08001E
 #define VP_N16_COOL_FAULT   0x080020
+#define VP_N16_DT_ALERT     0x080022  /* Delta temperature alert (when < 5C) */
+
+/* Configuration parameters VP addresses (N16 - x10 values for precision) */
+#define VP_N16_CFG_MIN_TIN      0x080030  /* Min Temp IN threshold (x10) */
+#define VP_N16_CFG_MIN_TOUT     0x080032  /* Min Temp OUT threshold (x10) */
+#define VP_N16_CFG_MIN_CURRENT  0x080034  /* Min Current threshold (mA) */
+#define VP_N16_CFG_MAX_TIN      0x080036  /* Max Temp IN threshold (x10) */
+#define VP_N16_CFG_MAX_TOUT     0x080038  /* Max Temp OUT threshold (x10) */
+#define VP_N16_CFG_MAX_CURRENT  0x08003A  /* Max Current threshold (mA) */
+#define VP_N16_CFG_APPLY_BTN    0x08003C  /* Apply button - set to 1 when pressed */
 
 #define WIFI_STATUS_OFFLINE   0
 #define WIFI_STATUS_CONNECTED 1
@@ -168,10 +191,12 @@ esp_err_t topway_set_codepage(uint8_t country, uint8_t codepage);
 esp_err_t topway_suspend_refresh(bool suspend);
 
 esp_err_t topway_n16_write(uint32_t addr, uint16_t value);
+esp_err_t topway_n16_read(uint32_t addr, uint16_t *value);
 esp_err_t topway_n16_fill(uint32_t addr, uint16_t length, uint16_t value);
 esp_err_t topway_n32_write(uint32_t addr, uint32_t value);
 esp_err_t topway_n64_write(uint32_t addr, uint64_t value);
 esp_err_t topway_str_write(uint32_t addr, const char *str);
+esp_err_t topway_str_read(uint32_t addr, char *out, size_t out_sz);
 esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str);
 esp_err_t topway_successive_write(uint32_t addr, uint8_t length, const uint8_t *data, size_t data_len);
 esp_err_t topway_g16_write(uint32_t addr, uint16_t size, const uint16_t *values);
@@ -180,6 +205,12 @@ esp_err_t topway_g16_write_rotate(uint32_t addr, uint16_t size, uint16_t value);
 esp_err_t topway_sys_reg_write(uint32_t addr, uint8_t value);
 
 esp_err_t topway_rtc_set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec);
+
+/* Touch event callback */
+typedef void (*topway_touch_callback_t)(uint8_t page_id, uint8_t key_id);
+
+void topway_register_touch_callback(topway_touch_callback_t callback);
+void topway_process_touch_events(void);
 
 #ifdef __cplusplus
 }

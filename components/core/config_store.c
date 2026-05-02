@@ -42,6 +42,53 @@ esp_err_t config_store_init(void)
         ESP_LOGI(TAG, "Seeded default technician chat id from Kconfig");
     }
 
+    /* Initialize threshold config defaults if not set */
+    int16_t val_i16;
+    uint16_t val_u16;
+    
+    /* Min Temp IN */
+    if (nvs_get_i16(h, "min_tin", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "min_tin", CONFIG_DEFAULT_MIN_TIN);
+        ESP_LOGI(TAG, "Initialized min_tin to default: %d C", CONFIG_DEFAULT_MIN_TIN);
+    }
+    
+    /* Max Temp IN */
+    if (nvs_get_i16(h, "max_tin", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "max_tin", CONFIG_DEFAULT_MAX_TIN);
+        ESP_LOGI(TAG, "Initialized max_tin to default: %d C", CONFIG_DEFAULT_MAX_TIN);
+    }
+    
+    /* Min Temp OUT */
+    if (nvs_get_i16(h, "min_tout", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "min_tout", CONFIG_DEFAULT_MIN_TOUT);
+        ESP_LOGI(TAG, "Initialized min_tout to default: %d C", CONFIG_DEFAULT_MIN_TOUT);
+    }
+    
+    /* Max Temp OUT */
+    if (nvs_get_i16(h, "max_tout", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "max_tout", CONFIG_DEFAULT_MAX_TOUT);
+        ESP_LOGI(TAG, "Initialized max_tout to default: %d C", CONFIG_DEFAULT_MAX_TOUT);
+    }
+    
+    /* Min Current */
+    if (nvs_get_u16(h, "min_curr", &val_u16) != ESP_OK) {
+        nvs_set_u16(h, "min_curr", CONFIG_DEFAULT_MIN_CURRENT);
+        ESP_LOGI(TAG, "Initialized min_curr to default: %d A", CONFIG_DEFAULT_MIN_CURRENT);
+    }
+    
+    /* Max Current */
+    if (nvs_get_u16(h, "max_curr", &val_u16) != ESP_OK) {
+        nvs_set_u16(h, "max_curr", CONFIG_DEFAULT_MAX_CURRENT);
+        ESP_LOGI(TAG, "Initialized max_curr to default: %d A", CONFIG_DEFAULT_MAX_CURRENT);
+    }
+    
+    /* Delta alert threshold */
+    if (nvs_get_i16(h, "dt_alert", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "dt_alert", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
+        ESP_LOGI(TAG, "Initialized dt_alert to default: %d C", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
+    }
+    
+    nvs_commit(h);
     nvs_close(h);
     return ESP_OK;
 }
@@ -230,4 +277,157 @@ esp_err_t config_get_ota_pass(char *out, size_t out_len)
 esp_err_t config_set_ota_pass(const char *pass)
 {
     return secrets_set("ota_pass", pass);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Threshold configuration helpers                                    */
+/* ------------------------------------------------------------------ */
+
+static int16_t nvs_get_i16_or_default(const char *key, int16_t default_val)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return default_val;
+    }
+    int16_t value = default_val;
+    esp_err_t err = nvs_get_i16(h, key, &value);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return default_val;
+    }
+    return value;
+}
+
+static uint16_t nvs_get_u16_or_default(const char *key, uint16_t default_val)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return default_val;
+    }
+    uint16_t value = default_val;
+    esp_err_t err = nvs_get_u16(h, key, &value);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return default_val;
+    }
+    return value;
+}
+
+static esp_err_t store_set_i16(const char *key, int16_t value)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    esp_err_t err = nvs_set_i16(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t store_set_u16(const char *key, uint16_t value)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    esp_err_t err = nvs_set_u16(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Threshold configuration getters/setters                            */
+/* ------------------------------------------------------------------ */
+
+int16_t config_get_min_tin(void)
+{
+    return nvs_get_i16_or_default("min_tin", CONFIG_DEFAULT_MIN_TIN);
+}
+
+esp_err_t config_set_min_tin(int16_t value)
+{
+    if (value < CONFIG_TEMP_MIN_LIMIT || value > CONFIG_TEMP_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("min_tin", value);
+}
+
+int16_t config_get_max_tin(void)
+{
+    return nvs_get_i16_or_default("max_tin", CONFIG_DEFAULT_MAX_TIN);
+}
+
+esp_err_t config_set_max_tin(int16_t value)
+{
+    if (value < CONFIG_TEMP_MIN_LIMIT || value > CONFIG_TEMP_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("max_tin", value);
+}
+
+int16_t config_get_min_tout(void)
+{
+    return nvs_get_i16_or_default("min_tout", CONFIG_DEFAULT_MIN_TOUT);
+}
+
+esp_err_t config_set_min_tout(int16_t value)
+{
+    if (value < CONFIG_TEMP_MIN_LIMIT || value > CONFIG_TEMP_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("min_tout", value);
+}
+
+int16_t config_get_max_tout(void)
+{
+    return nvs_get_i16_or_default("max_tout", CONFIG_DEFAULT_MAX_TOUT);
+}
+
+esp_err_t config_set_max_tout(int16_t value)
+{
+    if (value < CONFIG_TEMP_MIN_LIMIT || value > CONFIG_TEMP_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("max_tout", value);
+}
+
+uint16_t config_get_min_current(void)
+{
+    return nvs_get_u16_or_default("min_curr", CONFIG_DEFAULT_MIN_CURRENT);
+}
+
+esp_err_t config_set_min_current(uint16_t value)
+{
+    if (value > CONFIG_CURRENT_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_u16("min_curr", value);
+}
+
+uint16_t config_get_max_current(void)
+{
+    return nvs_get_u16_or_default("max_curr", CONFIG_DEFAULT_MAX_CURRENT);
+}
+
+esp_err_t config_set_max_current(uint16_t value)
+{
+    if (value > CONFIG_CURRENT_MAX_LIMIT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_u16("max_curr", value);
+}
+
+int16_t config_get_dt_alert_threshold(void)
+{
+    return nvs_get_i16_or_default("dt_alert", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
+}
+
+esp_err_t config_set_dt_alert_threshold(int16_t value)
+{
+    if (value < 0 || value > 100) {  /* 0 to 100 C (pure value) */
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("dt_alert", value);
 }

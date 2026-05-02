@@ -1,0 +1,26 @@
+"""
+Topway HKT070DTA-1C — 7-inch Smart LCD
+  - 800×480 pixels, 16-bit color
+  - UART TTL 3.3 V interface (RS232-TTL transceiver onboard)
+  - Resistive touch panel (XPT2046)
+  - 5 V power (LED backlight)
+  - DGUS-style protocol: AA [cmd] [3-byte addr] [data] CC 33 C3 3C
+  - Factory baud rate: 115200 8N1
+  - JST-XH 4-pin connector
+
+This atomic part describes the connector pinout on the LCD module.
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component HKT070DTA_1C:
+    trait has_designator_prefix<prefix="DS">
+    trait has_part_picked::by_supplier<supplier_id="aliexpress", supplier_partno="HKT070DTA-1C", manufacturer="Topway", partno="HKT070DTA-1C">
+
+    # JST-XH 4-pin connector on the LCD module
+    signal VCC ~ pin 1    # 5 V power (backlight + logic)
+    signal GND ~ pin 2    # Common ground
+    signal TX  ~ pin 3    # LCD TX → ESP32 RX (GPIO3)
+    signal RX  ~ pin 4    # LCD RX ← ESP32 TX (GPIO1)

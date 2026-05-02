@@ -1,0 +1,242 @@
+"""
+ESP-IDMS — ESP32-S3 Industrial Device Monitoring System
+Complete PCB Circuit (v3)
+
+This is the top-level circuit that wires together all components:
+  - ESP32-S3 DevKitC-1 N16R8 (MCU)
+  - Topway HKT070DTA-1C (7" smart LCD, UART, via JST-XH 4-pin connector)
+  - HLK-PM01 (AC-DC 5V PSU, 10A fused)
+  - SCT-013 bias network (non-invasive AC current sensing)
+  - 2× DS18B20 1-Wire buses (T_in & T_out temperature probes)
+  - XPT2046 touch SPI breakout (optional, for ILI9341 legacy builds)
+  - 3× Status LEDs (Green=Power, Blue=Wi-Fi, Red=Fault)
+  - 2× Tactile buttons (Reset, Boot)
+  - ESD protection on all external connectors
+  - 6× Test points for debugging
+  - AC-DC isolation slot (1.5 mm × 25 mm)
+
+PCB Specs: 2-layer FR4, 100×80 mm, 1.6 mm, 1 oz Cu, HASL LF
+Enclosure: IP65 ABS, PG9/PG11 cable glands
+Estimated BOM: ~$64 (modular) / ~$55 (soldered)
+"""
+
+#pragma experiment("FOR_LOOP")
+#pragma experiment("BRIDGE_CONNECT")
+#pragma experiment("TRAITS")
+
+# ── Standard Library ──
+import ElectricPower
+import Resistor
+import Capacitor
+import Electrical
+
+# ── Project Modules ──
+from "src/esp32s3_devkitc.ato" import ESP32_S3_DevKit
+from "src/hlk_pm01.ato" import HLK_PM01_PSU
+from "src/sct013_bias.ato" import SCT013_Bias_Network
+from "src/ds18b20_bus.ato" import DS18B20_Bus
+from "src/status_led.ato" import LED_Indicator_Green
+from "src/status_led.ato" import LED_Indicator_Blue
+from "src/status_led.ato" import LED_Indicator_Red
+from "src/button.ato" import Button_ActiveLow
+from "src/connectors.ato" import AC_Input_Connector
+from "src/connectors.ato" import LCD_Connector_4P
+from "src/connectors.ato" import CT_Connector_2P
+from "src/connectors.ato" import Touch_Connector_6P
+
+# ── Atomic Parts (instantiated directly) ──
+from "parts/fuse_holder/FuseHolder_5x20.ato" import FuseHolder_5x20mm
+from "parts/test_point/TestPoint_Loop.ato" import TestPoint_Loop
+
+
+module ESP_IDMS:
+    """Complete ESP-IDMS PCB circuit with all peripherals."""
+
+    # ═══════════════════════════════════════════════════════════════
+    # POWER DOMAINS
+    # ═══════════════════════════════════════════════════════════════
+
+    power_5v = new ElectricPower
+    power_3v3 = new ElectricPower
+
+    # ═══════════════════════════════════════════════════════════════
+    # 1. AC INPUT & PROTECTION (HIGH VOLTAGE ZONE — LEFT EDGE)
+    # ═══════════════════════════════════════════════════════════════
+
+    ac_input = new AC_Input_Connector
+    fuse = new FuseHolder_5x20mm        # Accepts 10A 5×20mm cartridge (Littelfuse 0215010.MXP)
+    psu = new HLK_PM01_PSU
+
+    # AC wiring: Live → fuse → HLK-PM01 AC_L, Neutral → HLK-PM01 AC_N
+    ac_input.ac_l ~ fuse.1
+    fuse.2 ~ psu.ac_in.hv               # AC_L fused
+    psu.ac_in.lv ~ ac_input.ac_n        # AC_N direct
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2. POWER RAILS & DECOUPLING
+    # ═══════════════════════════════════════════════════════════════
+
+    # HLK-PM01 output → 5V DC rail
+    psu.dc_out ~ power_5v
+
+    # 5V rail decoupling (bulk + HF near PSU output)
+    c5v_bulk = new Capacitor
+    c5v_bulk.capacitance = 10uF +/- 20%
+    c5v_bulk.max_voltage = 10V to 25V
+    power_5v.hv ~> c5v_bulk ~> power_5v.lv
+
+    c5v_hf = new Capacitor
+    c5v_hf.capacitance = 100nF +/- 20%
+    c5v_hf.package = "0805"
+    power_5v.hv ~> c5v_hf ~> power_5v.lv
+
+    # ═══════════════════════════════════════════════════════════════
+    # 3. ESP32-S3 DevKit (pluggable, 2×19 female headers)
+    # ═══════════════════════════════════════════════════════════════
+
+    mcu = new ESP32_S3_DevKit
+
+    # DevKit receives 5V (onboard LDO produces regulated 3.3V)
+    power_5v.hv ~ mcu.power_5v.hv
+    power_5v.lv ~ mcu.power_5v.lv
+
+    # DevKit's 3.3V output used for peripheral power
+    power_3v3.hv ~ mcu.power_3v3.hv
+    power_3v3.lv ~ mcu.power_3v3.lv
+
+    # 3.3V decoupling caps (3× 100nF near MCU)
+    decoupling_caps = new Capacitor[3]
+    for cap in decoupling_caps:
+        cap.capacitance = 100nF +/- 20%
+        cap.package = "0805"
+        power_3v3.hv ~> cap ~> power_3v3.lv
+
+    # ═══════════════════════════════════════════════════════════════
+    # 4. BUTTONS — RESET & BOOT
+    # ═══════════════════════════════════════════════════════════════
+
+    btn_reset = new Button_ActiveLow
+    btn_boot = new Button_ActiveLow
+
+    # Buttons are powered from 3.3V rail (for the 10kΩ pull-ups)
+    btn_reset.power ~ power_3v3
+    btn_boot.power ~ power_3v3
+
+    btn_reset.mcu_pin ~ mcu.reset        # EN pin → pulled low on press
+    btn_boot.mcu_pin ~ mcu.boot          # GPIO0 → pulled low on press
+
+    # ═══════════════════════════════════════════════════════════════
+    # 5. STATUS LEDs
+    # ═══════════════════════════════════════════════════════════════
+
+    # LED1 Green: Power OK — always on (3.3V directly drives it)
+    led_power_ok = new LED_Indicator_Green
+    power_3v3.hv ~ led_power_ok.power.hv
+    power_3v3.lv ~ led_power_ok.power.lv
+
+    # LED2 Blue: Wi-Fi connected — GPIO5 sources current (active high)
+    led_wifi = new LED_Indicator_Blue
+    mcu.led_wifi ~ led_wifi.power.hv     # GPIO5 drives anode
+    power_3v3.lv ~ led_wifi.power.lv     # Cathode returns through 330Ω to GND
+
+    # LED3 Red: Fault condition — GPIO2 sources current (active high)
+    led_fault = new LED_Indicator_Red
+    mcu.led_fault ~ led_fault.power.hv   # GPIO2 drives anode
+    power_3v3.lv ~ led_fault.power.lv    # Cathode returns through 330Ω to GND
+
+    # ═══════════════════════════════════════════════════════════════
+    # 6. TOPWAY SMART LCD (UART, 5V backlight, JST-XH 4-pin)
+    # ═══════════════════════════════════════════════════════════════
+
+    lcd_conn = new LCD_Connector_4P
+    lcd_conn.power ~ power_5v            # 5V for LCD backlight + logic
+
+    # UART crossing: LCD TX → MCU RX (GPIO3), MCU TX (GPIO1) → LCD RX
+    lcd_conn.tx ~ mcu.lcd_rx
+    lcd_conn.rx ~ mcu.lcd_tx
+
+    # ═══════════════════════════════════════════════════════════════
+    # 7. SCT-013 CURRENT SENSOR (ADC bias network, Pi filter, ESD)
+    # ═══════════════════════════════════════════════════════════════
+
+    sct013 = new SCT013_Bias_Network
+    sct013.power ~ power_3v3
+
+    ct_conn = new CT_Connector_2P
+    ct_conn.sig ~ sct013.bias_midpoint   # CT signal → bias network
+    ct_conn.gnd ~ power_3v3.lv           # CT ground reference
+
+    sct013.adc_output ~ mcu.adc_ct       # Filtered ADC signal → GPIO6
+
+    # ═══════════════════════════════════════════════════════════════
+    # 8. DS18B20 TEMPERATURE PROBES (2 independent 1-Wire buses)
+    # ═══════════════════════════════════════════════════════════════
+
+    # T_in: Inlet temperature — GPIO4, JST-XH 3-pin
+    temp_in = new DS18B20_Bus
+    temp_in.power ~ power_3v3
+    temp_in.mcu_pin ~ mcu.ow_tin
+
+    # T_out: Outlet temperature — GPIO15, JST-XH 3-pin
+    temp_out = new DS18B20_Bus
+    temp_out.power ~ power_3v3
+    temp_out.mcu_pin ~ mcu.ow_tout
+
+    # ═══════════════════════════════════════════════════════════════
+    # 9. TOUCH SPI BREAKOUT (XPT2046, optional, JST-XH 6-pin)
+    # ═══════════════════════════════════════════════════════════════
+
+    touch_conn = new Touch_Connector_6P
+    touch_conn.sclk ~ mcu.t_sclk
+    touch_conn.mosi ~ mcu.t_mosi
+    touch_conn.miso ~ mcu.t_miso
+    touch_conn.cs ~ mcu.t_cs
+    touch_conn.irq ~ mcu.t_irq
+    touch_conn.gnd ~ power_3v3.lv
+
+    # Touch IRQ pull-up to 3.3V (active-low pen-down interrupt)
+    r_irq_pu = new Resistor
+    r_irq_pu.resistance = 10kohm +/- 5%
+    r_irq_pu.package = "0805"
+    power_3v3.hv ~> r_irq_pu ~> mcu.t_irq
+
+    # ═══════════════════════════════════════════════════════════════
+    # 10. TEST POINTS (for oscilloscope debugging)
+    # ═══════════════════════════════════════════════════════════════
+
+    tp_3v3 = new TestPoint_Loop
+    tp_5v = new TestPoint_Loop
+    tp_gnd = new TestPoint_Loop
+    tp_adc = new TestPoint_Loop
+    tp_ow0 = new TestPoint_Loop
+    tp_ow1 = new TestPoint_Loop
+
+    tp_3v3.1 ~ power_3v3.hv
+    tp_5v.1 ~ power_5v.hv
+    tp_gnd.1 ~ power_3v3.lv
+    tp_adc.1 ~ sct013.adc_output
+    tp_ow0.1 ~ temp_in.ow_bus
+    tp_ow1.1 ~ temp_out.ow_bus
+
+    # ═══════════════════════════════════════════════════════════════
+    # CONSTRAINTS
+    # ═══════════════════════════════════════════════════════════════
+
+    assert power_5v.voltage within 4.75V to 5.25V
+    assert power_3v3.voltage within 3.0V to 3.6V
+
+    # ── Notes (layout directives for PCB designer) ──
+    #
+    # ANTENNA_KEEPOUT: 15 mm radius from ESP32 PCB antenna corner.
+    #   No copper, components, or traces on ANY layer.
+    #   Mark in silkscreen: "KEEP OUT — ANTENNA ZONE"
+    #
+    # ISOLATION_SLOT: 1.5 mm × 25 mm routed slot between AC and DC zones.
+    #   Ensures ≥ 5 mm creepage for safety isolation.
+    #   Mark AC zone in silkscreen: "⚠ HIGH VOLTAGE"
+    #
+    # MOUNTING: 4× M3 (3.2 mm) at corners, NPTH, tied to GND pour.
+    #
+    # ZONE_LAYOUT (Top, left→right):
+    #   [AC_IN | FUSE | HLK-PM01] ║ [ES32-S3 DevKit] ║ [CONNECTORS]
+    #   ← 30 mm HV zone → [slot] ← 60 mm DC zone →

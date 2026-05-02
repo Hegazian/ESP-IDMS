@@ -1,114 +1,91 @@
-# Project Definition — ESP32 Industrial Device Monitoring System (ESP-IDMS)
+# Project Definition — ESP-IDMS
 
-**Document Version:** 1.0  
+**Document Version:** 2.0  
 **Date:** April 2026  
-**Status:** Approved
+**Status:** Active Development
 
 ---
 
-## 1. Executive Summary
+## 1. Project Overview
 
-The **ESP32 Industrial Device Monitoring System (ESP-IDMS)** is a low-cost, professional-grade IoT monitoring appliance designed for deployment inside industrial facilities. The system continuously monitors a target machine's **operational status** and **cooling circuit efficiency**, and delivers instant push notifications to designated maintenance technicians via **Telegram** whenever a fault condition is detected.
+ESP-IDMS (ESP-IDF Industrial Device Monitoring System) is firmware for ESP32-S3 that monitors industrial machine status through non-invasive current sensing (SCT-013) and cooling efficiency (DS18B20 ΔT), displays real-time data on a Topway HKT070DTA-1C smart LCD, and sends Telegram alerts when fault conditions are detected.
 
-The project is purpose-built to minimize total cost of ownership: there are no recurring SIM or data subscription fees, and the entire connectivity stack runs over the facility's existing Wi-Fi infrastructure.
+## 2. Objectives
 
----
+1. **Current monitoring** — Detect machine power loss when AC current falls below a configurable threshold for 5+ seconds
+2. **Cooling monitoring** — Detect cooling system failure when ΔT (T_out − T_in) falls outside a configurable range for 5+ seconds
+3. **Remote alerts** — Send instant Telegram notifications to registered technicians on fault detection and restoration
+4. **Local display** — Show real-time current, temperatures, ΔT, status, and diagnostics on a 7-inch smart LCD
+5. **OTA updates** — Allow firmware updates over Wi-Fi via HTTP upload with rollback protection
+6. **NVS persistence** — Store Wi-Fi credentials, Telegram token, and technician IDs in non-volatile storage
 
-## 2. Project Objectives
+## 3. Design Philosophy
 
-| # | Objective |
-|---|---|
-| 1 | Provide **24/7 unattended monitoring** of machine power state and cooling performance. |
-| 2 | Deliver **instant, remote fault alerts** to maintenance technicians worldwide, without requiring an on-site presence. |
-| 3 | Maintain a **total BOM cost under $35 USD** per unit to allow economical fleet deployment. |
-| 4 | Eliminate recurring costs by replacing GSM/SIM-based connectivity with **Wi-Fi + cloud push notifications**. |
-| 5 | Ensure **personnel safety** through galvanic isolation between mains AC and all low-voltage electronics. |
+| Decision | Rationale |
+|----------|-----------|
+| Wi-Fi over GSM | Lower cost, higher bandwidth, existing infrastructure |
+| Telegram Bot API | No custom server required, end-to-end encryption, group notification |
+| DS18B20 1-Wire | Digital accuracy (±0.5 °C), single-wire interface, waterproof probes |
+| SCT-013 CT | Non-invasive, safe, split-core for easy installation |
+| Topway smart LCD | Built-in HMI controller, UART protocol, no SPI overhead on ESP32 |
+| NVS secrets | Avoids plaintext credentials in firmware binary |
+| Dual 1-Wire buses | Separate buses for T_in and T_out for reliability |
 
----
+## 4. Functional Modules
 
-## 3. Design Philosophy & Technology Selection
+| Module | Source Files | Description |
+|--------|-------------|-------------|
+| Monitor | `monitor/monitor.c` | Main 500 ms polling loop: ADC RMS current, DS18B20 temperature, fault detection |
+| DS18B20 | `drivers/ds18b20.c`, `drivers/onewire.c` | 1-Wire bus driver, temperature conversion with CRC validation |
+| Topway LCD | `drivers/topway_lcd.c` | UART protocol driver for Topway smart LCD |
+| UI | `ui/ui_topway.c` | Display update logic, status/diagnostic routing, VP address management |
+| Wi-Fi | `wifi/wifi_manager.c` | STA mode, auto-reconnect, IP acquisition |
+| Telegram | `telegram/tg_bot.c`, `tg_http.c`, `tg_send.c`, `tg_parse.c`, `tg_ui.c` | Bot polling, HTTPS client, message sending, JSON parsing |
+| Config Store | `core/config_store.c` | NVS secrets: Wi-Fi SSID/password, Telegram token, OTA credentials |
+| OTA | `ota/ota.c` | HTTP firmware upload server on port 8080, basic auth, SHA256 verification |
+| Console | `cli/serial_console.c` | Serial command interface for configuration and debugging |
 
-### 3.1 Connectivity: Wi-Fi over GSM
+## 5. Alert Behavior
 
-The system was initially conceived with a GSM module for cellular connectivity. After evaluation, Wi-Fi was selected as the final approach for the following reasons:
+| Condition | Trigger | Action |
+|-----------|---------|--------|
+| Power loss | Current < threshold for ≥ 5 s | Telegram alert to all technicians |
+| Power restored | Current rises above threshold | Telegram restoration notice |
+| Cooling fault (low ΔT) | ΔT < 5 °C for ≥ 5 s | Telegram alert |
+| Cooling fault (high ΔT) | ΔT > 15 °C for ≥ 5 s | Telegram alert |
+| Cooling restored | ΔT returns to normal | Telegram restoration notice |
+| Wi-Fi outage | Connection lost | Local monitoring continues; alerts queued |
+| Wi-Fi restored | Connection re-established | Queued alerts sent |
 
-| Criterion | GSM/SIM | Wi-Fi (Selected) |
-|---|---|---|
-| Recurring cost | Monthly SIM fees | None |
-| Network reliability | Dependent on 2G/EDGE infrastructure (declining) | Facility LAN (always on) |
-| Data latency | Higher | Lower |
-| Hardware complexity | Higher (AT commands, SIM management) | Lower (native ESP32 stack) |
+## 6. Display Pages
 
-### 3.2 Alert Delivery: Telegram Bot API
+The Topway HKT070DTA-1C display shows (Page 0):
 
-Telegram was selected for alert delivery due to its free tier, robust HTTPS API, multi-device delivery, and instant notification capability. Technician IDs can be managed directly on the device without requiring a laptop or web interface.
+- **Current (A)** — N16 value at VP 0x080000; text "--" at VP 0x000000 when invalid
+- **T_in (°C)** — N16 at VP 0x080002; valid flag at 0x080012
+- **T_out (°C)** — N16 at VP 0x080004; valid flag at 0x080014
+- **ΔT (°C)** — N16 at VP 0x080006 (signed); valid flag at 0x080016
+- **Wi-Fi IP** — String at VP 0x000200
+- **OTA status** — String at VP 0x000300
+- **Firmware version** — String at VP 0x000280
+- **Status** — ACTIVE/INACTIVE at VP 0x000380, ERROR at 0x000600, WARNING at 0x000700
+- **Diagnostic** — String at VP 0x000500
 
----
+## 7. Out of Scope
 
-## 4. Core Functional Modules
-
-### 4.1 Machine State Monitoring
-
-The system uses a **non-invasive AC Current Transformer (SCT-013-000)** that clips around a single live or neutral wire. This approach requires no physical connection to copper conductors and does not interrupt machine operation during installation.
-
-A **custom DC offset bias circuit** (dual 10 kΩ voltage divider + 10 µF decoupling capacitor) centres the AC waveform at 1.65 V (half of 3.3 V), making it readable by the ESP32's ADC on GPIO 34.
-
-**Fault Trigger:** If the measured RMS current drops below the configured threshold (0.2 A – 0.5 A) for more than 5 consecutive seconds, a **"Power Loss"** alert is dispatched to all registered technicians.
-
-### 4.2 Cooling Efficiency Monitoring
-
-Two **waterproof DS18B20** digital temperature sensors are deployed on a shared **1-Wire bus** (GPIO 4):
-
-- **Sensor 1 (T_in):** Measures coolant/air temperature at the machine's cooling inlet.
-- **Sensor 2 (T_out):** Measures coolant/air temperature at the machine's cooling outlet.
-
-The system continuously computes the **temperature differential (ΔT = T_out − T_in)** and compares it against configurable thresholds.
-
-**Fault Trigger:** If ΔT falls below 5 °C (insufficient heat transfer) or rises above 15 °C (excessive heat load, indicating coolant blockage or pump failure), a **"Cooling Failure"** alert is dispatched.
-
-### 4.3 Remote Alert & Notification System
-
-- **Transport:** Wi-Fi 2.4 GHz (802.11 b/g/n) with automatic reconnect logic.
-- **Protocol:** HTTPS POST to the Telegram Bot API (`api.telegram.org`) with SSL/TLS validation.
-- **Heartbeat:** A cloud connectivity check runs every 60 seconds.
-- **Storage:** Up to **5 technician Telegram Chat IDs** are stored persistently in ESP32 Non-Volatile Storage (NVS).
-
-### 4.4 On-Device User Interface
-
-A **2.8" SPI TFT touch display** (ILI9341 controller) provides:
-
-- A real-time dashboard showing current machine state, T_in, T_out, ΔT, and network status.
-- An interactive menu system for adding or removing technician Telegram Chat IDs without any external tools.
-
-### 4.5 Data Persistence
-
-Technician IDs are written to the ESP32's **Non-Volatile Storage (NVS)** using the `Preferences.h` library. This ensures that all configuration survives power outages and device reboots without requiring re-commissioning.
-
-### 4.6 Power Supply & Safety
-
-The unit is powered by a **Hi-Link HLK-PM01** isolated AC-DC module (100–240 V AC → 5 V DC). This module provides:
-
-- **Galvanic isolation** between the mains AC supply and all low-voltage logic circuitry.
-- A wide input voltage range suitable for global deployment.
-
-**Recommended Enhancement:** A small **18650 Li-ion cell** (with a suitable charge/protection module) is recommended as a backup power source. This allows the ESP32 to transmit a final "Power Loss" alert during a total facility power outage before shutting down.
+- Direct SCADA/Modbus integration (may be added later)
+- Local data logging / historical trends (SD card or flash)
+- Wi-Fi AP mode (STA only)
+- Bluetooth configuration
+- LCD touch input handling (display is output-only in current firmware)
 
 ---
 
-## 5. Out of Scope
-
-- Local area network (LAN) dashboard or web server interface.
-- Integration with SCADA or PLC systems.
-- Data logging / time-series database integration.
-- OTA (Over-the-Air) firmware update mechanism *(recommended for future revision)*.
-
----
-
-## 6. Related Documents
+## Related Documents
 
 | Document | Description |
-|---|---|
-| [`Specifications.md`](./Specifications.md) | Technical specifications, sampling rates, and fault thresholds |
-| [`BOM.md`](./BOM.md) | Bill of Materials with part numbers and cost estimates |
-| [`PCB_Layout.md`](./PCB_Layout.md) | PCB design guidelines, layer usage, and GPIO pin mapping |
-| [`README.md`](./README.md) | Project overview and quick-start guide |
+|----------|-------------|
+| [README.md](./README.md) | Project overview, pin map, console commands |
+| [Specifications.md](./Specifications.md) | Electrical specs, thresholds, GPIO mapping |
+| [PCB_Layout.md](./PCB_Layout.md) | PCB design, schematic, component placement |
+| [BOM.md](./BOM.md) | Bill of Materials |

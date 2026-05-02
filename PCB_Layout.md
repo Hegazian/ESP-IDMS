@@ -1,192 +1,250 @@
-# PCB Layout Guidelines — ESP32 Industrial Device Monitoring System (ESP-IDMS)
+# PCB Layout & Schematic — ESP-IDMS (ESP32-S3 + Topway LCD)
 
-**Document Version:** 1.1  
+**Document Version:** 2.0  
 **Date:** April 2026  
-**Status:** Approved
+**Target:** ESP32-S3 N16R8 + Topway HKT070DTA-1C
 
 ---
 
-## 1. Overview
+## 1. System Architecture
 
-This document defines the PCB design guidelines, layer stack-up strategy, component placement rules, trace routing standards, and GPIO pin mapping for the ESP-IDMS hardware. The design targets a **2-layer PCB** to minimise fabrication cost while maintaining signal integrity and electrical safety in an industrial environment.
-
-### 1.1 Modular vs on-board assembly
-
-To simplify field repair, upgrades, and bench testing, the PCB separates **pluggable subsystems** from **permanently mounted base circuitry**.
-
-| Assembly style | What belongs here | Rationale |
-|---|---|---|
-| **Pluggable (headers / cable connectors)** | ESP32 module, TFT display assembly, removable sensor harnesses | Highest swap/re-test rate; keeps firmware development and RMA workflows fast |
-| **Soldered on main PCB** | HLK-PM01, fuse/holder, SCT-013 bias + burden network, 1-Wire pull-up, decoupling capacitors, screw terminals for fixed installation wiring, connector **footprints** (sockets/receptacles) | Stable, low-cycle-count parts; safety-critical and analog-sensitive circuits stay on one controlled layout |
-
-Use **polarized, latching, or shrouded connectors** where mis-insertion would damage the ESP32 ADC or 3.3 V rails.
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        ESP-IDMS PCB                              │
+│                                                                  │
+│  ┌──────────────┐    ┌───────────────┐    ┌──────────────────┐  │
+│  │  HLK-PM01    │    │   ESP32-S3     │    │  Topway LCD      │  │
+│  │  AC-DC 5V    │    │   DevKit       │    │  HKT070DTA-1C    │  │
+│  │  100-240VAC  │5V──│ 3.3V  GPIO44  │TX──│ UART1    RX      │  │
+│  │  → 5V 600mA  │    │       GPIO43   │RX──│ UART1    TX      │  │
+│  │              │    │       GPIO1    │TX──│ (RS232-TTL)     │  │
+│  │  AC_IN       │    │       GPIO3    │RX──│                  │  │
+│  │  L ──┐       │    │       GPIO6    │    │  800×480 LCD     │  │
+│  │  N ──┤Fuse──┤    │       │        │    │  Resistive Touch  │  │
+│  │  E ──┘       │    │    ┌──┴──┐     │    │  UART 115200     │  │
+│  └──────────────┘    │    │SCT   │     │    └──────────────────┘  │
+│                      │    │Bias  │     │                          │
+│  ┌──────────────┐    │    │Circuit│     │    ┌──────────────────┐  │
+│  │  SCT-013     │────│───►│GPIO6 │     │    │  DS18B20 ×2      │  │
+│  │  CT Sensor   │    │    └──────┘     │    │  (1-Wire probes) │  │
+│  └──────────────┘    │                 │    │                   │  │
+│                      │  GPIO4 ─────┬───│──►│ DQ (T_in)         │  │
+│                      │             4.7kΩ │  │                   │  │
+│                      │  GPIO15 ────┬───│──►│ DQ (T_out)        │  │
+│                      │             4.7kΩ │  │                   │  │
+│                      │             3V3  │  │ VCC               │  │
+│                      │             GND  │  │ GND               │  │
+│                      └───────────────┘    └──────────────────┘  │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────────┐│
+│  │  XPT2046 Touch (on Topway LCD module)                       ││
+│  │  GPIO12=SCLK  GPIO13=MOSI  GPIO16=MISO  GPIO11=CS  GPIO14=IRQ │
+│  └──────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 2. Layer Stack-Up
 
 | Layer | Function |
-|---|---|
-| **Top Layer (Layer 1)** | Component placement, primary signal routing, power distribution |
-| **Bottom Layer (Layer 2)** | Solid ground copper pour (GND plane), return current paths |
+|-------|----------|
+| **Top (Layer 1)** | Component placement, primary signal routing, power distribution |
+| **Bottom (Layer 2)** | Solid ground copper pour (GND plane), return current paths |
 
-A 2-layer approach is sufficient for this design due to the relatively low signal frequencies involved (1-Wire at ~15 kHz, SPI at up to 40 MHz) and the moderate component count.
-
----
-
-## 3. Component Placement Guidelines
-
-### 3.1 ESP32 module (pluggable)
-
-- Use **two rows of female pin headers** (2 × 15 positions at **2.54 mm** pitch) matching the **ESP32 DevKit V1** footprint, or an equivalent **socket strip** rated for multiple insert cycles.
-- For easier unplugging, prefer **machine-pin round-hole sockets** or headers with **removal notch / pull tab** clearance in the enclosure layout; avoid soldering the DevKit directly to the mother PCB.
-- Position centrally on the board to minimise routing distances to all peripherals.
-- Route all signals that leave the ESP zone to **on-board test points** or **named nets** so a bare module swap does not require guesswork.
-- Maintain a clear keep-out zone around the ESP32's on-board PCB antenna — **no copper pour, traces, or components** under or immediately adjacent to the antenna area.
-
-### 3.2 AC-DC Power module (Hi-Link HLK-PM01) — soldered
-
-- Position the HLK-PM01 at the **edge of the board**, oriented so that AC input terminals face an external cable gland.
-- Maintain a minimum **5 mm creepage/clearance gap** between all AC-side conductors and any DC/logic traces. A physical **PCB slot or cutout** between the AC and DC zones is strongly recommended to meet IEC 60950 / IEC 62368 creepage requirements.
-- Label the AC zone with a silkscreen warning: `⚠ HIGH VOLTAGE — DO NOT TOUCH`.
-
-### 3.3 Field wiring terminals — soldered
-
-- Use **5.08 mm pitch screw terminals** (or pluggable terminal blocks if you want tool-free mains/CT wiring while keeping the block body soldered) for **installation cables** that rarely move:
-  - **AC mains input** to HLK-PM01 (2-pin), with fuse at entry
-  - Optional: **SCT-013 CT** leads if you prefer screw termination to the factory CT cable instead of a pluggable CT jack (see §3.6)
-- Position these at the **board perimeter** for cable glands and strain relief.
-
-### 3.4 TFT display (pluggable harness)
-
-- The 2.8" TFT module stays on the **enclosure lid** (or a sub-panel); the **main PCB only holds the receptacle**.
-- Use a **board-mounted shrouded box header** (2.54 mm) **or** a compact **JST-SH / GH-style** latching cable to the lid, chosen to match your display breakout’s tail. The goal is **one keyed connector** per display assembly so the panel can be removed without desoldering.
-- Keep the **SPI segment length** as short as practical from ESP socket to display connector; route **SCK/MOSI/CS/DC** as a group with adjacent **GND** pins or a parallel ground return on Layer 2.
-- If the display module includes **XPT2046 touch** on a **second** flex or pin row, add a **second small connector** (e.g. 6-pin) rather than sharing a fragile single row.
-
-**Suggested primary display connector (logic + SPI, 2.54 mm example — adjust to your module):**
-
-| Pin | Net | ESP32 GPIO / net |
-|---|---|---|
-| 1 | GND | Ground |
-| 2 | 3V3 | 3.3 V (display IO if module is 3.3 V tolerant) |
-| 3 | SCK | GPIO 18 |
-| 4 | MOSI | GPIO 23 |
-| 5 | CS | GPIO 15 |
-| 6 | DC | GPIO 2 |
-| 7 | RST | **Tie to ESP32 EN on the motherboard** (per [`Specifications.md`](./Specifications.md)); pin may be omitted from cable if RST is hardwired on lid |
-| 8 | LED / BL | Backlight control or always-on via resistor — match module |
-| 9–10 | Touch SPI or IRQ | As required by lid PCB (or use separate connector) |
-
-Document the **exact** pinout on the silkscreen next to the connector (`DISP1`).
-
-### 3.5 Temperature and current “sensors” (pluggable probes)
-
-Treat **factory-made probe leads** and **CT secondary leads** as removable harnesses:
-
-- **DS18B20 (×2, shared 1-Wire bus):** Provide **two identical 3-pin pluggable connectors** (e.g. **JST-XH 3P** or **Molex PicoBlade**) wired in parallel: **3V3**, **DQ (GPIO 4)**, **GND**. Each waterproof probe then terminates in a mating plug for **T_in** and **T_out**. The **4.7 kΩ pull-up** remains **soldered on the main PCB** between 3V3 and DQ.
-- **SCT-013 secondary:** Prefer a **2-pin pluggable polarized connector** (same family as above) from the CT burden/bias network to the CT cable; keep the **33 Ω burden** (if required) and **bias/divider network soldered** next to GPIO 34. If regulatory or site standards require hardwired CT leads, keep the **screw terminal** option as an alternate PCB footprint (not populated by default).
-
-Label connectors `TEMP1`, `TEMP2`, `CT` on silkscreen.
-
-### 3.6 Analog front-end (SCT-013 bias circuit) — soldered
-
-- Place the DC offset bias network (two 10 kΩ resistors + 10 µF capacitor) as close as possible to the **GPIO 34 ADC pin** of the ESP32 **and** the CT connector.
-- Route analog traces away from SPI and high-frequency digital traces to minimise noise coupling.
+2-layer FR4, 1.6 mm, 1 oz (35 µm) copper. Sufficient for signal frequencies (1-Wire ~15 kHz, UART 115200 baud).
 
 ---
 
-## 4. Trace Routing Guidelines
+## 3. Component Placement
 
-### 4.1 Ground Plane
+### 3.1 ESP32-S3 DevKit (pluggable)
 
-- Implement a **solid copper pour for GND on the bottom layer** across the entire DC/logic zone. This provides a low-impedance return path and significantly reduces EMI susceptibility in an industrial environment.
-- Define a **dedicated analog ground island** for the SCT-013 signal conditioning circuit. Connect this island to the main digital ground at a **single point** (star ground) near the ADC input to prevent high-frequency Wi-Fi RF noise from coupling into the analog measurement path.
+- Use 2× 19-pin female pin headers at 2.54 mm pitch matching ESP32-S3 DevKit footprint
+- Keep ESP32 antenna area clear: no copper pour, traces, or components within 15 mm
+- Position centrally to minimize trace lengths to all peripherals
+- Add labeled test points for all GPIOs
 
-### 4.2 Trace Width Recommendations
+### 3.2 Topway LCD Interface
+
+The HKT070DTA-1C smart LCD communicates via UART with a built-in RS232-TTL transceiver. Connection:
+
+| Signal | PCB Net | ESP32-S3 GPIO | Direction |
+|--------|---------|---------------|-----------|
+| UART TX | LCD_TX | GPIO 1 | Output (ESP→LCD) |
+| UART RX | LCD_RX | GPIO 3 | Input (LCD→ESP) |
+| VCC | 5V | — | Power (5 V from HLK-PM01) |
+| GND | GND | — | Common ground |
+
+> **Important:** The Topway LCD has an onboard RS232-TTL level shifter. Use direct 3.3 V UART connection (no external MAX232 needed). Baud rate is factory-set to 115200 but changed at startup via software command.
+
+### 3.3 SCT-013 Current Transformer
+
+SCT-013 bias and burden circuit (soldered on PCB, close to GPIO6):
+
+```
+         3.3V ──── R1 (10kΩ) ──┬──── GPIO6 (ADC input)
+                                 │
+                                C1 (10µF electrolytic, + to GPIO6, − to GND)
+                                 │
+         GND ──── R2 (10kΩ) ──┤──── GND
+                                 │
+                    ┌───────────┘│
+                    │            │
+              SCT-013 ── R_burden ── GND
+              (output wires)
+```
+
+**Component values:**
+
+| Component | Value | Notes |
+|-----------|-------|-------|
+| R1 | 10 kΩ 1% | 3.3 V to GPIO6 voltage divider upper leg |
+| R2 | 10 kΩ 1% | GPIO6 to GND voltage divider lower leg |
+| C1 | 10 µF 25 V electrolytic | AC coupling + DC stabilization at midpoint |
+| R_burden | 33 Ω 1% | **Only for SCT-013-000 (100 A)**; omit for SCT-013-030 (30 A) which has internal burden |
+
+**Expected DC voltage at GPIO6 with no AC current:** ~1.65 V (ADC count ≈ 2048)
+
+**When ADC reads 4095:** GPIO6 is floating (check R1 connection to 3.3 V)  
+**When ADC reads ~0:** GPIO6 shorted to GND (check R2 connection)
+
+### 3.4 DS18B20 Temperature Sensors
+
+Each sensor bus needs a 4.7 kΩ pull-up resistor to 3.3 V:
+
+```
+    3.3V ──── 4.7kΩ ──┬──── GPIO4 (T_in) or GPIO15 (T_out)
+                         │
+                    DS18B20 data pin
+                         │
+                        GND
+```
+
+**Per-bus connections (identical for both T_in and T_out):**
+
+| DS18B20 Wire | Connects To |
+|--------------|-------------|
+| Red (VCC) | 3.3 V |
+| Yellow (Data) | GPIO4 (T_in) or GPIO15 (T_out) + 4.7 kΩ pull-up |
+| Black/Bare (GND) | GND |
+
+Each bus is independent (separate 1-Wire bus, separate pull-up). Do not put both sensors on one bus.
+
+### 3.5 HLK-PM01 AC-DC Module
+
+- Position at board edge, AC input facing enclosure cable gland
+- **5 mm minimum creepage** between AC and DC zones
+- Add PCB slot under the HLK-PM01 between AC and DC sides
+- Label AC zone: `⚠ HIGH VOLTAGE`
+- 10 A fuse in series with AC live conductor at board entry
+
+### 3.6 XPT2046 Touch Controller
+
+The Topway LCD has its own touch interface. The XPT2046 SPI connections are for the legacy ILI9341 TFT design and may be left unpopulated on a Topway-only build. If used:
+
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| SPI SCLK | GPIO 12 | Touch SPI clock |
+| SPI MOSI | GPIO 13 | Touch SPI data out |
+| SPI MISO | GPIO 16 | Touch SPI data in |
+| CS | GPIO 11 | Touch chip select |
+| IRQ | GPIO 14 | Touch pen-down interrupt |
+
+---
+
+## 4. Connector Pinouts
+
+### 4.1 ESP32-S3 DevKit Header (2×19 pin)
+
+```
+Left side (J1):                    Right side (J2):
+┌─────────────────────┐            ┌─────────────────────┐
+│ 3V3          GPIO1   │            │  GND         GPIO43  │
+│ EN/RST       GPIO2   │            │  GPIO44      GPIO42  │
+│ VP/GPIO0     GPIO3   │            │  GPIO10      GPIO41   │
+│ VN/GPIO4     GPIO4   │ ← T_in     │  GPIO5       GPIO40  │
+│ GPIO5        GPIO5   │            │  GPIO6       GPIO39   │ ← ADC (SCT-013)
+│ GPIO7        GPIO6   │ ← ADC      │  GPIO7       GPIO38  │ ← LCD_BL
+│ GPIO15       GPIO7   │ ← T_out    │  GPIO8       GPIO37  │
+│ GPIO16       GPIO8   │            │  GPIO9       GPIO36  │
+│ ...          ...     │            │  ...         ...     │
+└─────────────────────┘            └─────────────────────┘
+```
+
+### 4.2 Topway LCD Connector (4-pin JST-XH)
+
+| Pin | Net | ESP32 GPIO | Notes |
+|-----|-----|------------|-------|
+| 1 | 5V | VCC (from HLK-PM01) | LCD power |
+| 2 | GND | GND | Common ground |
+| 3 | LCD_TX | GPIO 1 | ESP32 → LCD data |
+| 4 | LCD_RX | GPIO 3 | LCD → ESP32 data |
+
+### 4.3 DS18B20 Temperature Connector (3-pin JST-XH × 2)
+
+| Pin | T_in (GPIO4) | T_out (GPIO15) |
+|-----|---------------|-----------------|
+| 1 | 3.3 V | 3.3 V |
+| 2 | GPIO4 + 4.7 kΩ pull-up | GPIO15 + 4.7 kΩ pull-up |
+| 3 | GND | GND |
+
+### 4.4 SCT-013 CT Connector (2-pin JST-XH or screw terminal)
+
+| Pin | Net | Notes |
+|-----|-----|-------|
+| 1 | CT_output (to burden + divider) | Connects to GPIO6 bias network midpoint |
+| 2 | CT_return (to burden + divider GND) | Connects to GND |
+
+---
+
+## 5. Trace Routing Guidelines
 
 | Net Type | Recommended Width |
-|---|---|
-| Sensor signal lines (1-Wire, ADC) | 10 – 12 mil (0.25 – 0.30 mm) |
-| SPI display signal lines | 10 – 12 mil |
-| 3.3 V logic power | 20 – 30 mil (0.50 – 0.75 mm) |
-| 5 V power distribution | 30 – 40 mil (0.75 – 1.00 mm) |
-| AC mains traces (if on PCB) | ≥ 60 mil (1.50 mm) — minimise length |
+|----------|-------------------|
+| 1-Wire / ADC analog | 10–12 mil (0.25–0.30 mm) |
+| UART (Topway) | 10–12 mil |
+| 3.3 V logic power | 20–30 mil (0.50–0.75 mm) |
+| 5 V power distribution | 30–40 mil (0.75–1.00 mm) |
+| AC mains traces | ≥ 60 mil (1.50 mm), minimize length |
 
-### 4.3 Analog / Digital Isolation
+### Analog Isolation Rules
 
-- **Do not route** the SCT-013 analog signal trace parallel to or near TFT SPI clock or MOSI traces.
-- Maintain a minimum **20 mil (0.50 mm) separation** between analog and high-frequency digital traces.
-- Use the ground pour as a shield between the analog and digital zones wherever practical.
-
-### 4.4 Decoupling Capacitors
-
-- Place **100 nF ceramic decoupling capacitors** as close as possible to the VCC and 3.3 V pins of the ESP32 and any other active ICs.
-- The 10 µF electrolytic capacitor for the ADC bias circuit should be placed directly at the voltage divider midpoint, as close to GPIO 34 as possible.
+- **Do not** route the SCT-013 analog trace (GPIO6) parallel to or near high-frequency digital traces
+- Maintain **20 mil (0.50 mm) minimum separation** between analog and digital zones
+- Use ground pour as shield between analog and digital areas
+- Place ADC bias components (R1, R2, C1, R_burden) within 10 mm of GPIO6 pad
+- Dedicated analog ground island connected at single star-ground point near ADC input
 
 ---
 
-## 5. GPIO Pin Mapping
+## 6. Decoupling and Filtering
 
-| Signal | GPIO | Direction | Notes |
-|---|---|---|---|
-| DS18B20 Data (1-Wire) | GPIO 4 | Bidirectional | 4.7 kΩ pull-up to 3.3 V required |
-| SCT-013 Analog Output | GPIO 34 | Input (ADC) | Input-only pin; 12-bit ADC; DC-biased to 1.65 V |
-| TFT SCK (SPI Clock) | GPIO 18 | Output | VSPI bus |
-| TFT MOSI | GPIO 23 | Output | VSPI bus |
-| TFT CS (Chip Select) | GPIO 15 | Output | Active low |
-| TFT DC / RS | GPIO 2 | Output | High = Data, Low = Command |
-| TFT RST (Reset) | ESP32 EN | Output | Tie to EN pin to free GPIO 4 for 1-Wire |
-
-> **Design Note:** Connecting TFT RST to the ESP32 EN (Enable) pin is the recommended approach. This ensures the display resets together with the ESP32 and frees GPIO 4 for exclusive use by the DS18B20 1-Wire bus, avoiding a GPIO conflict.
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| 100 nF ceramic | VCC pin of ESP32-S3 DevKit | High-frequency decoupling |
+| 100 nF ceramic | VCC pin of Topway LCD connector | Display decoupling |
+| 10 µF electrolytic | ADC bias midpoint (GPIO6) | AC stabilization and noise filtering |
+| 4.7 kΩ resistor ×2 | GPIO4 and GPIO15 (1-Wire pull-ups) | 1-Wire bus integrity |
 
 ---
 
-## 6. ADC Bias Circuit — Schematic Description
-
-The SCT-013 CT sensor output is an AC signal centred at 0 V. Since the ESP32 ADC can only measure 0–3.3 V, a bias circuit is required to shift the waveform midpoint to 1.65 V.
-
-```
-3.3V ──┬── 10kΩ ──┬── 10kΩ ── GND
-       │           │
-       │         [midpoint] ── GPIO 34 (ADC)
-       │           │
-       │         10µF (to GND)
-       │
-    [Leave floating or decouple with 100nF to GND]
-
-SCT-013 Tip  ──── GPIO 34 (via series coupling)
-SCT-013 Sleeve ── Midpoint of voltage divider
-```
-
-The voltage divider creates a stable 1.65 V reference. During normal operation, the AC current signal from the CT rides on top of this 1.65 V bias, allowing the ESP32 ADC to read both positive and negative half-cycles of the AC waveform within its 0–3.3 V input range.
-
----
-
-## 7. Electrical Safety Requirements
+## 7. Electrical Safety
 
 | Requirement | Details |
-|---|---|
-| Creepage distance (AC to DC) | ≥ 5 mm (or physical PCB slot) |
-| AC trace isolation | AC zone must be clearly separated and labelled |
-| Fusing | 10 A fuse in series with AC live conductor at board/enclosure entry |
+|-------------|---------|
+| Creepage (AC to DC) | ≥ 5 mm (or physical PCB slot) |
+| AC trace isolation | AC zone clearly separated and labelled |
+| Fusing | 10 A fuse on AC live conductor at board entry |
 | Enclosure | IP65 minimum, with cable glands on all wire entry points |
 | Grounding | Enclosure earth stud connected to AC earth conductor |
 
 ---
 
-## 8. Mechanical / enclosure notes for modular builds
-
-- Reserve **straight vertical unplug height** for the ESP32 above the socket (typically **≈ 25–35 mm** depending on USB connector and shield).
-- Route display cables with a **service loop** or **panel-mount connector** on the lid so the lid can hinge open without pulling SPI pins.
-- Align connector latches away from high-voltage zones; never place a low-voltage latch where fingers must reach past exposed mains.
-
----
-
-## 9. Recommended PCB Fabrication Parameters
+## 8. Recommended PCB Fabrication Parameters
 
 | Parameter | Value |
-|---|---|
+|-----------|-------|
 | Layers | 2 |
 | Board Thickness | 1.6 mm |
 | Copper Weight | 1 oz (35 µm) |
@@ -197,11 +255,11 @@ The voltage divider creates a stable 1.65 V reference. During normal operation, 
 
 ---
 
-## 10. Related Documents
+## 9. Related Documents
 
 | Document | Description |
-|---|---|
-| [`Project Definition.md`](./Project%20Definition.md) | Full project scope and functional description |
-| [`Specifications.md`](./Specifications.md) | Technical specifications, thresholds, and GPIO mapping |
-| [`BOM.md`](./BOM.md) | Bill of Materials with part numbers and cost estimates |
-| [`README.md`](./README.md) | Project overview and quick-start guide |
+|----------|-------------|
+| [README.md](./README.md) | Project overview, pin map, console commands |
+| [Specifications.md](./Specifications.md) | Electrical specs, thresholds, GPIO mapping |
+| [BOM.md](./BOM.md) | Bill of Materials |
+| [hardware/esp-idms.ato](./hardware/esp-idms.ato) | atopile schematic description |

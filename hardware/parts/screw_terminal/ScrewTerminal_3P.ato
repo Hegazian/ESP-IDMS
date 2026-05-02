@@ -1,0 +1,17 @@
+"""
+Weidmüller 1715720000 — 3-Pin Screw Terminal (AC Input)
+  - 5.08 mm pitch, through-hole
+  - 250 V, 15 A rated
+  - Used for AC mains input: L, N, E
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component ScrewTerminal_3P:
+    trait has_designator_prefix<prefix="J">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C8465", manufacturer="Weidmüller", partno="1715720000">
+    pin 1   # AC Live
+    pin 2   # AC Neutral
+    pin 3   # AC Earth

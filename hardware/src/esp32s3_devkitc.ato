@@ -1,0 +1,72 @@
+"""
+ESP32-S3 DevKitC-1 N16R8 Module
+
+Wraps the DevKit atomic part and exposes all active GPIOs
+as named signals for the ESP-IDMS circuit.
+
+Active GPIO assignments (ESP-IDMS v3):
+  IO0  (GPIO0):  Boot button   IO4  (GPIO4):  DS18B20 T_in 1-Wire
+  IO1  (GPIO1):  Topway LCD TX   IO5  (GPIO5):  Wi-Fi LED
+  IO2  (GPIO2):  Fault LED       IO6  (GPIO6):  SCT-013 ADC
+  IO3  (GPIO3):  Topway LCD RX   IO11 (GPIO11): Touch CS
+  IO12 (GPIO12): Touch SCLK      IO14 (GPIO14): Touch IRQ
+  IO13 (GPIO13): Touch MOSI      IO15 (GPIO15): DS18B20 T_out 1-Wire
+  IO16 (GPIO16): Touch MISO
+  IO43 (GPIO43): Console RX      IO44 (GPIO44): Console TX
+"""
+
+#pragma experiment("TRAITS")
+#pragma experiment("BRIDGE_CONNECT")
+import Electrical
+import ElectricPower
+from "parts/esp32s3_devkit/ESP32_S3_DevKitC_N16R8.ato" import ESP32_S3_DevKitC_N16R8
+
+module ESP32_S3_DevKit:
+    package = new ESP32_S3_DevKitC_N16R8
+
+    # ── Power ──
+    power_3v3 = new ElectricPower
+    power_5v = new ElectricPower
+
+    power_3v3.hv ~ package.P3V3
+    power_3v3.lv ~ package.GND
+    power_5v.hv ~ package.P5V
+    power_5v.lv ~ package.GND
+
+    # ── Primary GPIOs (used in ESP-IDMS) ──
+    signal boot      ~ package.IO0   # Boot button (active low)
+    signal lcd_tx    ~ package.IO1   # UART1 TX → Topway LCD
+    signal led_fault ~ package.IO2   # Fault indicator LED
+    signal lcd_rx    ~ package.IO3   # UART1 RX ← Topway LCD
+    signal ow_tin    ~ package.IO4   # DS18B20 T_in 1-Wire bus
+    signal led_wifi  ~ package.IO5   # Wi-Fi status LED
+    signal adc_ct    ~ package.IO6   # SCT-013 biased ADC input
+    signal t_cs      ~ package.IO11  # XPT2046 chip select
+    signal t_sclk    ~ package.IO12  # XPT2046 SPI clock
+    signal t_mosi    ~ package.IO13  # XPT2046 SPI MOSI
+    signal t_irq     ~ package.IO14  # XPT2046 pen-down interrupt
+    signal ow_tout   ~ package.IO15  # DS18B20 T_out 1-Wire bus
+    signal t_miso    ~ package.IO16  # XPT2046 SPI MISO
+    signal console_rx ~ package.IO43 # USB-Serial RX
+    signal console_tx ~ package.IO44 # USB-Serial TX
+    signal reset      ~ package.EN   # Reset (active low)
+
+    # ── Spare GPIOs (not used, available for expansion) ──
+    signal spare_io7  ~ package.IO7
+    signal spare_io8  ~ package.IO8
+    signal spare_io9  ~ package.IO9
+    signal spare_io10 ~ package.IO10
+    signal spare_io17 ~ package.IO17
+    signal spare_io18 ~ package.IO18
+    signal spare_io21 ~ package.IO21
+    signal spare_io35 ~ package.IO35
+    signal spare_io36 ~ package.IO36
+    signal spare_io37 ~ package.IO37
+    signal spare_io38 ~ package.IO38
+    signal spare_io39 ~ package.IO39
+    signal spare_io40 ~ package.IO40
+    signal spare_io41 ~ package.IO41
+    signal spare_io42 ~ package.IO42
+
+    assert power_3v3.voltage within 3.0V to 3.6V
+    assert power_5v.voltage within 4.75V to 5.25V

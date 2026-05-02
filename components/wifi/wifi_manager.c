@@ -176,3 +176,23 @@ void wifi_manager_get_ip(char *out, size_t len)
     strncpy(out, s_ip, len - 1);
     out[len - 1] = '\0';
 }
+
+void wifi_manager_reconnect(void)
+{
+    ESP_LOGI(TAG, "WiFi reconnect triggered");
+    
+    /* Stop any pending reconnect timer */
+    if (s_reconnect_timer) {
+        xTimerStop(s_reconnect_timer, 0);
+    }
+    
+    /* Reset reconnect attempts */
+    s_reconnect_attempts = 0;
+    
+    /* Disconnect if currently connected or attempting */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    /* Try to connect with new credentials */
+    try_connect();
+}

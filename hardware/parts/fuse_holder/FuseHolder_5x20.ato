@@ -1,0 +1,17 @@
+"""
+Keystone 3557-2 — PCB Fuse Clip for 5×20mm Cartridge
+  - 2 clips = 1 holder (purchased as pair)
+  - 10 A max, through-hole
+  - Accepts 5×20 mm glass cartridge fuses
+  - Used with Littelfuse 0215010.MXP (10 A slow-blow)
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component FuseHolder_5x20mm:
+    trait has_designator_prefix<prefix="FH">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C5187193", manufacturer="Keystone", partno="3557-2">
+    pin 1   # Input (AC Line in)
+    pin 2   # Output (AC Line fused)

@@ -101,17 +101,17 @@ menu "ESP-IDMS Configuration"
     config IDMS_PIN_ONEWIRE
         int "DS18B20 1-Wire GPIO for T_in sensor"
         range 0 48
-        default 5 if IDF_TARGET_ESP32S3
+        default 4 if IDF_TARGET_ESP32S3
         default 4 if IDF_TARGET_ESP32
-        default 5
+        default 4
         depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
 
     config IDMS_PIN_ONEWIRE2
         int "DS18B20 1-Wire GPIO for T_out sensor"
         range 0 48
-        default 7 if IDF_TARGET_ESP32S3
+        default 15 if IDF_TARGET_ESP32S3
         default 17 if IDF_TARGET_ESP32
-        default 7
+        default 15
         depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
         help
             Dedicated GPIO for the second DS18B20 sensor (T_out).

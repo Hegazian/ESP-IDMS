@@ -1,0 +1,28 @@
+"""
+Hi-Link HLK-PM01 AC-DC Power Supply Module
+  - 100–240 VAC → 5 VDC 600 mA
+  - 3000 VAC isolation
+  - Includes fuse holder on AC_L line
+
+CAUTION: The AC side carries mains voltage.
+The DC side is safety-isolated.
+"""
+
+#pragma experiment("TRAITS")
+#pragma experiment("BRIDGE_CONNECT")
+import Electrical
+import ElectricPower
+from "parts/hlk_pm01/HLK_PM01.ato" import HLK_PM01
+
+module HLK_PM01_PSU:
+    package = new HLK_PM01
+
+    ac_in = new ElectricPower    # AC mains input
+    dc_out = new ElectricPower   # DC 5V output
+
+    ac_in.hv ~ package.AC_L
+    ac_in.lv ~ package.AC_N
+    dc_out.hv ~ package.VO_PLUS
+    dc_out.lv ~ package.VO_MINUS
+
+    assert dc_out.voltage within 4.75V to 5.25V

@@ -1,0 +1,32 @@
+"""
+Topway HKT070DTA-1C Smart LCD Module
+
+Wraps the LCD connector part, exposing:
+  - 5 V power input (backlight + logic)
+  - UART data lines (RX/TX at 3.3 V TTL)
+  - Antenna keep-out annotation (LCD FPC placed away from ESP32 antenna)
+
+The LCD has a built-in RS232-TTL level shifter — direct 3.3 V UART
+connection without external MAX232.
+"""
+
+#pragma experiment("TRAITS")
+#pragma experiment("BRIDGE_CONNECT")
+import Electrical
+import ElectricPower
+from "parts/topway_lcd/HKT070DTA_1C.ato" import HKT070DTA_1C
+
+module Topway_HKT070DTA_1C:
+    package = new HKT070DTA_1C
+
+    power = new ElectricPower
+    power.required = True
+
+    power.hv ~ package.VCC
+    power.lv ~ package.GND
+
+    # UART signals — note: LCD TX → MCU RX, LCD RX ← MCU TX
+    signal lcd_tx ~ package.TX   # LCD transmits → ESP32 GPIO3 receives
+    signal lcd_rx ~ package.RX   # LCD receives ← ESP32 GPIO1 transmits
+
+    assert power.voltage within 4.75V to 5.25V

@@ -1,0 +1,41 @@
+"""
+Tactile Button Module
+
+Wraps E-Switch TL3301AF160QG with a pull-up resistor.
+Used for:
+  SW1: Reset button (pulls EN low) — with 10kΩ pull-up to 3.3V
+  SW2: Boot button (pulls GPIO0 low) — with 10kΩ pull-up to 3.3V
+
+Both are active-low: pressing shorts to GND.
+"""
+
+#pragma experiment("TRAITS")
+#pragma experiment("BRIDGE_CONNECT")
+import Electrical
+import ElectricPower
+import Resistor
+from "parts/tl3301/TL3301AF160QG.ato" import TL3301AF160QG
+
+module Button_ActiveLow:
+    """Momentary button that shorts to GND when pressed, with external pull-up."""
+    power = new ElectricPower
+    power.required = True
+
+    sw = new TL3301AF160QG
+    r_pullup = new Resistor
+
+    # One side of switch to signal (pulled up), other side to GND
+    sw.A1 ~ sw.A2                # Internal connection pair A
+    sw.B1 ~ sw.B2                # Internal connection pair B
+
+    signal mcu_pin               # Connected to MCU EN or GPIO0
+
+    # Pull-up: 3.3V → 10kΩ → signal → switch → GND
+    power.hv ~> r_pullup ~> mcu_pin
+    mcu_pin ~ sw.A1
+    sw.B1 ~ power.lv
+
+    r_pullup.resistance = 10kohm +/- 5%
+    r_pullup.package = "0805"
+
+    assert power.voltage within 3.0V to 3.6V

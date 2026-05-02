@@ -1,0 +1,45 @@
+"""
+JST XH Series — Wire-to-Board Connectors (Right-Angle Headers)
+
+  - B2B-XH-A:  2-pin, 2.5 mm pitch (SCT-013 CT)
+  - B3B-XH-A:  3-pin, 2.5 mm pitch (DS18B20 probes, TH right-angle)
+  - B4B-XH-A:  4-pin, 2.5 mm pitch (Topway LCD)
+  - B6B-XH-A:  6-pin, 2.5 mm pitch (Touch SPI breakout)
+
+  All are through-hole, right-angle. Mating with XHP-N housings.
+"""
+
+#pragma experiment("TRAITS")
+import has_designator_prefix
+import has_part_picked
+
+component JST_XH_2P_RA:
+    trait has_designator_prefix<prefix="J">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C16003", manufacturer="JST", partno="B2B-XH-A(LF)(SN)">
+    pin 1
+    pin 2
+
+component JST_XH_3P_RA:
+    trait has_designator_prefix<prefix="J">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C16004", manufacturer="JST", partno="B3B-XH-A(LF)(SN)">
+    pin 1
+    pin 2
+    pin 3
+
+component JST_XH_4P_RA:
+    trait has_designator_prefix<prefix="J">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C16005", manufacturer="JST", partno="B4B-XH-A(LF)(SN)">
+    pin 1
+    pin 2
+    pin 3
+    pin 4
+
+component JST_XH_6P_RA:
+    trait has_designator_prefix<prefix="J">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C138342", manufacturer="JST", partno="B6B-XH-A(LF)(SN)">
+    pin 1
+    pin 2
+    pin 3
+    pin 4
+    pin 5
+    pin 6

@@ -1,0 +1,11 @@
+requires-atopile: ^0.14.0
+
+paths:
+  src: .
+  layout: ./layouts
+
+builds:
+  default:
+    entry: esp-idms.ato:ESP_IDMS
+    hide_designators: false
+    exclude_checks: []

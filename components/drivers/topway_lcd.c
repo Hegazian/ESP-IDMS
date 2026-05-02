@@ -321,6 +321,29 @@ esp_err_t topway_n16_write(uint32_t addr, uint16_t value)
     return send_packet(pkt, sizeof(pkt));
 }
 
+esp_err_t topway_n16_read(uint32_t addr, uint16_t *value)
+{
+    if (!value) return ESP_ERR_INVALID_ARG;
+
+    uint8_t pkt[5] = {
+        TOPWAY_CMD_N16_READ,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+    };
+    
+    esp_err_t err = send_packet(pkt, sizeof(pkt));
+    if (err != ESP_OK) return err;
+
+    uint8_t resp[16] = {0};
+    int len = uart_read_bytes(s_uart, resp, sizeof(resp), pdMS_TO_TICKS(500));
+    
+    if (len < 6 || resp[0] != TOPWAY_PKT_HEADER || resp[1] != TOPWAY_CMD_N16_READ) {
+        return ESP_ERR_TIMEOUT;
+    }
+    *value = ((uint16_t)resp[2] << 8) | resp[3];
+    drain_rx();
+    return ESP_OK;
+}
+
 esp_err_t topway_n16_fill(uint32_t addr, uint16_t length, uint16_t value)
 {
     uint8_t pkt[9] = {
@@ -372,6 +395,36 @@ esp_err_t topway_str_write(uint32_t addr, const char *str)
     pkt[5 + slen] = 0x00;  /* null terminator required by Topway protocol */
 
     return send_packet(pkt, 5 + slen + 1);
+}
+
+esp_err_t topway_str_read(uint32_t addr, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return ESP_ERR_INVALID_ARG;
+
+    uint8_t pkt[5] = {
+        TOPWAY_CMD_STR_READ,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+    };
+
+    esp_err_t err = send_packet(pkt, sizeof(pkt));
+    if (err != ESP_OK) return err;
+
+    uint8_t resp[140] = {0};
+    int len = uart_read_bytes(s_uart, resp, sizeof(resp), pdMS_TO_TICKS(500));
+
+    if (len < 4 || resp[0] != TOPWAY_PKT_HEADER || resp[1] != TOPWAY_CMD_STR_READ) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* Copy string data (starts at offset 2) until null terminator or max length */
+    size_t i;
+    for (i = 0; i < out_sz - 1 && i + 2 < (size_t)len && resp[2 + i] != 0x00; i++) {
+        out[i] = resp[2 + i];
+    }
+    out[i] = '\0';
+
+    drain_rx();
+    return ESP_OK;
 }
 
 esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)
@@ -458,4 +511,33 @@ esp_err_t topway_rtc_set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour,
         year, month, day, hour, min, sec,
     };
     return send_packet(pkt, sizeof(pkt));
+}
+
+static topway_touch_callback_t s_touch_callback = NULL;
+
+void topway_register_touch_callback(topway_touch_callback_t callback)
+{
+    s_touch_callback = callback;
+}
+
+void topway_process_touch_events(void)
+{
+    if (!s_touch_callback) return;
+
+    uint8_t buf[16];
+    int len;
+
+    /* Non-blocking read of any pending data */
+    while ((len = uart_read_bytes(s_uart, buf, sizeof(buf), 0)) > 0) {
+        /* Check for touch key event: AA 77 <page_id> <key_id> <tail> */
+        for (int i = 0; i < len - 4; i++) {
+            if (buf[i] == TOPWAY_PKT_HEADER && buf[i+1] == TOPWAY_TOUCH_KEY_VP) {
+                uint8_t page_id = buf[i+2];
+                uint8_t key_id = buf[i+3];
+                if (s_touch_callback) {
+                    s_touch_callback(page_id, key_id);
+                }
+            }
+        }
+    }
 }

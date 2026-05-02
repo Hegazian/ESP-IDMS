@@ -1,0 +1,21 @@
+import has_datasheet
+import has_designator_prefix
+import has_part_picked
+import is_atomic_part
+import is_auto_generated
+
+component UNI_ROYAL_0805W8F4701T5E_package:
+    """4.7KΩ (4701) ±1%"""
+
+    # This trait marks this file as auto-generated
+    # If you want to manually change it, remove the trait
+    trait is_auto_generated<system="ato_part", source="easyeda:C17673", date="2026-04-27T08:23:40.768436+00:00", checksum="77ef47c384a77d3a073e2e4d4a0c3f238271d8153add7f8a0d010c0bbab3cb7e">
+
+    trait is_atomic_part<manufacturer="UNI-ROYAL", partnumber="0805W8F4701T5E", footprint="R0805.kicad_mod", symbol="0805W8F4701T5E.kicad_sym", model="R0805_L2.0-W1.3-H0.6.step">
+    trait has_part_picked::by_supplier<supplier_id="lcsc", supplier_partno="C17673", manufacturer="UNI-ROYAL", partno="0805W8F4701T5E">
+    trait has_designator_prefix<prefix="R">
+    trait has_datasheet<datasheet="https://www.lcsc.com/datasheet/lcsc_datasheet_2206010200_UNI-ROYAL-Uniroyal-Elec-0805W8F4701T5E_C17673.pdf">
+
+    # pins
+    pin 2
+    pin 1

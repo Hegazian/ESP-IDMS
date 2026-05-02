@@ -7,6 +7,8 @@ set(ui_requires
     monitor
     drivers
     wifi
+    app_update
+    telegram
 )
 
 if(CONFIG_IDMS_DISPLAY_TOPWAY)
