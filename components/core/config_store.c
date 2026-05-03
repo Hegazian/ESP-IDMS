@@ -10,6 +10,36 @@
 static const char *TAG = "cfg";
 static const char *NS = "idms";
 
+static void copy_str_or_empty(char *out, size_t out_len, const char *value)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    if (!value) {
+        value = "";
+    }
+    strncpy(out, value, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
+static esp_err_t seed_default_str(nvs_handle_t h, const char *key, const char *value, const char *label)
+{
+    size_t required = 0;
+    esp_err_t err = nvs_get_str(h, key, NULL, &required);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        return err;
+    }
+
+    err = nvs_set_str(h, key, value ? value : "");
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Initialized %s to default: %s", label, value ? value : "");
+    }
+    return err;
+}
+
 esp_err_t config_store_init(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -86,6 +116,27 @@ esp_err_t config_store_init(void)
     if (nvs_get_i16(h, "dt_alert", &val_i16) != ESP_OK) {
         nvs_set_i16(h, "dt_alert", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
         ESP_LOGI(TAG, "Initialized dt_alert to default: %d C", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
+    }
+
+    err = seed_default_str(h, "dev_model", CONFIG_DEFAULT_DEVICE_MODEL, "device model");
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+    err = seed_default_str(h, "sup_email", CONFIG_DEFAULT_SUPPORT_EMAIL, "support email");
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+    err = seed_default_str(h, "sup_phone", CONFIG_DEFAULT_SUPPORT_PHONE, "support phone");
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+    err = seed_default_str(h, "qr_code", CONFIG_DEFAULT_QR_CODE, "QR code");
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
     }
     
     nvs_commit(h);
@@ -277,6 +328,113 @@ esp_err_t config_get_ota_pass(char *out, size_t out_len)
 esp_err_t config_set_ota_pass(const char *pass)
 {
     return secrets_set("ota_pass", pass);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Device information stored in NVS "idms" namespace                  */
+/* ------------------------------------------------------------------ */
+
+static esp_err_t store_get_str_or_default(const char *key, const char *fallback,
+                                          char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        copy_str_or_empty(out, out_len, fallback);
+        return ESP_OK;
+    }
+
+    size_t required = out_len;
+    err = nvs_get_str(h, key, out, &required);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        copy_str_or_empty(out, out_len, fallback);
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t store_set_str(const char *key, const char *value)
+{
+    if (!value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(value) > CONFIG_INFO_STRING_MAX_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    esp_err_t err = nvs_set_str(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_get_device_model(char *out, size_t out_len)
+{
+    return store_get_str_or_default("dev_model", CONFIG_DEFAULT_DEVICE_MODEL, out, out_len);
+}
+
+esp_err_t config_set_device_model(const char *value)
+{
+    return store_set_str("dev_model", value);
+}
+
+esp_err_t config_get_serial_number(char *out, size_t out_len)
+{
+    return store_get_str_or_default("serial_no", "", out, out_len);
+}
+
+esp_err_t config_set_serial_number(const char *value)
+{
+    return store_set_str("serial_no", value);
+}
+
+esp_err_t config_get_manufacture_date(char *out, size_t out_len)
+{
+    return store_get_str_or_default("mfg_date", "", out, out_len);
+}
+
+esp_err_t config_set_manufacture_date(const char *value)
+{
+    return store_set_str("mfg_date", value);
+}
+
+esp_err_t config_get_support_email(char *out, size_t out_len)
+{
+    return store_get_str_or_default("sup_email", CONFIG_DEFAULT_SUPPORT_EMAIL, out, out_len);
+}
+
+esp_err_t config_set_support_email(const char *value)
+{
+    return store_set_str("sup_email", value);
+}
+
+esp_err_t config_get_support_phone(char *out, size_t out_len)
+{
+    return store_get_str_or_default("sup_phone", CONFIG_DEFAULT_SUPPORT_PHONE, out, out_len);
+}
+
+esp_err_t config_set_support_phone(const char *value)
+{
+    return store_set_str("sup_phone", value);
+}
+
+esp_err_t config_get_qr_code(char *out, size_t out_len)
+{
+    return store_get_str_or_default("qr_code", CONFIG_DEFAULT_QR_CODE, out, out_len);
+}
+
+esp_err_t config_set_qr_code(const char *value)
+{
+    return store_set_str("qr_code", value);
 }
 
 /* ------------------------------------------------------------------ */

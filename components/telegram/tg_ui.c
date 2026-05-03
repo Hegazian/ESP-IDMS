@@ -24,12 +24,15 @@ void tg_build_status(char *buf, size_t sz)
         "<b>Current:</b> %s\n"
         "<b>T_in:</b> %s\n"
         "<b>T_out:</b> %s\n"
-        "<b>\xce\x94T:</b> %s\n\n"
+        "<b>\xce\x94T:</b> %s\n"
+        "<b>Sensors:</b> %s\n\n"
         "<b>Technicians:</b> %u/5",
         ota_get_version(),
         ota_get_status(), ota_get_partition(),
         m.wifi_connected ? "\xe2\x9c\x85" : "\xe2\x9d\x8c", m.wifi_ip[0] ? m.wifi_ip : "N/A",
-        a, ti, to, dt, config_get_tech_count());
+        a, ti, to, dt,
+        m.sensor_preflight_ok ? "OK" : (m.sensor_status[0] ? m.sensor_status : "Preflight pending"),
+        config_get_tech_count());
 }
 
 void tg_build_ota(char *buf, size_t sz)

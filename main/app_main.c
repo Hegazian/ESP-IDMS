@@ -143,7 +143,10 @@ void app_main(void)
     init_touch_spi_bus();
 #endif
 
-    monitor_init();
+    esp_err_t monitor_err = monitor_init();
+    if (monitor_err != ESP_OK) {
+        ESP_LOGE(TAG, "Monitor sensor preflight reported errors: %s", esp_err_to_name(monitor_err));
+    }
 
 #if CONFIG_IDMS_DISPLAY_TOPWAY
     idms_ui_topway_init();

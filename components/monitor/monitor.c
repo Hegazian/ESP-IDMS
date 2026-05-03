@@ -3,6 +3,8 @@
 #include "esp_err.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -37,6 +39,12 @@ static const char *TAG = "monitor";
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_channel_t s_adc_channel;
+static adc_cali_handle_t s_adc_cali;
+static bool s_adc_cali_enabled;
+static uint32_t s_sensor_error_flags;
+static uint32_t s_sensor_init_error_flags;
+static uint32_t s_sensor_last_logged_flags = UINT32_MAX;
+static char s_sensor_status[96] = "Sensor preflight pending";
 static portMUX_TYPE s_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
 static idms_metrics_t s_metrics;
 
@@ -48,6 +56,12 @@ static pt100_adc_t s_pt100_out;
 #endif
 
 static bool s_conv_pending_read;
+static uint32_t s_ds18b20_request_ms;
+static uint32_t s_ds18b20_last_rescan_ms;
+static float s_last_t_in_c;
+static float s_last_t_out_c;
+static bool s_last_t_in_valid;
+static bool s_last_t_out_valid;
 static uint32_t s_heartbeat_ticks;
 
 enum power_state_t { POWER_OK = 0, POWER_LOW_PENDING, POWER_FAULT };
@@ -65,6 +79,7 @@ static bool s_cool_alert_pending;
 static bool s_cool_alert_low_side;
 static float s_cool_alert_pending_dt;
 static bool s_cool_restore_pending;
+static bool s_sensor_preflight_alert_pending;
 #endif
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
@@ -77,44 +92,123 @@ static float estimate_current_a_from_adc_rms(float v_rms)
     return v_rms * scale;
 }
 
+typedef struct {
+    float mean_raw;
+    float rms_raw;
+    float mean_mv;
+    float rms_mv;
+    int read_errors;
+    int samples;
+    bool connected;
+} current_sample_stats_t;
+
 static int s_adc_err_count;
 static bool s_adc_sensor_connected = false;
 static float s_current_ema = 0.0f;
 static bool s_current_ema_initialized = false;
 #define CURRENT_EMA_ALPHA 0.15f
+#define MONITOR_PERIOD_MS 500
+#define CURRENT_ADC_BIAS_MIN_RAW 900.0f
+#define CURRENT_ADC_BIAS_MAX_RAW 3200.0f
+#define CURRENT_ADC_WARMUP_SAMPLES 32
+#define DS18B20_CONVERSION_MS 800
+#define DS18B20_RESCAN_MS 10000
 
-static float sample_current_rms_volts(void)
+static bool current_adc_bias_ok(float mean_raw)
 {
-    const int n = 512;
+    return mean_raw >= CURRENT_ADC_BIAS_MIN_RAW && mean_raw <= CURRENT_ADC_BIAS_MAX_RAW;
+}
+
+static int current_adc_raw_to_mv(int raw)
+{
+    int voltage_mv = (raw * 3300) / 4095;
+    if (s_adc_cali_enabled && s_adc_cali) {
+        if (adc_cali_raw_to_voltage(s_adc_cali, raw, &voltage_mv) != ESP_OK) {
+            voltage_mv = (raw * 3300) / 4095;
+        }
+    }
+    return voltage_mv;
+}
+
+static esp_err_t sample_current_stats(int n, TickType_t delay_ticks, current_sample_stats_t *out)
+{
+    if (!out || n <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+
+    if (!s_adc) {
+        out->read_errors = n;
+        return ESP_ERR_INVALID_STATE;
+    }
+
     int32_t sum = 0;
     int64_t sum_sq = 0;
+    int32_t sum_mv = 0;
+    int64_t sum_sq_mv = 0;
     int err_count = 0;
+    int sample_count = 0;
     
     for (int i = 0; i < n; i++) {
         int v = 0;
         esp_err_t ret = adc_oneshot_read(s_adc, s_adc_channel, &v);
         if (ret != ESP_OK) {
-            v = 0;
             err_count++;
+            if (delay_ticks > 0) {
+                vTaskDelay(delay_ticks);
+            }
+            continue;
         }
         sum += v;
         sum_sq += (int64_t)v * (int64_t)v;
+        int mv = current_adc_raw_to_mv(v);
+        sum_mv += mv;
+        sum_sq_mv += (int64_t)mv * (int64_t)mv;
+        sample_count++;
+        if (delay_ticks > 0) {
+            vTaskDelay(delay_ticks);
+        }
     }
-    
-    s_adc_err_count = err_count;
-    
-    float mean = (float)sum / (float)n;
-    float mean_sq = (float)sum_sq / (float)n;
-    float variance = mean_sq - (mean * mean);
-    if (variance < 0.0f) variance = 0.0f;
-    float rms_counts = sqrtf(variance);
-    float vrms = rms_counts * (3.3f / 4095.0f);
 
-    if (mean > 4080.0f || mean < 15.0f) {
-        s_adc_sensor_connected = false;
-    } else {
-        s_adc_sensor_connected = true;
+    out->read_errors = err_count;
+    out->samples = sample_count;
+    if (sample_count == 0) {
+        return ESP_FAIL;
     }
+    
+    out->mean_raw = (float)sum / (float)sample_count;
+    float mean_sq = (float)sum_sq / (float)sample_count;
+    float variance = mean_sq - (out->mean_raw * out->mean_raw);
+    if (variance < 0.0f) {
+        variance = 0.0f;
+    }
+    out->rms_raw = sqrtf(variance);
+
+    out->mean_mv = (float)sum_mv / (float)sample_count;
+    float mean_sq_mv = (float)sum_sq_mv / (float)sample_count;
+    float variance_mv = mean_sq_mv - (out->mean_mv * out->mean_mv);
+    if (variance_mv < 0.0f) {
+        variance_mv = 0.0f;
+    }
+    out->rms_mv = sqrtf(variance_mv);
+    out->connected = current_adc_bias_ok(out->mean_raw);
+
+    return ESP_OK;
+}
+
+static float sample_current_rms_volts(void)
+{
+    current_sample_stats_t stats;
+    esp_err_t err = sample_current_stats(512, 0, &stats);
+    if (err != ESP_OK) {
+        s_adc_err_count = stats.read_errors;
+        s_adc_sensor_connected = false;
+        return 0.0f;
+    }
+
+    s_adc_err_count = stats.read_errors;
+    s_adc_sensor_connected = stats.connected && stats.read_errors == 0;
+    float vrms = stats.rms_mv / 1000.0f;
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
     vrms -= s_adc_offset_volts;
@@ -127,43 +221,301 @@ static float sample_current_rms_volts(void)
 }
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
-void monitor_calibrate_zero(void)
+esp_err_t monitor_calibrate_zero(void)
 {
     const int n = CONFIG_IDMS_SCT_AUTOZERO_SAMPLES;
-    int32_t sum = 0;
-    int64_t sum_sq = 0;
-    int err_count = 0;
+    current_sample_stats_t stats;
 
     ESP_LOGI(TAG, "Starting SCT-013 auto-zero calibration (%d samples)...", n);
-    for (int i = 0; i < n; i++) {
-        int v = 0;
-        esp_err_t ret = adc_oneshot_read(s_adc, s_adc_channel, &v);
-        if (ret != ESP_OK) {
-            v = 0;
-            err_count++;
-        }
-        sum += v;
-        sum_sq += (int64_t)v * (int64_t)v;
-        vTaskDelay(pdMS_TO_TICKS(1));
+    esp_err_t err = sample_current_stats(n, pdMS_TO_TICKS(1), &stats);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Auto-zero failed: ADC sampling error (%s)", esp_err_to_name(err));
+        return err;
     }
-    if (err_count > 0) {
+    if (stats.read_errors > 0) {
         ESP_LOGE(TAG, "Auto-zero: %d/%d ADC reads FAILED (GPIO%d may not support ADC)",
-                 err_count, n, CONFIG_IDMS_ADC_GPIO);
+                 stats.read_errors, n, CONFIG_IDMS_ADC_GPIO);
+        return ESP_FAIL;
     }
-
-    float mean = (float)sum / (float)n;
-    float mean_sq = (float)sum_sq / (float)n;
-    float variance = mean_sq - (mean * mean);
-    if (variance < 0.0f) {
-        variance = 0.0f;
+    if (!stats.connected) {
+        ESP_LOGE(TAG, "Auto-zero failed: ADC bias mean %.1f outside expected %.0f-%.0f counts",
+                 (double)stats.mean_raw,
+                 (double)CURRENT_ADC_BIAS_MIN_RAW,
+                 (double)CURRENT_ADC_BIAS_MAX_RAW);
+        ESP_LOGE(TAG, "Check TP_ADC: expected about 1.65V with 2x10k bias divider");
+        return ESP_ERR_INVALID_STATE;
     }
-    float rms_counts = sqrtf(variance);
-    s_adc_offset_volts = rms_counts * (3.3f / 4095.0f);
+    s_adc_offset_volts = stats.rms_mv / 1000.0f;
 
     ESP_LOGI(TAG, "Auto-zero complete: offset = %.4f V (%.1f ADC counts), mean = %.1f",
-             s_adc_offset_volts, (double)rms_counts, (double)mean);
+             s_adc_offset_volts, (double)stats.rms_raw, (double)stats.mean_raw);
+    return ESP_OK;
 }
 #endif
+
+static void append_status_item(char *buf, size_t buf_sz, const char *item)
+{
+    if (!buf || buf_sz == 0 || !item) {
+        return;
+    }
+    size_t len = strlen(buf);
+    if (len > 0 && len < buf_sz - 1) {
+        int written = snprintf(buf + len, buf_sz - len, ", %s", item);
+        (void)written;
+    } else if (len == 0) {
+        snprintf(buf, buf_sz, "%s", item);
+    }
+}
+
+static void set_sensor_preflight_result(uint32_t flags)
+{
+    char failed[80] = "";
+
+    if (flags & IDMS_SENSOR_ERR_CURRENT_ADC) {
+        append_status_item(failed, sizeof(failed), "Current ADC");
+    }
+    if (flags & IDMS_SENSOR_ERR_CURRENT_RANGE) {
+        append_status_item(failed, sizeof(failed), "Current bias");
+    }
+    if (flags & IDMS_SENSOR_ERR_CURRENT_CAL) {
+        append_status_item(failed, sizeof(failed), "Current cal");
+    }
+    if (flags & IDMS_SENSOR_ERR_TEMP_INIT) {
+        append_status_item(failed, sizeof(failed), "Temp init");
+    }
+    if (flags & IDMS_SENSOR_ERR_TEMP_IN) {
+        append_status_item(failed, sizeof(failed), "T_in");
+    }
+    if (flags & IDMS_SENSOR_ERR_TEMP_OUT) {
+        append_status_item(failed, sizeof(failed), "T_out");
+    }
+    if (flags & IDMS_SENSOR_ERR_TEMP_DELTA) {
+        append_status_item(failed, sizeof(failed), "Delta T");
+    }
+
+    s_sensor_error_flags = flags;
+    if (flags == 0) {
+        snprintf(s_sensor_status, sizeof(s_sensor_status), "Sensors OK");
+    } else {
+        snprintf(s_sensor_status, sizeof(s_sensor_status), "Sensor fault: %s", failed[0] ? failed : "failed");
+    }
+
+    if (flags != s_sensor_last_logged_flags) {
+        if (flags == 0) {
+            ESP_LOGI(TAG, "Sensor faults recovered");
+        } else {
+            ESP_LOGW(TAG, "Sensor status: %s (flags=0x%02lx)",
+                     s_sensor_status, (unsigned long)flags);
+        }
+        s_sensor_last_logged_flags = flags;
+    }
+
+    portENTER_CRITICAL(&s_metrics_lock);
+    s_metrics.sensor_preflight_done = true;
+    s_metrics.sensor_preflight_ok = (flags == 0);
+    s_metrics.sensor_error_flags = flags;
+    strncpy(s_metrics.sensor_status, s_sensor_status, sizeof(s_metrics.sensor_status) - 1);
+    s_metrics.sensor_status[sizeof(s_metrics.sensor_status) - 1] = '\0';
+    portEXIT_CRITICAL(&s_metrics_lock);
+
+#if CONFIG_IDMS_UI_ENABLE
+    if (flags == 0) {
+        s_sensor_preflight_alert_pending = false;
+    }
+#endif
+}
+
+static void mark_sensor_preflight_pending(void)
+{
+    portENTER_CRITICAL(&s_metrics_lock);
+    s_metrics.sensor_preflight_done = false;
+    s_metrics.sensor_preflight_ok = false;
+    s_metrics.sensor_error_flags = 0;
+    strncpy(s_metrics.sensor_status, "Sensor preflight pending", sizeof(s_metrics.sensor_status) - 1);
+    s_metrics.sensor_status[sizeof(s_metrics.sensor_status) - 1] = '\0';
+    portEXIT_CRITICAL(&s_metrics_lock);
+}
+
+static bool temp_in_range(float temp_c, float min_c, float max_c)
+{
+    return isfinite(temp_c) && temp_c >= min_c && temp_c <= max_c;
+}
+
+static bool init_current_adc_calibration(adc_unit_t unit_id, adc_channel_t channel,
+                                         adc_atten_t atten, adc_bitwidth_t bitwidth)
+{
+    s_adc_cali = NULL;
+    s_adc_cali_enabled = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t curve_cfg = {
+        .unit_id = unit_id,
+        .chan = channel,
+        .atten = atten,
+        .bitwidth = bitwidth,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&curve_cfg, &s_adc_cali) == ESP_OK) {
+        s_adc_cali_enabled = true;
+        ESP_LOGI(TAG, "Current ADC calibration: curve fitting");
+        return true;
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t line_cfg = {
+        .unit_id = unit_id,
+        .atten = atten,
+        .bitwidth = bitwidth,
+    };
+    if (adc_cali_create_scheme_line_fitting(&line_cfg, &s_adc_cali) == ESP_OK) {
+        s_adc_cali_enabled = true;
+        ESP_LOGI(TAG, "Current ADC calibration: line fitting");
+        return true;
+    }
+#endif
+
+    ESP_LOGW(TAG, "Current ADC calibration unavailable; using raw 3.3V conversion");
+    return false;
+}
+
+static uint32_t preflight_current_sensor(void)
+{
+    current_sample_stats_t stats;
+    uint32_t flags = 0;
+    esp_err_t err = sample_current_stats(128, pdMS_TO_TICKS(1), &stats);
+
+    if (err != ESP_OK || stats.read_errors > 0) {
+        ESP_LOGE(TAG, "Current sensor preflight failed: ADC sampling err=%s read_errors=%d",
+                 esp_err_to_name(err), stats.read_errors);
+        flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+    }
+    if (err == ESP_OK && !stats.connected) {
+        ESP_LOGE(TAG, "Current sensor preflight failed: ADC bias mean %.1f outside expected %.0f-%.0f counts",
+                 (double)stats.mean_raw,
+                 (double)CURRENT_ADC_BIAS_MIN_RAW,
+                 (double)CURRENT_ADC_BIAS_MAX_RAW);
+        ESP_LOGE(TAG, "Measure TP_ADC/GPIO%d: expected about 1.65V before current can be calibrated",
+                 CONFIG_IDMS_ADC_GPIO);
+        flags |= IDMS_SENSOR_ERR_CURRENT_RANGE;
+    }
+    if (err == ESP_OK && stats.connected && stats.read_errors == 0) {
+        ESP_LOGI(TAG, "Current sensor preflight OK: mean=%.1f raw rms=%.1f mv rms=%.2f",
+                 (double)stats.mean_raw, (double)stats.rms_raw, (double)stats.rms_mv);
+    }
+
+    return flags;
+}
+
+static uint32_t preflight_temperature_sensors(void)
+{
+    uint32_t flags = 0;
+
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20
+    bool tin_present = ds18b20_sensor_present(0);
+    bool tout_present = ds18b20_sensor_present(1);
+    if (!tin_present) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+    if (!tout_present) {
+        flags |= IDMS_SENSOR_ERR_TEMP_OUT;
+    }
+    if (!tin_present || !tout_present) {
+        flags |= IDMS_SENSOR_ERR_TEMP_DELTA;
+    }
+    if (tin_present || tout_present) {
+        ds18b20_request_conversion();
+        vTaskDelay(pdMS_TO_TICKS(800));
+        float t_in = 0.0f;
+        if (!tin_present ||
+            !ds18b20_read_temperature_c(0, &t_in) ||
+            !temp_in_range(t_in, -55.0f, 125.0f)) {
+            flags |= IDMS_SENSOR_ERR_TEMP_IN | IDMS_SENSOR_ERR_TEMP_DELTA;
+            s_last_t_in_valid = false;
+        } else {
+            s_last_t_in_c = t_in;
+            s_last_t_in_valid = true;
+        }
+        float t_out = 0.0f;
+        if (!tout_present ||
+            !ds18b20_read_temperature_c(1, &t_out) ||
+            !temp_in_range(t_out, -55.0f, 125.0f)) {
+            flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+            s_last_t_out_valid = false;
+        } else {
+            s_last_t_out_c = t_out;
+            s_last_t_out_valid = true;
+        }
+    }
+#elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
+    int count = max31865_sensor_count();
+    if (count < 1) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+    if (count < 2) {
+        flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+    }
+    float t = 0.0f;
+    if (count >= 1 && (!max31865_read_temperature_c(0, &t) || !temp_in_range(t, -100.0f, 400.0f))) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+    if (count >= 2 && (!max31865_read_temperature_c(1, &t) || !temp_in_range(t, -100.0f, 400.0f))) {
+        flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+    }
+#elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
+    float t = 0.0f;
+    if (!pt100_adc_read_celsius(&s_pt100_in, &t) || !temp_in_range(t, -100.0f, 400.0f)) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+#elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+    bool ds_requested = false;
+    int count = ds18b20_device_count();
+#if CONFIG_IDMS_COMBO_T_IN_DS18B20 || CONFIG_IDMS_COMBO_T_OUT_DS18B20
+    if (count > 0) {
+        ds18b20_request_conversion();
+        ds_requested = true;
+    }
+    if (ds_requested) {
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+#endif
+#if CONFIG_IDMS_COMBO_T_IN_DS18B20
+    float t_in_ds = 0.0f;
+    if (count < 1 || !ds18b20_read_temperature_c(0, &t_in_ds) ||
+        !temp_in_range(t_in_ds, -55.0f, 125.0f)) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+#elif CONFIG_IDMS_COMBO_T_IN_PT100
+    float t_in_pt = 0.0f;
+    if (!pt100_adc_read_celsius(&s_pt100_in, &t_in_pt) || !temp_in_range(t_in_pt, -100.0f, 400.0f)) {
+        flags |= IDMS_SENSOR_ERR_TEMP_IN;
+    }
+#endif
+#if CONFIG_IDMS_COMBO_T_OUT_DS18B20
+    float t_out_ds = 0.0f;
+    if (count < 2 || !ds18b20_read_temperature_c(1, &t_out_ds) ||
+        !temp_in_range(t_out_ds, -55.0f, 125.0f)) {
+        flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+    }
+#elif CONFIG_IDMS_COMBO_T_OUT_PT100
+    float t_out_pt = 0.0f;
+#if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
+    if (!pt100_adc_read_celsius(&s_pt100_out, &t_out_pt) || !temp_in_range(t_out_pt, -100.0f, 400.0f)) {
+#else
+    if (!pt100_adc_read_celsius(&s_pt100_in, &t_out_pt) || !temp_in_range(t_out_pt, -100.0f, 400.0f)) {
+#endif
+        flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+    }
+#endif
+#endif
+
+    if (flags & (IDMS_SENSOR_ERR_TEMP_IN | IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA)) {
+        ESP_LOGE(TAG, "Temperature sensor preflight failed (flags=0x%02lx)",
+                 (unsigned long)flags);
+    } else {
+        ESP_LOGI(TAG, "Temperature sensor preflight OK");
+    }
+    return flags;
+}
 
 #if CONFIG_IDMS_UI_ENABLE
 #define ALERT_MSG_BUF_SIZE 256
@@ -217,6 +569,7 @@ static void monitor_task(void *arg)
 {
     (void)arg;
     s_conv_pending_read = false;
+    s_ds18b20_request_ms = 0;
     s_heartbeat_ticks = 0;
 
     const float i_thresh = (float)CONFIG_IDMS_CURRENT_THRESHOLD_MA / 1000.0f;
@@ -229,7 +582,8 @@ static void monitor_task(void *arg)
 #endif
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(MONITOR_PERIOD_MS));
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
         float vrms = sample_current_rms_volts();
         float amps_raw = estimate_current_a_from_adc_rms(vrms);
@@ -246,16 +600,50 @@ static void monitor_task(void *arg)
         bool v_in = false, v_out = false;
 
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20
-        if (s_conv_pending_read) {
-            if (ds18b20_device_count() >= 1) {
-                v_in = ds18b20_read_temperature_c(0, &t_in);
-            }
-            if (ds18b20_device_count() >= 2) {
-                v_out = ds18b20_read_temperature_c(1, &t_out);
-            }
+        if ((!ds18b20_sensor_present(0) || !ds18b20_sensor_present(1)) &&
+            (now_ms - s_ds18b20_last_rescan_ms) >= DS18B20_RESCAN_MS) {
+            ESP_LOGI(TAG, "Re-scanning DS18B20 buses for recovered sensors");
+            ds18b20_init();
+            s_ds18b20_last_rescan_ms = now_ms;
+            s_conv_pending_read = false;
+            s_last_t_in_valid = ds18b20_sensor_present(0) ? s_last_t_in_valid : false;
+            s_last_t_out_valid = ds18b20_sensor_present(1) ? s_last_t_out_valid : false;
         }
-        ds18b20_request_conversion();
-        s_conv_pending_read = true;
+
+        t_in = s_last_t_in_c;
+        t_out = s_last_t_out_c;
+        v_in = s_last_t_in_valid;
+        v_out = s_last_t_out_valid;
+        bool ds_ready = s_conv_pending_read &&
+                        ((now_ms - s_ds18b20_request_ms) >= DS18B20_CONVERSION_MS);
+        if (ds_ready) {
+            if (ds18b20_sensor_present(0)) {
+                v_in = ds18b20_read_temperature_c(0, &t_in);
+                if (v_in) {
+                    s_last_t_in_c = t_in;
+                }
+                s_last_t_in_valid = v_in;
+            } else {
+                v_in = false;
+                s_last_t_in_valid = false;
+            }
+            if (ds18b20_sensor_present(1)) {
+                v_out = ds18b20_read_temperature_c(1, &t_out);
+                if (v_out) {
+                    s_last_t_out_c = t_out;
+                }
+                s_last_t_out_valid = v_out;
+            } else {
+                v_out = false;
+                s_last_t_out_valid = false;
+            }
+            s_conv_pending_read = false;
+        }
+        if (!s_conv_pending_read) {
+            ds18b20_request_conversion();
+            s_ds18b20_request_ms = now_ms;
+            s_conv_pending_read = true;
+        }
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
         v_in = max31865_read_temperature_c(0, &t_in);
         v_out = max31865_read_temperature_c(1, &t_out);
@@ -264,15 +652,17 @@ static void monitor_task(void *arg)
         v_out = false;
 #elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
         {
-            bool ds18b20_read_done = s_conv_pending_read;
+            bool ds18b20_read_done = s_conv_pending_read &&
+                                     ((now_ms - s_ds18b20_request_ms) >= DS18B20_CONVERSION_MS);
             float ds_t = 0.0f;
             bool ds_v = false;
 
             if (ds18b20_read_done && ds18b20_device_count() >= 1) {
                 ds_v = ds18b20_read_temperature_c(0, &ds_t);
             }
-            ds18b20_request_conversion();
-            s_conv_pending_read = true;
+            if (ds18b20_read_done) {
+                s_conv_pending_read = false;
+            }
 
     #if CONFIG_IDMS_COMBO_T_IN_DS18B20
             v_in = ds_v;
@@ -294,6 +684,11 @@ static void monitor_task(void *arg)
             v_out = pt100_adc_read_celsius(&s_pt100_in, &t_out);
         #endif
     #endif
+            if (!s_conv_pending_read) {
+                ds18b20_request_conversion();
+                s_ds18b20_request_ms = now_ms;
+                s_conv_pending_read = true;
+            }
         }
 #endif
 
@@ -302,6 +697,38 @@ static void monitor_task(void *arg)
         if (v_dt) {
             dt = t_out - t_in;
         }
+        bool delta_alert_active = v_dt && (dt < (float)config_get_dt_alert_threshold());
+
+        uint32_t runtime_sensor_flags = s_sensor_init_error_flags;
+        if (!s_adc) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+        } else if (!s_adc_sensor_connected) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_CURRENT_RANGE;
+        }
+#if CONFIG_IDMS_TEMP_SENSOR_DS18B20 || CONFIG_IDMS_TEMP_SENSOR_MAX31865
+        if (!v_in) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_TEMP_IN | IDMS_SENSOR_ERR_TEMP_DELTA;
+        }
+        if (!v_out) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+        }
+#elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
+        if (!v_in) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_TEMP_IN;
+        }
+#elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
+    #if CONFIG_IDMS_COMBO_T_IN_DS18B20 || CONFIG_IDMS_COMBO_T_IN_PT100
+        if (!v_in) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_TEMP_IN | IDMS_SENSOR_ERR_TEMP_DELTA;
+        }
+    #endif
+    #if CONFIG_IDMS_COMBO_T_OUT_DS18B20 || CONFIG_IDMS_COMBO_T_OUT_PT100
+        if (!v_out) {
+            runtime_sensor_flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
+        }
+    #endif
+#endif
+        set_sensor_preflight_result(runtime_sensor_flags);
 
 #if CONFIG_IDMS_UI_ENABLE
         bool wifi_up = wifi_manager_is_connected();
@@ -331,8 +758,8 @@ static void monitor_task(void *arg)
         portEXIT_CRITICAL(&s_metrics_lock);
 
         /* Power fault detection — ALWAYS runs, independent of Wi-Fi */
-        if (amps < i_thresh) {
-            s_power_low_ms += 500;
+        if (s_adc_sensor_connected && amps < i_thresh) {
+            s_power_low_ms += MONITOR_PERIOD_MS;
             if (s_power_low_ms >= 5000 && s_power_st == POWER_OK) {
                 s_power_st = POWER_LOW_PENDING;
             }
@@ -367,7 +794,7 @@ static void monitor_task(void *arg)
             bool bad = bad_low || bad_high;
 
             if (bad) {
-                s_cool_bad_ms += 500;
+                s_cool_bad_ms += MONITOR_PERIOD_MS;
                 if (s_cool_bad_ms >= 5000 && s_cool_st == COOL_OK) {
 #if CONFIG_IDMS_UI_ENABLE
                     if (wifi_up) {
@@ -407,9 +834,28 @@ static void monitor_task(void *arg)
             s_cool_st = COOL_OK;
         }
 
+        portENTER_CRITICAL(&s_metrics_lock);
+        s_metrics.power_fault = (s_power_st == POWER_FAULT);
+        s_metrics.cooling_fault = (s_cool_st == COOL_FAULT_LOW || s_cool_st == COOL_FAULT_HIGH);
+        s_metrics.delta_alert = delta_alert_active;
+        s_metrics.sensor_preflight_done = true;
+        s_metrics.sensor_preflight_ok = (s_sensor_error_flags == 0);
+        s_metrics.sensor_error_flags = s_sensor_error_flags;
+        strncpy(s_metrics.sensor_status, s_sensor_status, sizeof(s_metrics.sensor_status) - 1);
+        s_metrics.sensor_status[sizeof(s_metrics.sensor_status) - 1] = '\0';
+        portEXIT_CRITICAL(&s_metrics_lock);
+
 #if CONFIG_IDMS_UI_ENABLE
         /* Wi-Fi dependent operations: heartbeat and flush pending alerts */
         if (wifi_up) {
+            if (s_sensor_preflight_alert_pending) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "ALERT: Sensor preflight failed: %s (flags=0x%02lx)",
+                         s_sensor_status, (unsigned long)s_sensor_error_flags);
+                telegram_broadcast_alert(msg);
+                s_sensor_preflight_alert_pending = false;
+            }
+
             s_heartbeat_ticks++;
             if (s_heartbeat_ticks >= 120) {
                 s_heartbeat_ticks = 0;
@@ -439,19 +885,33 @@ static void monitor_task(void *arg)
     }
 }
 
-void monitor_init(void)
+esp_err_t monitor_init(void)
 {
     const gpio_num_t adc_gpio = (gpio_num_t)CONFIG_IDMS_ADC_GPIO;
     adc_unit_t unit_id = ADC_UNIT_1;
     adc_channel_t ch = ADC_CHANNEL_0;
+    uint32_t sensor_flags = 0;
+    esp_err_t init_result = ESP_OK;
+
+    memset(&s_metrics, 0, sizeof(s_metrics));
+    s_sensor_error_flags = 0;
+    s_sensor_init_error_flags = 0;
+    s_sensor_last_logged_flags = UINT32_MAX;
+    s_last_t_in_valid = false;
+    s_last_t_out_valid = false;
+    mark_sensor_preflight_pending();
     esp_err_t err = adc_oneshot_io_to_channel(adc_gpio, &unit_id, &ch);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADC GPIO %d is not valid for this chip (%s). Fix IDMS_ADC_GPIO in menuconfig.",
                  (int)adc_gpio, esp_err_to_name(err));
-        ESP_ERROR_CHECK(err);
+        sensor_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+        init_result = err;
+    } else {
+        s_adc_channel = ch;
     }
-    s_adc_channel = ch;
 
+    if ((sensor_flags & IDMS_SENSOR_ERR_CURRENT_ADC) == 0) {
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << adc_gpio,
         .mode = GPIO_MODE_DISABLE,
@@ -464,28 +924,66 @@ void monitor_init(void)
     adc_oneshot_unit_init_cfg_t ucfg = {
         .unit_id = unit_id,
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&ucfg, &s_adc));
+    err = adc_oneshot_new_unit(&ucfg, &s_adc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ADC unit init failed: %s", esp_err_to_name(err));
+        sensor_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+        init_result = err;
+    }
 
     adc_oneshot_chan_cfg_t chcfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, s_adc_channel, &chcfg));
+    if ((sensor_flags & IDMS_SENSOR_ERR_CURRENT_ADC) == 0) {
+        err = adc_oneshot_config_channel(s_adc, s_adc_channel, &chcfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADC channel config failed: %s", esp_err_to_name(err));
+            sensor_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+            s_sensor_init_error_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+            init_result = err;
+        } else {
+            init_current_adc_calibration(unit_id, s_adc_channel, ADC_ATTEN_DB_12,
+                                         ADC_BITWIDTH_DEFAULT);
+        }
+    }
 
-    int test_val = 0;
-    err = adc_oneshot_read(s_adc, s_adc_channel, &test_val);
-    ESP_LOGI(TAG, "ADC test read: GPIO%d, unit=%d, ch=%d, val=%d, err=%s",
-             (int)adc_gpio, (int)unit_id, (int)ch, test_val,
-             err == ESP_OK ? "OK" : esp_err_to_name(err));
-    if (test_val >= 4090 || test_val <= 5) {
-        ESP_LOGW(TAG, "ADC reading stuck at %d (full range 0-4095)", test_val);
-        ESP_LOGW(TAG, "  If 4095: GPIO%d is floating (read VCC) — check SCT-013 bias circuit", (int)adc_gpio);
-        ESP_LOGW(TAG, "  Bias circuit: 2x10kR divider (3V3-GPIO6-GND) + 10uF cap + 33R burden");
-        ESP_LOGW(TAG, "  If 0: GPIO6 shorted to GND or ADC misconfigured");
+    if ((sensor_flags & IDMS_SENSOR_ERR_CURRENT_ADC) == 0) {
+        current_sample_stats_t warmup;
+        err = sample_current_stats(CURRENT_ADC_WARMUP_SAMPLES, pdMS_TO_TICKS(1), &warmup);
+        if (err != ESP_OK || warmup.read_errors > 0) {
+            ESP_LOGE(TAG, "ADC warm-up failed: err=%s read_errors=%d/%d",
+                     esp_err_to_name(err), warmup.read_errors, CURRENT_ADC_WARMUP_SAMPLES);
+            sensor_flags |= IDMS_SENSOR_ERR_CURRENT_ADC;
+            init_result = err;
+        } else {
+            ESP_LOGI(TAG, "ADC warm-up: GPIO%d, unit=%d, ch=%d, mean=%.1f, rms=%.1f",
+                     (int)adc_gpio, (int)unit_id, (int)ch,
+                     (double)warmup.mean_raw, (double)warmup.rms_raw);
+            if (!current_adc_bias_ok(warmup.mean_raw)) {
+                ESP_LOGW(TAG, "ADC bias outside expected range %.0f-%.0f counts",
+                         (double)CURRENT_ADC_BIAS_MIN_RAW,
+                         (double)CURRENT_ADC_BIAS_MAX_RAW);
+                ESP_LOGW(TAG, "  Check SCT-013 bias: 2x10k divider, 10uF cap, GPIO%d TP_ADC about 1.65V",
+                         (int)adc_gpio);
+            }
+        }
+    }
     }
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
-    monitor_calibrate_zero();
+    if ((sensor_flags & IDMS_SENSOR_ERR_CURRENT_ADC) == 0) {
+        err = monitor_calibrate_zero();
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_INVALID_STATE) {
+                sensor_flags |= IDMS_SENSOR_ERR_CURRENT_RANGE;
+            } else {
+                sensor_flags |= IDMS_SENSOR_ERR_CURRENT_CAL;
+            }
+            init_result = err;
+        }
+    }
 #endif
 
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20
@@ -493,33 +991,74 @@ void monitor_init(void)
     ESP_LOGI(TAG, "Temperature sensors: DS18B20 1-Wire (T_in=GPIO%d, T_out=GPIO%d)",
              CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_ONEWIRE2);
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
-    max31865_init(IDMS_SENSOR_SPI_HOST);
+    err = max31865_init(IDMS_SENSOR_SPI_HOST);
+    if (err != ESP_OK) {
+        sensor_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        init_result = err;
+    }
     ESP_LOGI(TAG, "Temperature sensors: PT100 via MAX31865 (CS0=GPIO%d, CS1=GPIO%d)",
              CONFIG_IDMS_MAX31865_CS0, CONFIG_IDMS_MAX31865_CS1);
 #elif CONFIG_IDMS_TEMP_SENSOR_PT100_ADC
-    pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
-                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
-                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    err = pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
+                         (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                         (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    if (err != ESP_OK) {
+        sensor_flags |= IDMS_SENSOR_ERR_TEMP_INIT | IDMS_SENSOR_ERR_TEMP_IN;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        init_result = err;
+    }
     ESP_LOGI(TAG, "Temperature sensors: PT100 via ADC (GPIO%d, R_ref=%.1fΩ)",
              CONFIG_IDMS_PIN_PT100_ADC, (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f);
 #elif CONFIG_IDMS_TEMP_SENSOR_DS18B20_PT100
     ds18b20_init();
-    pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
-                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
-                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    err = pt100_adc_init(&s_pt100_in, CONFIG_IDMS_PIN_PT100_ADC,
+                         (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                         (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    if (err != ESP_OK) {
+        sensor_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        init_result = err;
+    }
 #if CONFIG_IDMS_PIN_PT100_ADC2 >= 0
-    pt100_adc_init(&s_pt100_out, CONFIG_IDMS_PIN_PT100_ADC2,
-                   (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
-                   (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    err = pt100_adc_init(&s_pt100_out, CONFIG_IDMS_PIN_PT100_ADC2,
+                         (float)CONFIG_IDMS_PT100_RREF_X10 / 10.0f,
+                         (float)CONFIG_IDMS_PT100_R0_X10 / 10.0f);
+    if (err != ESP_OK) {
+        sensor_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        s_sensor_init_error_flags |= IDMS_SENSOR_ERR_TEMP_INIT;
+        init_result = err;
+    }
 #endif
     ESP_LOGI(TAG, "Temperature sensors: DS18B20+PT100 combo (1-Wire=GPIO%d/%d, PT100 ADC=GPIO%d)",
              CONFIG_IDMS_PIN_ONEWIRE, CONFIG_IDMS_PIN_ONEWIRE2, CONFIG_IDMS_PIN_PT100_ADC);
 #endif
 
-    memset(&s_metrics, 0, sizeof(s_metrics));
-    xTaskCreatePinnedToCore(monitor_task, "monitor", 8192, NULL, 5, NULL, tskNO_AFFINITY);
-    ESP_LOGI(TAG, "Monitor task started (SCT-013 ADC on GPIO%d, adc unit %d channel %d)",
-             (int)adc_gpio, (int)unit_id, (int)s_adc_channel);
+    if ((sensor_flags & IDMS_SENSOR_ERR_CURRENT_ADC) == 0) {
+        sensor_flags |= preflight_current_sensor();
+    }
+    sensor_flags |= preflight_temperature_sensors();
+    set_sensor_preflight_result(sensor_flags);
+
+#if CONFIG_IDMS_UI_ENABLE
+    s_sensor_preflight_alert_pending = (sensor_flags != 0);
+#endif
+
+    BaseType_t task_ok = xTaskCreatePinnedToCore(monitor_task, "monitor", 8192, NULL, 5, NULL,
+                                                 tskNO_AFFINITY);
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start monitor task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "Monitor task started (SCT-013 ADC on GPIO%d, adc unit %d channel %d, preflight=%s)",
+             (int)adc_gpio, (int)unit_id, (int)s_adc_channel,
+             sensor_flags == 0 ? "OK" : s_sensor_status);
+
+    if (sensor_flags != 0 && init_result == ESP_OK) {
+        init_result = ESP_ERR_INVALID_STATE;
+    }
+    return init_result;
 }
 
 void monitor_get_metrics(idms_metrics_t *out)
@@ -538,6 +1077,13 @@ void monitor_adc_debug(int *out_mean, int *out_rms, int *out_errors)
     int32_t sum = 0;
     int64_t sum_sq = 0;
     int err = 0;
+
+    if (!s_adc) {
+        if (out_mean) *out_mean = 0;
+        if (out_rms) *out_rms = 0;
+        if (out_errors) *out_errors = n;
+        return;
+    }
 
     for (int i = 0; i < n; i++) {
         int v = 0;

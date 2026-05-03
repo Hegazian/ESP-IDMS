@@ -28,8 +28,9 @@ void idms_ui_topway_update(void);
 /**
  * @brief Send device information to Topway LCD display
  * 
- * Sends device model, firmware version, hardware version, 
- * serial number, and manufacture date to the INFO page VP addresses.
+ * Sends NVS-backed device model, serial number, manufacture date,
+ * support email, support phone, and QR code payload to the INFO page
+ * VP addresses.
  */
 void idms_ui_topway_send_device_info(void);
 
@@ -53,10 +54,12 @@ void idms_ui_topway_send_config(void);
  * @param max_tin     Pointer to store Max Temp IN (x10, 0.1C precision), or NULL
  * @param max_tout    Pointer to store Max Temp OUT (x10, 0.1C precision), or NULL
  * @param max_current Pointer to store Max Current (mA), or NULL
+ * @param dt_alert    Pointer to store Delta_T threshold (C), or NULL
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
 esp_err_t idms_ui_topway_read_config(int16_t *min_tin, int16_t *min_tout, uint16_t *min_current,
-                                      int16_t *max_tin, int16_t *max_tout, uint16_t *max_current);
+                                      int16_t *max_tin, int16_t *max_tout, uint16_t *max_current,
+                                      int16_t *dt_alert);
 
 /**
  * @brief Check if apply button was pressed and read config from LCD

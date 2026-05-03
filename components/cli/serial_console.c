@@ -112,6 +112,13 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "T_in: %.1f C (%s)", m.t_in_c, m.t_in_valid ? "valid" : "invalid");
         ESP_LOGI(TAG, "T_out: %.1f C (%s)", m.t_out_c, m.t_out_valid ? "valid" : "invalid");
         ESP_LOGI(TAG, "Delta T: %.1f C (%s)", m.delta_t_c, m.delta_valid ? "valid" : "invalid");
+        ESP_LOGI(TAG, "Faults: power=%s cooling=%s delta_alert=%s",
+                 m.power_fault ? "yes" : "no",
+                 m.cooling_fault ? "yes" : "no",
+                 m.delta_alert ? "yes" : "no");
+        ESP_LOGI(TAG, "Sensor preflight: %s (flags=0x%02lx)",
+                 m.sensor_preflight_ok ? "OK" : m.sensor_status,
+                 (unsigned long)m.sensor_error_flags);
         ESP_LOGI(TAG, "Technicians: %u", config_get_tech_count());
     } else if (strcmp(cmd, "reboot") == 0) {
         ESP_LOGI(TAG, "Rebooting...");
@@ -195,7 +202,9 @@ static void handle_cmd(const char *cmd)
         monitor_adc_debug(&mean, &rms, &errors);
         ESP_LOGI(TAG, "ADC debug: mean=%d, rms=%d, errors=%d/64 (GPIO%d, unit=1 ch=5)",
                  mean, rms, errors, CONFIG_IDMS_ADC_GPIO);
-        ESP_LOGI(TAG, "  Expected: mean~2048 with bias circuit, mean~0 if pin floating/0V");
+        ESP_LOGI(TAG, "  Expected: mean roughly mid-scale with bias circuit (about 900-3200 counts)");
+        ESP_LOGI(TAG, "  If mean is near 0, TP_ADC/GPIO%d is shorted to GND or bias divider is missing", CONFIG_IDMS_ADC_GPIO);
+        ESP_LOGI(TAG, "  If mean is near 4095, TP_ADC/GPIO%d is floating/high", CONFIG_IDMS_ADC_GPIO);
         ESP_LOGI(TAG, "  If errors>0: GPIO%d may not support ADC or ADC not initialized", CONFIG_IDMS_ADC_GPIO);
     } else if (strncmp(cmd, "topway_str ", 11) == 0) {
 #if CONFIG_IDMS_DISPLAY_TOPWAY

@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 esp_err_t config_store_init(void);
@@ -26,6 +27,30 @@ esp_err_t config_get_ota_user(char *out, size_t out_len);
 esp_err_t config_set_ota_user(const char *user);
 esp_err_t config_get_ota_pass(char *out, size_t out_len);
 esp_err_t config_set_ota_pass(const char *pass);
+
+/* ------------------------------------------------------------------ */
+/*  Device information shown on the Topway INFO page                   */
+/*  Stored in NVS namespace "idms" and persisted across reboots.       */
+/* ------------------------------------------------------------------ */
+
+#define CONFIG_INFO_STRING_MAX_LEN       127
+#define CONFIG_DEFAULT_DEVICE_MODEL      "ESP-IDMS"
+#define CONFIG_DEFAULT_SUPPORT_EMAIL     ""
+#define CONFIG_DEFAULT_SUPPORT_PHONE     ""
+#define CONFIG_DEFAULT_QR_CODE           "@IDMS_USERBOT"
+
+esp_err_t config_get_device_model(char *out, size_t out_len);
+esp_err_t config_set_device_model(const char *value);
+esp_err_t config_get_serial_number(char *out, size_t out_len);
+esp_err_t config_set_serial_number(const char *value);
+esp_err_t config_get_manufacture_date(char *out, size_t out_len);
+esp_err_t config_set_manufacture_date(const char *value);
+esp_err_t config_get_support_email(char *out, size_t out_len);
+esp_err_t config_set_support_email(const char *value);
+esp_err_t config_get_support_phone(char *out, size_t out_len);
+esp_err_t config_set_support_phone(const char *value);
+esp_err_t config_get_qr_code(char *out, size_t out_len);
+esp_err_t config_set_qr_code(const char *value);
 
 /* ------------------------------------------------------------------ */
 /*  Threshold configuration for temperature and current limits         */
@@ -65,4 +90,3 @@ uint16_t config_get_max_current(void);
 esp_err_t config_set_max_current(uint16_t value);
 int16_t config_get_dt_alert_threshold(void);
 esp_err_t config_set_dt_alert_threshold(int16_t value);
-

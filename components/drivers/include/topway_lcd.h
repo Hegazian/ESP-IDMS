@@ -104,11 +104,7 @@ extern "C" {
 #define VP_N16_BASE      0x080000
 
 #define VP_STR_CURRENT   0x000000
-#define VP_STR_TIN       0x000080
-#define VP_STR_TOUT      0x000100
-#define VP_STR_DT        0x000180
 #define VP_STR_WIFI      0x000200
-#define VP_STR_VERSION   0x000280
 #define VP_STR_OTA       0x000300
 #define VP_STR_STATUS    0x000380
 #define VP_STR_STATUS_ERR 0x000600
@@ -116,6 +112,9 @@ extern "C" {
 #define VP_STR_DIAG      0x000500
 
 /* Device info VP addresses for INFO page */
+#define VP_STR_SUPPORT_EMAIL    0x000100  /* Support email */
+#define VP_STR_SUPPORT_PHONE    0x000180  /* Support phone */
+#define VP_STR_QR_CODE          0x000280  /* QR code payload */
 #define VP_STR_DEVICE_MODEL      0x000980  /* Device model */
 #define VP_STR_FIRMWARE_VERSION  0x000A00  /* Firmware version */
 #define VP_STR_HARDWARE_VERSION  0x000A80  /* Hardware version */
@@ -142,8 +141,8 @@ extern "C" {
 #define VP_N16_OTA_STATUS   0x08001A
 #define VP_N16_TECH_COUNT   0x08001C
 #define VP_N16_POWER_FAULT  0x08001E
-#define VP_N16_COOL_FAULT   0x080020
-#define VP_N16_DT_ALERT     0x080022  /* Delta temperature alert (when < 5C) */
+#define VP_N16_COOL_FAULT   0x080022
+#define VP_N16_DT_ALERT     0x080026  /* Internal delta temperature alert flag */
 
 /* Configuration parameters VP addresses (N16 - x10 values for precision) */
 #define VP_N16_CFG_MIN_TIN      0x080030  /* Min Temp IN threshold (x10) */
@@ -152,6 +151,7 @@ extern "C" {
 #define VP_N16_CFG_MAX_TIN      0x080036  /* Max Temp IN threshold (x10) */
 #define VP_N16_CFG_MAX_TOUT     0x080038  /* Max Temp OUT threshold (x10) */
 #define VP_N16_CFG_MAX_CURRENT  0x08003A  /* Max Current threshold (mA) */
+#define VP_N16_CFG_DT_ALERT     0x080024  /* Delta temperature threshold */
 #define VP_N16_CFG_APPLY_BTN    0x08003C  /* Apply button - set to 1 when pressed */
 
 #define WIFI_STATUS_OFFLINE   0

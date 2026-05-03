@@ -10,6 +10,7 @@
 #include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -56,24 +57,20 @@ static void load_cached_creds(void)
     s_creds_cached = true;
 }
 
-static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 static int b64_encode(char *out, size_t out_sz, const uint8_t *in, size_t in_len)
 {
-    if (out_sz < 4 * ((in_len + 2) / 3) + 1) return -1;
-    size_t i = 0, j = 0;
-    while (i < in_len) {
-        uint32_t octet_a = i < in_len ? in[i++] : 0;
-        uint32_t octet_b = i < in_len ? in[i++] : 0;
-        uint32_t octet_c = i < in_len ? in[i++] : 0;
-        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
-        out[j++] = b64_table[(triple >> 18) & 0x3F];
-        out[j++] = b64_table[(triple >> 12) & 0x3F];
-        out[j++] = (i - 1 < in_len) ? b64_table[(triple >> 6) & 0x3F] : '=';
-        out[j++] = (i - 2 < in_len) ? b64_table[triple & 0x3F] : '=';
+    if (!out || out_sz == 0) {
+        return -1;
     }
-    out[j] = '\0';
-    return (int)j;
+
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode((unsigned char *)out, out_sz, &olen, in, in_len);
+    if (ret != 0 || olen >= out_sz) {
+        return -1;
+    }
+
+    out[olen] = '\0';
+    return (int)olen;
 }
 
 static bool ct_memcmp(const void *a, const void *b, size_t len)
@@ -191,7 +188,10 @@ static bool check_basic_auth(httpd_req_t *req)
     if (n < 0) return false;
 
     if (creds_len != (size_t)n) {
-        ct_memcmp(creds, expected_b64, (creds_len > (size_t)n) ? creds_len : (size_t)n);
+        size_t cmp_len = creds_len < (size_t)n ? creds_len : (size_t)n;
+        if (cmp_len > 0) {
+            ct_memcmp(creds, expected_b64, cmp_len);
+        }
         return false;
     }
     return ct_memcmp(creds, expected_b64, (size_t)n);
@@ -235,6 +235,101 @@ static bool is_end_boundary(const char *line, const char *boundary)
     if (strncmp(line, boundary, strlen(boundary)) != 0) return false;
     const char *after = line + strlen(boundary);
     return (strncmp(after, "--", 2) == 0);
+}
+
+static const char *find_bytes(const char *buf, size_t buf_len,
+                              const char *needle, size_t needle_len)
+{
+    if (!buf || !needle || needle_len == 0 || buf_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i <= buf_len - needle_len; i++) {
+        if (memcmp(buf + i, needle, needle_len) == 0) {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+static esp_err_t ota_write_verified(esp_ota_handle_t ota_h,
+                                    mbedtls_sha256_context *sha256_ctx,
+                                    const char *data, size_t len,
+                                    size_t *total, uint32_t max_size)
+{
+    if (len == 0) {
+        return ESP_OK;
+    }
+    if (*total + len > max_size) {
+        ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)",
+                 *total + len, (unsigned long)max_size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t err = esp_ota_write(ota_h, data, len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    mbedtls_sha256_update(sha256_ctx, (const unsigned char *)data, len);
+    *total += len;
+    return ESP_OK;
+}
+
+static esp_err_t ota_process_file_bytes(const char *data, size_t data_len,
+                                        char *scan_buf,
+                                        char *tail, size_t *tail_len,
+                                        size_t tail_cap,
+                                        const char *boundary,
+                                        size_t boundary_len,
+                                        esp_ota_handle_t ota_h,
+                                        mbedtls_sha256_context *sha256_ctx,
+                                        size_t *total, uint32_t max_size,
+                                        bool *found_boundary)
+{
+    *found_boundary = false;
+
+    size_t scan_len = *tail_len + data_len;
+    memcpy(scan_buf, tail, *tail_len);
+    memcpy(scan_buf + *tail_len, data, data_len);
+
+    char delimiter[160];
+    int delim_len_i = snprintf(delimiter, sizeof(delimiter), "\r\n%s", boundary);
+    if (delim_len_i <= 0 || delim_len_i >= (int)sizeof(delimiter)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t delimiter_len = (size_t)delim_len_i;
+
+    const char *found = find_bytes(scan_buf, scan_len, delimiter, delimiter_len);
+    size_t write_len = 0;
+    if (found) {
+        write_len = (size_t)(found - scan_buf);
+        *found_boundary = true;
+    } else if (scan_len >= boundary_len && memcmp(scan_buf, boundary, boundary_len) == 0) {
+        write_len = 0;
+        *found_boundary = true;
+    } else {
+        size_t keep_len = (boundary_len + 4 < tail_cap) ? boundary_len + 4 : tail_cap;
+        if (scan_len <= keep_len) {
+            memcpy(tail, scan_buf, scan_len);
+            *tail_len = scan_len;
+            return ESP_OK;
+        }
+        write_len = scan_len - keep_len;
+    }
+
+    esp_err_t err = ota_write_verified(ota_h, sha256_ctx, scan_buf, write_len,
+                                       total, max_size);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (*found_boundary) {
+        *tail_len = 0;
+        return ESP_OK;
+    }
+
+    *tail_len = scan_len - write_len;
+    memcpy(tail, scan_buf + write_len, *tail_len);
+    return ESP_OK;
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
@@ -321,13 +416,30 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    size_t tail_cap = strlen(boundary) + 4;
+    char *tail = malloc(tail_cap);
+    char *scan_buf = malloc(OTA_RECV_BUFSZ + tail_cap);
+    if (!tail || !scan_buf) {
+        free(scan_buf);
+        free(tail);
+        free(buf);
+        mbedtls_sha256_free(&sha256_ctx);
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
+        s_update_in_progress = false;
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
     size_t total = 0;
+    size_t tail_len = 0;
     int recv_len;
     bool in_file_data = false;
     bool skip_headers = true;
     char line_buf[256];
     size_t line_pos = 0;
     bool upload_ok = true;
+    bool saw_final_boundary = false;
     esp_ota_handle_t ota_h = s_ota_handle;
 
     while ((recv_len = httpd_req_recv(req, buf, OTA_RECV_BUFSZ)) > 0) {
@@ -357,40 +469,27 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                         }
                     }
                 }
+                if (!in_file_data && line_pos >= sizeof(line_buf) - 1) {
+                    ESP_LOGE(TAG, "Multipart header line too long");
+                    upload_ok = false;
+                    goto upload_complete;
+                }
             } else {
-                int write_start = buf_offset;
                 size_t remaining = recv_len - buf_offset;
-
-                char *found = memmem(buf + buf_offset, remaining, boundary, strlen(boundary));
-                if (found) {
-                    size_t before = (size_t)(found - buf);
-                    if (before > (size_t)write_start) {
-                        size_t chunk = before - write_start;
-                        if (total + chunk > max_size) {
-                            ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + chunk, (unsigned long)max_size);
-                            upload_ok = false;
-                            goto upload_complete;
-                        }
-                        err = esp_ota_write(ota_h, buf + write_start, chunk);
-                        if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
-                        mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), chunk);
-                        total += chunk;
-                    }
-                    in_file_data = false;
-                    skip_headers = true;
-                    line_pos = 0;
-                    buf_offset = (int)before;
-                } else {
-                    if (total + remaining > max_size) {
-                        ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + remaining, (unsigned long)max_size);
-                        upload_ok = false;
-                        goto upload_complete;
-                    }
-                    err = esp_ota_write(ota_h, buf + write_start, remaining);
-                    if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
-                    mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), remaining);
-                    total += remaining;
-                    buf_offset = recv_len;
+                bool found_boundary = false;
+                err = ota_process_file_bytes(buf + buf_offset, remaining,
+                                             scan_buf, tail, &tail_len, tail_cap,
+                                             boundary, strlen(boundary),
+                                             ota_h, &sha256_ctx,
+                                             &total, max_size, &found_boundary);
+                if (err != ESP_OK) {
+                    upload_ok = false;
+                    goto upload_complete;
+                }
+                buf_offset = recv_len;
+                if (found_boundary) {
+                    saw_final_boundary = true;
+                    goto upload_complete;
                 }
             }
         }
@@ -398,6 +497,10 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 upload_complete:
     if (recv_len < 0 && upload_ok) {
+        upload_ok = false;
+    }
+    if (!saw_final_boundary && upload_ok) {
+        ESP_LOGE(TAG, "Multipart upload ended before final firmware boundary");
         upload_ok = false;
     }
 
@@ -415,6 +518,8 @@ upload_complete:
         esp_ota_abort(ota_h);
         s_ota_handle = 0;
         s_update_in_progress = false;
+        free(scan_buf);
+        free(tail);
         free(buf);
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
@@ -430,6 +535,8 @@ upload_complete:
             esp_ota_abort(ota_h);
             s_ota_handle = 0;
             s_update_in_progress = false;
+            free(scan_buf);
+            free(tail);
             free(buf);
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "text/plain");
@@ -448,6 +555,8 @@ upload_complete:
     err = esp_ota_end(ota_h);
     s_ota_handle = 0;
     s_update_in_progress = false;
+    free(scan_buf);
+    free(tail);
     free(buf);
 
     if (err != ESP_OK) {

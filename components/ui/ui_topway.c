@@ -12,7 +12,6 @@
 #include "config_store.h"
 #include "ota.h"
 #include "wifi_manager.h"
-#include "telegram.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_mac.h"
@@ -21,14 +20,15 @@
 #include "esp_app_format.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
 #include <string.h>
 
 static const char *TAG = "ui_topway";
 
 #define PAGE_MAIN 0
+#define INFO_FIELD_MAX_LEN (CONFIG_INFO_STRING_MAX_LEN + 1)
+#define INFO_FIELD_POLL_MS 1500
 
-static TimerHandle_t s_ui_timer = NULL;
+static TaskHandle_t s_ui_task = NULL;
 static bool s_display_ready = false;
 static float s_last_current = -999.0f;
 static float s_last_tin = -999.0f;
@@ -44,17 +44,17 @@ static uint16_t s_cfg_min_current = 0;
 static int16_t  s_cfg_max_tin = 0;
 static int16_t  s_cfg_max_tout = 0;
 static uint16_t s_cfg_max_current = 0;
+static int16_t  s_cfg_dt_alert = 0;
 static bool     s_cfg_applied = false;
 
-/* Alert state tracking - to prevent notification spam */
-static struct {
-  bool power_fault;
-  bool cool_fault;
-  bool dt_alert;
-  uint32_t last_notify_tick;
-} s_alert_state = {false, false, false, 0};
-
-#define ALERT_COOLDOWN_MS  60000  /* 1 minute between repeat notifications */
+static char s_info_device_model[INFO_FIELD_MAX_LEN] = "";
+static char s_info_serial_number[INFO_FIELD_MAX_LEN] = "";
+static char s_info_manufacture_date[INFO_FIELD_MAX_LEN] = "";
+static char s_info_support_email[INFO_FIELD_MAX_LEN] = "";
+static char s_info_support_phone[INFO_FIELD_MAX_LEN] = "";
+static char s_info_qr_code[INFO_FIELD_MAX_LEN] = "";
+static uint32_t s_info_last_poll = 0;
+static size_t s_info_next_field = 0;
 
 /* WiFi status tracking */
 static bool s_last_wifi_connected = false;
@@ -69,21 +69,122 @@ static bool s_wifi_fields_cleared = false;
 /* WiFi button cooldown to prevent rapid re-triggering */
 static uint32_t s_wifi_btn_last_trigger = 0;
 #define WIFI_BTN_COOLDOWN_MS 10000 /* 10 second cooldown between button presses */
+#define UI_TOPWAY_REFRESH_MS 500
 
-static void send_alert_notification(const char *alert_type, const char *message)
+static uint8_t topway_baud_code_from_rate(uint32_t baud_rate)
 {
-  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  
-  /* Only send notification if cooldown has passed */
-  if ((now - s_alert_state.last_notify_tick) < ALERT_COOLDOWN_MS) {
+  switch (baud_rate) {
+    case 1200:
+      return TOPWAY_BAUD_1200;
+    case 2400:
+      return TOPWAY_BAUD_2400;
+    case 4800:
+      return TOPWAY_BAUD_4800;
+    case 9600:
+      return TOPWAY_BAUD_9600;
+    case 19200:
+      return TOPWAY_BAUD_19200;
+    case 38400:
+      return TOPWAY_BAUD_38400;
+    case 57600:
+      return TOPWAY_BAUD_57600;
+    case 115200:
+      return TOPWAY_BAUD_115200;
+    default:
+      ESP_LOGW(TAG, "Unsupported Topway baud %lu, using 115200 for panel config",
+               (unsigned long)baud_rate);
+      return TOPWAY_BAUD_115200;
+  }
+}
+
+static void copy_info_cache(char *dst, const char *src)
+{
+  if (!dst) {
     return;
   }
-  
-  char alert_msg[256];
-  snprintf(alert_msg, sizeof(alert_msg), "🚨 *ALERT: %s*\n\n%s", alert_type, message);
-  
-  telegram_broadcast_alert(alert_msg);
-  s_alert_state.last_notify_tick = now;
+  if (!src) {
+    src = "";
+  }
+  strncpy(dst, src, INFO_FIELD_MAX_LEN - 1);
+  dst[INFO_FIELD_MAX_LEN - 1] = '\0';
+}
+
+static void generate_default_serial_number(char *out, size_t out_sz)
+{
+  if (!out || out_sz == 0) {
+    return;
+  }
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);
+  snprintf(out, out_sz, "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void generate_default_manufacture_date(char *out, size_t out_sz)
+{
+  if (!out || out_sz == 0) {
+    return;
+  }
+  strncpy(out, "Unknown", out_sz - 1);
+  out[out_sz - 1] = '\0';
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_app_desc_t app_desc;
+  if (running && esp_ota_get_partition_description(running, &app_desc) == ESP_OK) {
+    snprintf(out, out_sz, "%s", app_desc.date);
+  }
+}
+
+typedef esp_err_t (*info_setter_t)(const char *value);
+
+typedef struct {
+  uint32_t vp;
+  char *cache;
+  const char *label;
+  info_setter_t set;
+} info_field_t;
+
+static void idms_ui_topway_poll_info_fields(void)
+{
+  if (!s_display_ready) {
+    return;
+  }
+
+  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  if ((now - s_info_last_poll) < INFO_FIELD_POLL_MS) {
+    return;
+  }
+  s_info_last_poll = now;
+
+  static info_field_t fields[] = {
+      { VP_STR_DEVICE_MODEL, s_info_device_model, "Device Model", config_set_device_model },
+      { VP_STR_SERIAL_NUMBER, s_info_serial_number, "Serial Number", config_set_serial_number },
+      { VP_STR_MANUFACTURE_DATE, s_info_manufacture_date, "Manufacture Date", config_set_manufacture_date },
+      { VP_STR_SUPPORT_EMAIL, s_info_support_email, "Support Email", config_set_support_email },
+      { VP_STR_SUPPORT_PHONE, s_info_support_phone, "Support Phone", config_set_support_phone },
+      { VP_STR_QR_CODE, s_info_qr_code, "QR Code", config_set_qr_code },
+  };
+  const size_t field_count = sizeof(fields) / sizeof(fields[0]);
+  info_field_t *field = &fields[s_info_next_field];
+  s_info_next_field = (s_info_next_field + 1) % field_count;
+
+  char value[INFO_FIELD_MAX_LEN] = {0};
+  esp_err_t err = topway_str_read(field->vp, value, sizeof(value));
+  if (err != ESP_OK) {
+    return;
+  }
+
+  if (strcmp(value, field->cache) == 0) {
+    return;
+  }
+
+  err = field->set(value);
+  if (err == ESP_OK) {
+    copy_info_cache(field->cache, value);
+    ESP_LOGI(TAG, "%s updated from LCD and saved to NVS", field->label);
+  } else {
+    ESP_LOGW(TAG, "Failed to save %s from LCD: %s", field->label, esp_err_to_name(err));
+    topway_str_write(field->vp, field->cache);
+  }
 }
 
 static void update_wifi_status_on_lcd(void)
@@ -202,46 +303,11 @@ static void update_display_values(void) {
       s_last_dt = dt_rounded;
     }
     
-    /* Check cooling fault using config thresholds */
-    int16_t dt_low = s_cfg_applied ? s_cfg_min_tout : config_get_min_tout();
-    int16_t dt_high = s_cfg_applied ? s_cfg_max_tout : config_get_max_tout();
-    bool cool_fault = (m.delta_t_c < dt_low || m.delta_t_c > dt_high);
-    
-    if (cool_fault) {
-      topway_n16_write(VP_N16_COOL_FAULT, 1);
-      if (!s_alert_state.cool_fault) {
-        /* Fault just started - send notification */
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Delta T out of range: %.1fC (limits: %d-%dC)", 
-                 m.delta_t_c, dt_low, dt_high);
-        send_alert_notification("Cooling Fault", msg);
-        s_alert_state.cool_fault = true;
-      }
-    } else {
-      topway_n16_write(VP_N16_COOL_FAULT, 0);
-      s_alert_state.cool_fault = false;
-    }
-    
-    /* Check delta alert - when delta is less than threshold */
-    int16_t dt_alert = config_get_dt_alert_threshold();
-    bool dt_alert_active = (m.delta_t_c < dt_alert);
-    
-    if (dt_alert_active) {
-      topway_n16_write(VP_N16_DT_ALERT, 1);
-      if (!s_alert_state.dt_alert) {
-        /* Alert just started - send notification */
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Low delta T: %.1fC < threshold %dC", 
-                 m.delta_t_c, dt_alert);
-        send_alert_notification("Low Delta Alert", msg);
-        s_alert_state.dt_alert = true;
-      }
-    } else {
-      topway_n16_write(VP_N16_DT_ALERT, 0);
-      s_alert_state.dt_alert = false;
-    }
+    topway_n16_write(VP_N16_COOL_FAULT, m.cooling_fault ? 1 : 0);
+    topway_n16_write(VP_N16_DT_ALERT, m.delta_alert ? 1 : 0);
   } else {
     topway_n16_write(VP_N16_DT_VALID, 0);
+    topway_n16_write(VP_N16_COOL_FAULT, 0);
     topway_n16_write(VP_N16_DT_ALERT, 0);
   }
 
@@ -265,51 +331,21 @@ static void update_display_values(void) {
 
   topway_n16_write(VP_N16_TECH_COUNT, config_get_tech_count());
 
-  /* Check power fault using config thresholds */
-  uint16_t min_current_a = s_cfg_applied ? s_cfg_min_current : config_get_min_current();
-  uint16_t max_current_a = s_cfg_applied ? s_cfg_max_current : config_get_max_current();
-  
-  bool power_fault = false;
-  char power_msg[128] = {0};
-  
-  if (m.current_valid && m.current_a < min_current_a) {
-    power_fault = true;
-    snprintf(power_msg, sizeof(power_msg), "Current low: %.2fA < threshold %dA", 
-             m.current_a, min_current_a);
-  } else if (m.current_valid && m.current_a > max_current_a) {
-    power_fault = true;
-    snprintf(power_msg, sizeof(power_msg), "Current high: %.2fA > threshold %dA", 
-             m.current_a, max_current_a);
-  }
-  
-  if (power_fault) {
-    topway_n16_write(VP_N16_POWER_FAULT, 1);
-    if (!s_alert_state.power_fault) {
-      send_alert_notification("Power Fault", power_msg);
-      s_alert_state.power_fault = true;
-    }
-  } else {
-    topway_n16_write(VP_N16_POWER_FAULT, 0);
-    s_alert_state.power_fault = false;
-  }
-
-  topway_str_write(VP_STR_VERSION, ota_get_version());
+  topway_n16_write(VP_N16_POWER_FAULT, m.power_fault ? 1 : 0);
 
   /* Determine device status and diagnostic message */
   const char *status_str = "ACTIVE";
   const char *diag_str = "OK";
 
-  bool has_power_fault = (m.current_valid && 
-      (m.current_a < min_current_a || m.current_a > max_current_a));
-  
-  int16_t dt_low = s_cfg_applied ? s_cfg_min_tout : config_get_min_tout();
-  int16_t dt_high = s_cfg_applied ? s_cfg_max_tout : config_get_max_tout();
-  bool has_cool_fault = (m.delta_valid &&
-      (m.delta_t_c < dt_low || m.delta_t_c > dt_high));
+  bool has_power_fault = m.power_fault;
+  bool has_cool_fault = m.cooling_fault;
   bool temp_invalid = (!m.t_in_valid || !m.t_out_valid);
   bool current_invalid = !m.current_valid;
 
-  if (temp_invalid && current_invalid) {
+  if (m.sensor_preflight_done && !m.sensor_preflight_ok) {
+    status_str = "ERROR";
+    diag_str = m.sensor_status[0] ? m.sensor_status : "Sensor Preflight";
+  } else if (temp_invalid && current_invalid) {
     status_str = "ERROR";
     diag_str = "Sensors Offline";
   } else if (has_power_fault && has_cool_fault) {
@@ -365,6 +401,7 @@ void idms_ui_topway_check_apply_button(void) {
     int16_t new_max_tout = s_cfg_max_tout;
     uint16_t new_min_current = s_cfg_min_current;
     uint16_t new_max_current = s_cfg_max_current;
+    int16_t new_dt_alert = s_cfg_dt_alert;
     bool valid = true;
     
     /* Read and validate Min Temp IN: -50 to 100 C */
@@ -402,6 +439,12 @@ void idms_ui_topway_check_apply_button(void) {
       new_max_current = val;
       if (new_max_current > CONFIG_CURRENT_MAX_LIMIT) valid = false;
     }
+
+    /* Read and validate Delta_T threshold: 0 to 100 C */
+    if (topway_n16_read(VP_N16_CFG_DT_ALERT, &val) == ESP_OK) {
+      new_dt_alert = (int16_t)val;
+      if (new_dt_alert < 0 || new_dt_alert > 100) valid = false;
+    }
     
     if (!valid) {
       topway_n16_write(VP_N16_CFG_APPLY_BTN, 0);
@@ -418,6 +461,7 @@ void idms_ui_topway_check_apply_button(void) {
     if (config_set_max_tout(new_max_tout) != ESP_OK) save_err = ESP_FAIL;
     if (config_set_min_current(new_min_current) != ESP_OK) save_err = ESP_FAIL;
     if (config_set_max_current(new_max_current) != ESP_OK) save_err = ESP_FAIL;
+    if (config_set_dt_alert_threshold(new_dt_alert) != ESP_OK) save_err = ESP_FAIL;
     
     if (save_err == ESP_OK) {
       /* Update runtime values */
@@ -427,12 +471,13 @@ void idms_ui_topway_check_apply_button(void) {
       s_cfg_max_tout = new_max_tout;
       s_cfg_min_current = new_min_current;
       s_cfg_max_current = new_max_current;
+      s_cfg_dt_alert = new_dt_alert;
       s_cfg_applied = true;
       
-      ESP_LOGI(TAG, "Config saved to NVS: MinTin=%d, MaxTin=%d, MinTout=%d, MaxTout=%d, MinCur=%dA, MaxCur=%dA",
+      ESP_LOGI(TAG, "Config saved to NVS: MinTin=%d, MaxTin=%d, MinTout=%d, MaxTout=%d, MinCur=%dA, MaxCur=%dA, DeltaT=%dC",
                s_cfg_min_tin, s_cfg_max_tin,
                s_cfg_min_tout, s_cfg_max_tout,
-               s_cfg_min_current, s_cfg_max_current);
+               s_cfg_min_current, s_cfg_max_current, s_cfg_dt_alert);
     } else {
       ESP_LOGE(TAG, "Failed to save config to NVS");
     }
@@ -450,6 +495,7 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
     uint16_t val;
     int16_t new_min_tin = 0, new_max_tin = 0, new_min_tout = 0, new_max_tout = 0;
     uint16_t new_min_current = 0, new_max_current = 0;
+    int16_t new_dt_alert = 0;
     bool valid = true;
     
     /* Read all config values from LCD */
@@ -459,6 +505,7 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
     if (topway_n16_read(VP_N16_CFG_MAX_TOUT, &val) == ESP_OK) new_max_tout = (int16_t)val;
     if (topway_n16_read(VP_N16_CFG_MIN_CURRENT, &val) == ESP_OK) new_min_current = val;
     if (topway_n16_read(VP_N16_CFG_MAX_CURRENT, &val) == ESP_OK) new_max_current = val;
+    if (topway_n16_read(VP_N16_CFG_DT_ALERT, &val) == ESP_OK) new_dt_alert = (int16_t)val;
     
     /* Validate */
     if (new_min_tin < CONFIG_TEMP_MIN_LIMIT || new_min_tin > CONFIG_TEMP_MAX_LIMIT) valid = false;
@@ -467,6 +514,7 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
     if (new_max_tout < CONFIG_TEMP_MIN_LIMIT || new_max_tout > CONFIG_TEMP_MAX_LIMIT) valid = false;
     if (new_min_current > CONFIG_CURRENT_MAX_LIMIT) valid = false;
     if (new_max_current > CONFIG_CURRENT_MAX_LIMIT) valid = false;
+    if (new_dt_alert < 0 || new_dt_alert > 100) valid = false;
     
     if (!valid) {
       ESP_LOGW(TAG, "Config validation failed");
@@ -479,7 +527,8 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
         config_set_min_tout(new_min_tout) == ESP_OK &&
         config_set_max_tout(new_max_tout) == ESP_OK &&
         config_set_min_current(new_min_current) == ESP_OK &&
-        config_set_max_current(new_max_current) == ESP_OK) {
+        config_set_max_current(new_max_current) == ESP_OK &&
+        config_set_dt_alert_threshold(new_dt_alert) == ESP_OK) {
       
       s_cfg_min_tin = new_min_tin;
       s_cfg_max_tin = new_max_tin;
@@ -487,11 +536,12 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
       s_cfg_max_tout = new_max_tout;
       s_cfg_min_current = new_min_current;
       s_cfg_max_current = new_max_current;
+      s_cfg_dt_alert = new_dt_alert;
       s_cfg_applied = true;
       
-      ESP_LOGI(TAG, "Config updated: Tin(%d,%d) Tout(%d,%d) Cur(%d,%d)",
+      ESP_LOGI(TAG, "Config updated: Tin(%d,%d) Tout(%d,%d) Cur(%d,%d) DeltaT=%d",
                new_min_tin, new_max_tin, new_min_tout, new_max_tout, 
-               new_min_current, new_max_current);
+               new_min_current, new_max_current, new_dt_alert);
     }
   }
 }
@@ -512,12 +562,66 @@ bool idms_ui_topway_get_config(int16_t *min_tin, int16_t *min_tout, uint16_t *mi
   return true;
 }
 
-static void ui_timer_callback(TimerHandle_t timer) { 
-  update_display_values(); 
-  update_wifi_status_on_lcd();
-  idms_ui_topway_check_apply_button();
-  idms_ui_topway_check_wifi_button();
-  topway_process_touch_events();
+esp_err_t idms_ui_topway_read_config(int16_t *min_tin, int16_t *min_tout, uint16_t *min_current,
+                                      int16_t *max_tin, int16_t *max_tout, uint16_t *max_current,
+                                      int16_t *dt_alert) {
+  if (!s_display_ready)
+    return ESP_ERR_INVALID_STATE;
+
+  uint16_t val;
+  esp_err_t err = ESP_OK;
+
+  if (min_tin) {
+    err = topway_n16_read(VP_N16_CFG_MIN_TIN, &val);
+    if (err != ESP_OK) return err;
+    *min_tin = (int16_t)val;
+  }
+  if (min_tout) {
+    err = topway_n16_read(VP_N16_CFG_MIN_TOUT, &val);
+    if (err != ESP_OK) return err;
+    *min_tout = (int16_t)val;
+  }
+  if (min_current) {
+    err = topway_n16_read(VP_N16_CFG_MIN_CURRENT, &val);
+    if (err != ESP_OK) return err;
+    *min_current = val;
+  }
+  if (max_tin) {
+    err = topway_n16_read(VP_N16_CFG_MAX_TIN, &val);
+    if (err != ESP_OK) return err;
+    *max_tin = (int16_t)val;
+  }
+  if (max_tout) {
+    err = topway_n16_read(VP_N16_CFG_MAX_TOUT, &val);
+    if (err != ESP_OK) return err;
+    *max_tout = (int16_t)val;
+  }
+  if (max_current) {
+    err = topway_n16_read(VP_N16_CFG_MAX_CURRENT, &val);
+    if (err != ESP_OK) return err;
+    *max_current = val;
+  }
+  if (dt_alert) {
+    err = topway_n16_read(VP_N16_CFG_DT_ALERT, &val);
+    if (err != ESP_OK) return err;
+    *dt_alert = (int16_t)val;
+  }
+
+  return ESP_OK;
+}
+
+static void ui_topway_task(void *arg) {
+  (void)arg;
+
+  for (;;) {
+    update_display_values();
+    update_wifi_status_on_lcd();
+    idms_ui_topway_check_apply_button();
+    idms_ui_topway_check_wifi_button();
+    idms_ui_topway_poll_info_fields();
+    topway_process_touch_events();
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_TOPWAY_REFRESH_MS));
+  }
 }
 
 esp_err_t idms_ui_topway_init(void) {
@@ -539,7 +643,8 @@ esp_err_t idms_ui_topway_init(void) {
 
   vTaskDelay(pdMS_TO_TICKS(200));
 
-  err = topway_set_sys_config(TOPWAY_BAUD_9600, TOPWAY_TOUCH_DOWN_COORD_CFG);
+  err = topway_set_sys_config(topway_baud_code_from_rate(CONFIG_IDMS_TOPWAY_BAUD),
+                              TOPWAY_TOUCH_DOWN_COORD_CFG);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "set_sys_config failed (may need RS232 level shifter)");
   }
@@ -576,11 +681,15 @@ esp_err_t idms_ui_topway_init(void) {
     s_wifi_fields_cleared = true;
   }
 
-  s_ui_timer = xTimerCreate("ui_topway", pdMS_TO_TICKS(500), pdTRUE, NULL,
-                            ui_timer_callback);
-
-  if (s_ui_timer) {
-    xTimerStart(s_ui_timer, 0);
+  if (!s_ui_task) {
+    BaseType_t task_ok = xTaskCreatePinnedToCore(ui_topway_task, "ui_topway",
+                                                 8192, NULL, 4, &s_ui_task,
+                                                 tskNO_AFFINITY);
+    if (task_ok != pdPASS) {
+      s_ui_task = NULL;
+      ESP_LOGE(TAG, "Failed to start Topway UI task");
+      return ESP_ERR_NO_MEM;
+    }
   }
 
   ESP_LOGI(TAG, "Topway UI ready (800x480)");
@@ -588,8 +697,8 @@ esp_err_t idms_ui_topway_init(void) {
 }
 
 void idms_ui_topway_update(void) {
-  if (s_ui_timer) {
-    xTimerReset(s_ui_timer, 0);
+  if (s_ui_task) {
+    xTaskNotifyGive(s_ui_task);
   }
 }
 
@@ -599,9 +708,18 @@ void idms_ui_topway_send_device_info(void) {
 
   ESP_LOGI(TAG, "Sending device info to Topway LCD");
 
-  /* Device Model */
-  const char *device_model = "ESP-IDMS";
+  char device_model[INFO_FIELD_MAX_LEN] = {0};
+  char serial_number[INFO_FIELD_MAX_LEN] = {0};
+  char manufacture_date[INFO_FIELD_MAX_LEN] = {0};
+  char support_email[INFO_FIELD_MAX_LEN] = {0};
+  char support_phone[INFO_FIELD_MAX_LEN] = {0};
+  char qr_code[INFO_FIELD_MAX_LEN] = {0};
+
+  if (config_get_device_model(device_model, sizeof(device_model)) != ESP_OK) {
+    copy_info_cache(device_model, CONFIG_DEFAULT_DEVICE_MODEL);
+  }
   topway_str_write(VP_STR_DEVICE_MODEL, device_model);
+  copy_info_cache(s_info_device_model, device_model);
   ESP_LOGI(TAG, "Device Model: %s", device_model);
 
   /* Firmware Version - from OTA/version info */
@@ -623,24 +741,44 @@ void idms_ui_topway_send_device_info(void) {
   topway_str_write(VP_STR_HARDWARE_VERSION, hw_version);
   ESP_LOGI(TAG, "Hardware Version: %s", hw_version);
 
-  /* Serial Number - from MAC address */
-  uint8_t mac[6];
-  esp_efuse_mac_get_default(mac);
-  char serial_number[18];
-  snprintf(serial_number, sizeof(serial_number), "%02X%02X%02X%02X%02X%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if (config_get_serial_number(serial_number, sizeof(serial_number)) != ESP_OK ||
+      serial_number[0] == '\0') {
+    generate_default_serial_number(serial_number, sizeof(serial_number));
+    config_set_serial_number(serial_number);
+  }
   topway_str_write(VP_STR_SERIAL_NUMBER, serial_number);
+  copy_info_cache(s_info_serial_number, serial_number);
   ESP_LOGI(TAG, "Serial Number: %s", serial_number);
 
-  /* Manufacture Date - from compile date of running firmware */
-  const esp_partition_t *running = esp_ota_get_running_partition();
-  esp_app_desc_t app_desc;
-  char manufacture_date[32] = "Unknown";
-  if (esp_ota_get_partition_description(running, &app_desc) == ESP_OK) {
-    snprintf(manufacture_date, sizeof(manufacture_date), "%s", app_desc.date);
+  if (config_get_manufacture_date(manufacture_date, sizeof(manufacture_date)) != ESP_OK ||
+      manufacture_date[0] == '\0') {
+    generate_default_manufacture_date(manufacture_date, sizeof(manufacture_date));
+    config_set_manufacture_date(manufacture_date);
   }
   topway_str_write(VP_STR_MANUFACTURE_DATE, manufacture_date);
+  copy_info_cache(s_info_manufacture_date, manufacture_date);
   ESP_LOGI(TAG, "Manufacture Date: %s", manufacture_date);
+
+  if (config_get_support_email(support_email, sizeof(support_email)) != ESP_OK) {
+    copy_info_cache(support_email, CONFIG_DEFAULT_SUPPORT_EMAIL);
+  }
+  topway_str_write(VP_STR_SUPPORT_EMAIL, support_email);
+  copy_info_cache(s_info_support_email, support_email);
+  ESP_LOGI(TAG, "Support Email: %s", support_email);
+
+  if (config_get_support_phone(support_phone, sizeof(support_phone)) != ESP_OK) {
+    copy_info_cache(support_phone, CONFIG_DEFAULT_SUPPORT_PHONE);
+  }
+  topway_str_write(VP_STR_SUPPORT_PHONE, support_phone);
+  copy_info_cache(s_info_support_phone, support_phone);
+  ESP_LOGI(TAG, "Support Phone: %s", support_phone);
+
+  if (config_get_qr_code(qr_code, sizeof(qr_code)) != ESP_OK) {
+    copy_info_cache(qr_code, CONFIG_DEFAULT_QR_CODE);
+  }
+  topway_str_write(VP_STR_QR_CODE, qr_code);
+  copy_info_cache(s_info_qr_code, qr_code);
+  ESP_LOGI(TAG, "QR Code: %s", qr_code);
 }
 
 void idms_ui_topway_send_config(void) {
@@ -656,6 +794,15 @@ void idms_ui_topway_send_config(void) {
   int16_t max_tout = config_get_max_tout();
   uint16_t min_current = config_get_min_current();
   uint16_t max_current = config_get_max_current();
+  int16_t dt_alert = config_get_dt_alert_threshold();
+
+  s_cfg_min_tin = min_tin;
+  s_cfg_max_tin = max_tin;
+  s_cfg_min_tout = min_tout;
+  s_cfg_max_tout = max_tout;
+  s_cfg_min_current = min_current;
+  s_cfg_max_current = max_current;
+  s_cfg_dt_alert = dt_alert;
 
   /* Send Min Temp IN threshold (pure Celsius) */
   topway_n16_write(VP_N16_CFG_MIN_TIN, (uint16_t)min_tin);
@@ -680,6 +827,10 @@ void idms_ui_topway_send_config(void) {
   /* Send Max Current threshold (pure Amperes) */
   topway_n16_write(VP_N16_CFG_MAX_CURRENT, max_current);
   ESP_LOGI(TAG, "Max Current: %d A", max_current);
+
+  /* Send Delta_T threshold (pure Celsius) */
+  topway_n16_write(VP_N16_CFG_DT_ALERT, (uint16_t)dt_alert);
+  ESP_LOGI(TAG, "Delta_T threshold: %d C", dt_alert);
 }
 
 void idms_ui_topway_check_wifi_button(void)
