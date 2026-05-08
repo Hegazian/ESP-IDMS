@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 #if CONFIG_IDMS_DISPLAY_TOPWAY
 #include "topway_lcd.h"
@@ -116,7 +117,11 @@ static void handle_cmd(const char *cmd)
                  m.power_fault ? "yes" : "no",
                  m.cooling_fault ? "yes" : "no",
                  m.delta_alert ? "yes" : "no");
-        ESP_LOGI(TAG, "Sensor preflight: %s (flags=0x%02lx)",
+        ESP_LOGI(TAG, "Thresholds: power_loss=%.3f A machine_running=%.3f A current_limit=%u-%u A",
+                 (double)config_get_power_loss_current_ma() / 1000.0,
+                 (double)config_get_machine_running_current_ma() / 1000.0,
+                 config_get_min_current(), config_get_max_current());
+        ESP_LOGI(TAG, "Sensor status: %s (flags=0x%02lx)",
                  m.sensor_preflight_ok ? "OK" : m.sensor_status,
                  (unsigned long)m.sensor_error_flags);
         ESP_LOGI(TAG, "Technicians: %u", config_get_tech_count());
@@ -174,15 +179,67 @@ static void handle_cmd(const char *cmd)
             esp_err_t err = config_set_ota_pass(val);
             ESP_LOGI(TAG, "Set OTA password: **** (%s)", esp_err_to_name(err));
         }
+    } else if (strncmp(cmd, "set_cloud_url ", 14) == 0) {
+        const char *val = cmd + 14;
+        if (val[0] == '\0') {
+            ESP_LOGW(TAG, "Cloud URL cannot be empty");
+        } else if (strncmp(val, "https://", 8) != 0
+#if CONFIG_IDMS_CLOUD_ALLOW_INSECURE_HTTP
+                   && strncmp(val, "http://", 7) != 0
+#endif
+        ) {
+#if CONFIG_IDMS_CLOUD_ALLOW_INSECURE_HTTP
+            ESP_LOGW(TAG, "Cloud URL must start with http:// or https://");
+#else
+            ESP_LOGW(TAG, "Cloud URL must start with https:// (enable insecure HTTP only for development)");
+#endif
+        } else {
+            esp_err_t err = config_set_cloud_url(val);
+            ESP_LOGI(TAG, "Set cloud URL: %s (%s)", val, esp_err_to_name(err));
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Cloud sync will use the new URL on the next upload attempt");
+            }
+        }
+    } else if (strncmp(cmd, "set_cloud_token ", 16) == 0) {
+        const char *val = cmd + 16;
+        esp_err_t err = config_set_cloud_token(val);
+        ESP_LOGI(TAG, "Set cloud token: %s (%s)", val[0] ? "****" : "(empty)", esp_err_to_name(err));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Cloud sync will use the new token on the next upload attempt");
+        }
+    } else if (strncmp(cmd, "set_power_threshold ", 20) == 0) {
+        float actual_a = strtof(cmd + 20, NULL);
+        if (actual_a < 0.0f || actual_a > (float)CONFIG_CURRENT_MAX_LIMIT) {
+            ESP_LOGW(TAG, "Usage: set_power_threshold <A> (0.00 to %d.00)", CONFIG_CURRENT_MAX_LIMIT);
+        } else {
+            uint16_t ma = (uint16_t)lroundf(actual_a * 1000.0f);
+            esp_err_t err = config_set_power_loss_current_ma(ma);
+            ESP_LOGI(TAG, "Set power-loss threshold: %.3f A (%s)",
+                     (double)ma / 1000.0, esp_err_to_name(err));
+        }
+    } else if (strncmp(cmd, "set_running_threshold ", 22) == 0) {
+        float actual_a = strtof(cmd + 22, NULL);
+        if (actual_a < 0.0f || actual_a > (float)CONFIG_CURRENT_MAX_LIMIT) {
+            ESP_LOGW(TAG, "Usage: set_running_threshold <A> (0.00 to %d.00)", CONFIG_CURRENT_MAX_LIMIT);
+        } else {
+            uint16_t ma = (uint16_t)lroundf(actual_a * 1000.0f);
+            esp_err_t err = config_set_machine_running_current_ma(ma);
+            ESP_LOGI(TAG, "Set machine-running threshold: %.3f A (%s)",
+                     (double)ma / 1000.0, esp_err_to_name(err));
+        }
     } else if (strcmp(cmd, "show_secrets") == 0) {
-        char ssid[64], ota_user[64];
+        char ssid[64], ota_user[64], cloud_url[256], cloud_token[128];
         config_get_wifi_ssid(ssid, sizeof(ssid));
         config_get_ota_user(ota_user, sizeof(ota_user));
+        config_get_cloud_url(cloud_url, sizeof(cloud_url));
+        config_get_cloud_token(cloud_token, sizeof(cloud_token));
         ESP_LOGI(TAG, "Wi-Fi SSID:     %s", ssid[0] ? ssid : "(not set)");
         ESP_LOGI(TAG, "Wi-Fi password: ****");
         ESP_LOGI(TAG, "Telegram token: ****");
         ESP_LOGI(TAG, "OTA user:       %s", ota_user[0] ? ota_user : "(not set)");
         ESP_LOGI(TAG, "OTA password:   ****");
+        ESP_LOGI(TAG, "Cloud URL:      %s", cloud_url[0] ? cloud_url : "(not set)");
+        ESP_LOGI(TAG, "Cloud token:    %s", cloud_token[0] ? "****" : "(not set)");
     } else if (strcmp(cmd, "topway_test") == 0) {
 #if CONFIG_IDMS_DISPLAY_TOPWAY
         ESP_LOGI(TAG, "Writing test values to Topway screen...");
@@ -199,13 +256,71 @@ static void handle_cmd(const char *cmd)
 #endif
     } else if (strcmp(cmd, "adc") == 0) {
         int mean = 0, rms = 0, errors = 0;
+        idms_metrics_t m;
         monitor_adc_debug(&mean, &rms, &errors);
+        monitor_get_metrics(&m);
         ESP_LOGI(TAG, "ADC debug: mean=%d, rms=%d, errors=%d/64 (GPIO%d, unit=1 ch=5)",
                  mean, rms, errors, CONFIG_IDMS_ADC_GPIO);
+        ESP_LOGI(TAG, "  Current: %.2f A (%s), calibration %.2f A/V",
+                 (double)m.current_a, m.current_valid ? "valid" : "invalid",
+                 (double)config_get_current_cal_x100() / 100.0);
         ESP_LOGI(TAG, "  Expected: mean roughly mid-scale with bias circuit (about 900-3200 counts)");
         ESP_LOGI(TAG, "  If mean is near 0, TP_ADC/GPIO%d is shorted to GND or bias divider is missing", CONFIG_IDMS_ADC_GPIO);
         ESP_LOGI(TAG, "  If mean is near 4095, TP_ADC/GPIO%d is floating/high", CONFIG_IDMS_ADC_GPIO);
         ESP_LOGI(TAG, "  If errors>0: GPIO%d may not support ADC or ADC not initialized", CONFIG_IDMS_ADC_GPIO);
+    } else if (strncmp(cmd, "set_current_cal ", 16) == 0) {
+        float amps_per_volt = strtof(cmd + 16, NULL);
+        if (amps_per_volt < 0.10f || amps_per_volt > 5000.0f) {
+            ESP_LOGW(TAG, "Usage: set_current_cal <amps_per_volt> (0.10 to 5000.00)");
+        } else {
+            uint32_t cal_x100 = (uint32_t)lroundf(amps_per_volt * 100.0f);
+            esp_err_t err = config_set_current_cal_x100(cal_x100);
+            monitor_reset_current_filter();
+            ESP_LOGI(TAG, "Set current calibration: %.2f A/V (%s)",
+                     (double)amps_per_volt, esp_err_to_name(err));
+        }
+    } else if (strncmp(cmd, "cal_current ", 12) == 0) {
+        float actual_a = strtof(cmd + 12, NULL);
+        idms_metrics_t m;
+        monitor_get_metrics(&m);
+        if (!m.current_valid || m.current_a < 0.05f || actual_a <= 0.0f) {
+            ESP_LOGW(TAG, "Cannot calibrate. Need valid displayed current and actual amps > 0.");
+            ESP_LOGW(TAG, "Current now: %.2f A (%s)", (double)m.current_a,
+                     m.current_valid ? "valid" : "invalid");
+        } else {
+            uint32_t old_cal = config_get_current_cal_x100();
+            float new_cal_f = ((float)old_cal * actual_a) / m.current_a;
+            if (new_cal_f < 10.0f || new_cal_f > 500000.0f) {
+                ESP_LOGW(TAG, "Calculated calibration out of range: %.2f x100", (double)new_cal_f);
+                ESP_LOGW(TAG, "Check wiring: CT must clamp around one conductor only.");
+            } else {
+                uint32_t new_cal = (uint32_t)lroundf(new_cal_f);
+                esp_err_t err = config_set_current_cal_x100(new_cal);
+                monitor_reset_current_filter();
+                ESP_LOGI(TAG, "Current calibrated: measured=%.2f A actual=%.2f A scale %.2f -> %.2f A/V (%s)",
+                         (double)m.current_a, (double)actual_a,
+                         (double)old_cal / 100.0, (double)new_cal / 100.0,
+                         esp_err_to_name(err));
+            }
+        }
+    } else if (strcmp(cmd, "cal_zero") == 0) {
+#if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
+        ESP_LOGI(TAG, "Current zero calibration requested. Keep the CT connected and the load OFF.");
+        esp_err_t err = monitor_calibrate_zero();
+        monitor_reset_current_filter();
+        ESP_LOGI(TAG, "Current zero calibration result: %s", esp_err_to_name(err));
+#else
+        ESP_LOGW(TAG, "Current zero calibration is disabled in menuconfig");
+#endif
+    } else if (strcmp(cmd, "cal_all") == 0) {
+        ESP_LOGI(TAG, "Running sensor self-test and safe automatic calibration");
+        ESP_LOGI(TAG, "Temperature sensors are presence/range checked; absolute calibration requires a reference thermometer.");
+        esp_err_t err = monitor_calibrate_all();
+        ESP_LOGI(TAG, "Sensor calibration/self-test result: %s", esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_dt_high ", 12) == 0) {
+        int value = atoi(cmd + 12);
+        esp_err_t err = config_set_dt_high_threshold((int16_t)value);
+        ESP_LOGI(TAG, "Set Delta-T high threshold: %d C (%s)", value, esp_err_to_name(err));
     } else if (strncmp(cmd, "topway_str ", 11) == 0) {
 #if CONFIG_IDMS_DISPLAY_TOPWAY
         const char *arg = cmd + 11;
@@ -239,11 +354,20 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  show_token       — Show current token (first/last chars only)");
         ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
         ESP_LOGI(TAG, "  set_ota_pass <p> — Set OTA HTTP password (NVS)");
+        ESP_LOGI(TAG, "  set_cloud_url <url> — Set telemetry upload endpoint (NVS)");
+        ESP_LOGI(TAG, "  set_cloud_token <t> — Set telemetry upload bearer token (NVS)");
         ESP_LOGI(TAG, "  show_secrets     — Show secret status (values hidden)");
         ESP_LOGI(TAG, "  topway_test      — Write test values to Topway screen");
         ESP_LOGI(TAG, "  topway_str <hex_addr> <text> — Write string to Topway VP address");
-        ESP_LOGI(TAG, "  adc              — Read raw ADC values (diagnose current sensor)");
-        ESP_LOGI(TAG, "  reboot           — Reboot device");
+        ESP_LOGI(TAG, "  adc              - Read raw ADC values (diagnose current sensor)");
+        ESP_LOGI(TAG, "  cal_zero         - Safe no-load current zero calibration");
+        ESP_LOGI(TAG, "  cal_all          - Sensor self-test + safe automatic calibration");
+        ESP_LOGI(TAG, "  cal_current <A>  - Calibrate current using a known load");
+        ESP_LOGI(TAG, "  set_current_cal <A/V> - Set current calibration scale directly");
+        ESP_LOGI(TAG, "  set_power_threshold <A> - Current below this means power loss");
+        ESP_LOGI(TAG, "  set_running_threshold <A> - Current above this enables cooling alerts");
+        ESP_LOGI(TAG, "  set_dt_high <C>  - Set Delta-T high threshold");
+        ESP_LOGI(TAG, "  reboot           - Reboot device");
         ESP_LOGI(TAG, "  help             — Show this help");
     } else {
         ESP_LOGW(TAG, "Unknown command: '%s' (type 'help' for commands)", cmd);

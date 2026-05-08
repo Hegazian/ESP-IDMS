@@ -30,11 +30,14 @@ static esp_err_t wait_busy(uint32_t timeout_ms)
 static esp_err_t send_packet(const uint8_t *payload, size_t len)
 {
     if (!payload || len == 0) return ESP_ERR_INVALID_ARG;
+    if (!s_tx_mux) return ESP_ERR_INVALID_STATE;
 
     esp_err_t err = wait_busy(200);
     if (err != ESP_OK) return err;
 
-    xSemaphoreTake(s_tx_mux, portMAX_DELAY);
+    if (xSemaphoreTake(s_tx_mux, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     uint8_t hdr = TOPWAY_PKT_HEADER;
     uart_write_bytes(s_uart, &hdr, 1);
@@ -47,20 +50,6 @@ static esp_err_t send_packet(const uint8_t *payload, size_t len)
 
     vTaskDelay(pdMS_TO_TICKS(30));
     return ESP_OK;
-}
-
-static esp_err_t read_ack(uint32_t timeout_ms)
-{
-    uint8_t buf[2] = {0};
-    int len = uart_read_bytes(s_uart, buf, 2, pdMS_TO_TICKS(timeout_ms));
-    if (len == 2 && buf[0] == 0x3A && buf[1] == 0x3E) {
-        return ESP_OK;
-    }
-    if (len == 2 && buf[0] == 0x21 && buf[1] == 0x3E) {
-        ESP_LOGW(TAG, "NAK from display");
-        return ESP_FAIL;
-    }
-    return ESP_ERR_TIMEOUT;
 }
 
 static void drain_rx(void)
@@ -101,7 +90,10 @@ esp_err_t topway_init(const topway_config_t *config)
     }
 
     s_tx_mux = xSemaphoreCreateMutex();
-    if (!s_tx_mux) return ESP_ERR_NO_MEM;
+    if (!s_tx_mux) {
+        uart_driver_delete(s_uart);
+        return ESP_ERR_NO_MEM;
+    }
 
     ESP_LOGI(TAG, "Topway LCD: UART%d @ %lu baud (TX=%d, RX=%d, RTS=%d)",
              s_uart, (unsigned long)config->baud_rate,
@@ -127,6 +119,8 @@ esp_err_t topway_init(const topway_config_t *config)
         ESP_LOGE(TAG, "  Check: RS232-TTL wiring (TX<->RX cross), baud rate, VCC");
         ESP_LOGE(TAG, "  Display needs 12V on VDD pin, RS232 converter needs 3.3-5V");
         ESP_LOGE(TAG, "  Try 9600 baud if jumpers changed (JP1,JP8 close; JP2,JP7 open)");
+        topway_deinit();
+        return err;
     }
 
     return ESP_OK;

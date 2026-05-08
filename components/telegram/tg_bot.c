@@ -8,6 +8,7 @@
 #include "ota.h"
 #include "wifi_manager.h"
 #include "telegram.h"
+#include "telemetry.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -34,6 +35,7 @@ static char *s_resp_buf = NULL;
 static bool s_dns_ok = false;
 static int s_update_offset = -1;
 static bool s_commands_registered = false;
+static TaskHandle_t s_poll_task = NULL;
 
 static void load_state(void)
 {
@@ -86,6 +88,12 @@ static void handle_cmd(const char *chat, const char *cmd)
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
         telegram_cancel_alerts(chat);
+    } else if (strcmp(cmd, "weekly") == 0) {
+        tg_build_weekly(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+    } else if (strcmp(cmd, "export") == 0) {
+        tg_build_export(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
     } else if (strcmp(cmd, "test") == 0) {
         tg_broadcast_alert(
             "\xf0\x9f\x94\x94 <b>TEST ALERT</b>\n\n"
@@ -161,6 +169,12 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
         telegram_cancel_alerts(chat);
+    } else if (strcmp(data, "cmd_weekly") == 0) {
+        tg_build_weekly(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+    } else if (strcmp(data, "cmd_export") == 0) {
+        tg_build_export(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
     } else if (strcmp(data, "cmd_test") == 0) {
         tg_broadcast_alert("\xf0\x9f\x94\x94 <b>TEST ALERT</b>\n\nTest notification. \xe2\x9c\x85");
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Test alert sent.");
@@ -201,7 +215,7 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
             uint8_t count = config_get_tech_count();
             for (int i = 0; i < count; i++) {
                 char btn[96];
-                snprintf(btn, sizeof(btn), "{\"text\":\"\\xe2\\x9d\\x8c [%d]\",\"callback_data\":\"rm_%d\"}%s",
+                snprintf(btn, sizeof(btn), "[{\"text\":\"Remove [%d]\",\"callback_data\":\"rm_%d\"}]%s",
                          i, i, (i < count - 1) ? "," : "");
                 size_t cur = strlen(kb);
                 size_t blen = strlen(btn);
@@ -210,7 +224,8 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
                 }
             }
             size_t klen = strlen(kb);
-            snprintf(kb + klen, sizeof(kb) - klen, ",[{\"text\":\"\\xe2\\x97\\x80\\xef\\xb8\\x8f Back\",\"callback_data\":\"back_main\"}]]");
+            snprintf(kb + klen, sizeof(kb) - klen, "%s[{\"text\":\"Back\",\"callback_data\":\"back_main\"}]]",
+                     count > 0 ? "," : "");
             tg_send_kb(chat, s_resp_buf, kb);
         }
     } else if (strncmp(data, "rm_", 3) == 0) {
@@ -295,6 +310,8 @@ static void register_cmds(void)
         "{\"commands\":["
         "{\"command\":\"start\",\"description\":\"Main menu\"},"
         "{\"command\":\"status\",\"description\":\"Device status report\"},"
+        "{\"command\":\"weekly\",\"description\":\"Weekly telemetry report\"},"
+        "{\"command\":\"export\",\"description\":\"Export telemetry CSV\"},"
         "{\"command\":\"ota\",\"description\":\"OTA firmware update\"},"
         "{\"command\":\"test\",\"description\":\"Send test alert\"},"
         "{\"command\":\"reboot\",\"description\":\"Reboot device\"},"
@@ -379,6 +396,15 @@ static void poll_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(poll_int * 1000));
 
         tg_send_process_reminders();
+        if (telemetry_weekly_report_due()) {
+            tg_build_weekly(s_resp_buf, RESP_BUF_SZ);
+            esp_err_t report_err = tg_broadcast_text(s_resp_buf);
+            if (report_err != ESP_OK) {
+                ESP_LOGW(TAG, "Weekly report broadcast returned %s", esp_err_to_name(report_err));
+            } else {
+                telemetry_mark_weekly_report_sent();
+            }
+        }
 
         char path[256];
         if (s_update_offset < 0) {
@@ -424,6 +450,12 @@ static void poll_task(void *arg)
 
         tg_update_t update;
         if (!tg_parse_update(resp, &update)) {
+            int bad_update_id = 0;
+            if (tg_parse_first_update_id(resp, &bad_update_id)) {
+                ESP_LOGW(TAG, "Dropping unparseable update %d to keep polling moving", bad_update_id);
+                s_update_offset = bad_update_id + 1;
+                save_state();
+            }
             continue;
         }
 
@@ -443,6 +475,7 @@ static void poll_task(void *arg)
 
         if (!tg_is_authorized_id(update.from_id)) {
             uint8_t tech_count = config_get_tech_count();
+#if CONFIG_IDMS_TELEGRAM_ALLOW_FIRST_USER_CLAIM
             if (tech_count == 0 && update.is_message &&
                 (tg_is_cmd_text(update.message_text, "start") || tg_is_cmd_text(update.message_text, "help"))) {
                 esp_err_t add_err = config_add_tech_id(update.from_id);
@@ -459,6 +492,8 @@ static void poll_task(void *arg)
                     ESP_LOGE(TAG, "Failed to auto-register first user: %s", esp_err_to_name(add_err));
                 }
             }
+
+#endif
 
             ESP_LOGW(TAG, "Unauthorized %s (from_id=%s, techs=%u) — ignored",
                      update.is_callback ? "callback" : "message",
@@ -485,6 +520,10 @@ static void poll_task(void *arg)
                 handle_cmd(update.chat_id, "start");
             else if (tg_is_cmd_text(update.message_text, "status"))
                 handle_cmd(update.chat_id, "status");
+            else if (tg_is_cmd_text(update.message_text, "weekly"))
+                handle_cmd(update.chat_id, "weekly");
+            else if (tg_is_cmd_text(update.message_text, "export"))
+                handle_cmd(update.chat_id, "export");
             else if (tg_is_cmd_text(update.message_text, "test"))
                 handle_cmd(update.chat_id, "test");
             else if (tg_is_cmd_text(update.message_text, "ota"))
@@ -501,7 +540,18 @@ static void poll_task(void *arg)
     }
 }
 
-void tg_bot_start(void)
+esp_err_t tg_bot_start(void)
 {
-    xTaskCreatePinnedToCore(poll_task, "tg_bot", 24576, NULL, 3, NULL, tskNO_AFFINITY);
+    if (s_poll_task) {
+        return ESP_OK;
+    }
+
+    BaseType_t ok = xTaskCreatePinnedToCore(poll_task, "tg_bot", 24576,
+                                            NULL, 3, &s_poll_task, tskNO_AFFINITY);
+    if (ok != pdPASS) {
+        s_poll_task = NULL;
+        ESP_LOGE(TAG, "Failed to start Telegram poll task");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

@@ -17,6 +17,8 @@ typedef struct {
 
 bool tg_parse_update(const char *json_response, tg_update_t *out);
 
+bool tg_parse_first_update_id(const char *json_response, int *update_id);
+
 bool tg_is_authorized_id(const char *from_id);
 
 bool tg_is_cmd_text(const char *text, const char *cmd);

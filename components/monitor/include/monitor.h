@@ -39,6 +39,8 @@ typedef struct {
 esp_err_t monitor_init(void);
 void monitor_get_metrics(idms_metrics_t *out);
 void monitor_adc_debug(int *out_mean, int *out_rms, int *out_errors);
+void monitor_reset_current_filter(void);
+esp_err_t monitor_calibrate_all(void);
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
 esp_err_t monitor_calibrate_zero(void);

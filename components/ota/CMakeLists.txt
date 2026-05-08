@@ -5,16 +5,14 @@ set(priv_requires
     app_update
     bootloader_support
     esp_http_server
+    esp_https_server
     nvs_flash
     telegram
+    telemetry
     mbedtls
     core
     freertos
 )
-
-if(CONFIG_IDMS_OTA_HTTPS_ENABLE)
-    list(APPEND priv_requires esp_https_server)
-endif()
 
 idf_component_register(
     SRCS "ota.c"

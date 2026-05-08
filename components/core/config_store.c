@@ -44,10 +44,16 @@ esp_err_t config_store_init(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+        ESP_LOGE(TAG,
+                 "NVS init failed with %s. Refusing automatic erase because NVS "
+                 "contains provisioned credentials, technicians, calibration, and telemetry state.",
+                 esp_err_to_name(err));
+        return err;
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     nvs_handle_t h;
     err = nvs_open(NS, NVS_READWRITE, &h);
@@ -111,11 +117,29 @@ esp_err_t config_store_init(void)
         nvs_set_u16(h, "max_curr", CONFIG_DEFAULT_MAX_CURRENT);
         ESP_LOGI(TAG, "Initialized max_curr to default: %d A", CONFIG_DEFAULT_MAX_CURRENT);
     }
+
+    /* Power-loss threshold */
+    if (nvs_get_u16(h, "power_ma", &val_u16) != ESP_OK) {
+        nvs_set_u16(h, "power_ma", CONFIG_IDMS_CURRENT_THRESHOLD_MA);
+        ESP_LOGI(TAG, "Initialized power_ma to default: %d mA", CONFIG_IDMS_CURRENT_THRESHOLD_MA);
+    }
+
+    /* Machine-running threshold used to gate cooling alerts */
+    if (nvs_get_u16(h, "run_ma", &val_u16) != ESP_OK) {
+        nvs_set_u16(h, "run_ma", CONFIG_DEFAULT_MIN_CURRENT * 1000);
+        ESP_LOGI(TAG, "Initialized run_ma to default: %d mA", CONFIG_DEFAULT_MIN_CURRENT * 1000);
+    }
     
     /* Delta alert threshold */
     if (nvs_get_i16(h, "dt_alert", &val_i16) != ESP_OK) {
         nvs_set_i16(h, "dt_alert", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
         ESP_LOGI(TAG, "Initialized dt_alert to default: %d C", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
+    }
+
+    /* Delta high alert threshold */
+    if (nvs_get_i16(h, "dt_high", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "dt_high", CONFIG_IDMS_DT_HIGH_C);
+        ESP_LOGI(TAG, "Initialized dt_high to default: %d C", CONFIG_IDMS_DT_HIGH_C);
     }
 
     err = seed_default_str(h, "dev_model", CONFIG_DEFAULT_DEVICE_MODEL, "device model");
@@ -137,6 +161,13 @@ esp_err_t config_store_init(void)
     if (err != ESP_OK) {
         nvs_close(h);
         return err;
+    }
+    char qr_value[CONFIG_INFO_STRING_MAX_LEN + 1] = {0};
+    size_t qr_len = sizeof(qr_value);
+    if (nvs_get_str(h, "qr_code", qr_value, &qr_len) == ESP_OK &&
+        strcmp(qr_value, "https://t.me/IDMS_UserBot") == 0) {
+        nvs_set_str(h, "qr_code", CONFIG_DEFAULT_QR_CODE);
+        ESP_LOGI(TAG, "Migrated QR code default to %s", CONFIG_DEFAULT_QR_CODE);
     }
     
     nvs_commit(h);
@@ -330,6 +361,26 @@ esp_err_t config_set_ota_pass(const char *pass)
     return secrets_set("ota_pass", pass);
 }
 
+esp_err_t config_get_cloud_url(char *out, size_t out_len)
+{
+    return secrets_get("cloud_url", CONFIG_IDMS_CLOUD_URL, out, out_len);
+}
+
+esp_err_t config_set_cloud_url(const char *url)
+{
+    return secrets_set("cloud_url", url);
+}
+
+esp_err_t config_get_cloud_token(char *out, size_t out_len)
+{
+    return secrets_get("cloud_token", CONFIG_IDMS_CLOUD_TOKEN, out, out_len);
+}
+
+esp_err_t config_set_cloud_token(const char *token)
+{
+    return secrets_set("cloud_token", token);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Device information stored in NVS "idms" namespace                  */
 /* ------------------------------------------------------------------ */
@@ -471,6 +522,21 @@ static uint16_t nvs_get_u16_or_default(const char *key, uint16_t default_val)
     return value;
 }
 
+static uint32_t nvs_get_u32_or_default(const char *key, uint32_t default_val)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return default_val;
+    }
+    uint32_t value = default_val;
+    esp_err_t err = nvs_get_u32(h, key, &value);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return default_val;
+    }
+    return value;
+}
+
 static esp_err_t store_set_i16(const char *key, int16_t value)
 {
     nvs_handle_t h;
@@ -488,6 +554,18 @@ static esp_err_t store_set_u16(const char *key, uint16_t value)
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
     esp_err_t err = nvs_set_u16(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t store_set_u32(const char *key, uint32_t value)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    esp_err_t err = nvs_set_u32(h, key, value);
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
@@ -577,6 +655,32 @@ esp_err_t config_set_max_current(uint16_t value)
     return store_set_u16("max_curr", value);
 }
 
+uint16_t config_get_power_loss_current_ma(void)
+{
+    return nvs_get_u16_or_default("power_ma", CONFIG_IDMS_CURRENT_THRESHOLD_MA);
+}
+
+esp_err_t config_set_power_loss_current_ma(uint16_t value)
+{
+    if (value > (uint16_t)(CONFIG_CURRENT_MAX_LIMIT * 1000)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_u16("power_ma", value);
+}
+
+uint16_t config_get_machine_running_current_ma(void)
+{
+    return nvs_get_u16_or_default("run_ma", CONFIG_DEFAULT_MIN_CURRENT * 1000);
+}
+
+esp_err_t config_set_machine_running_current_ma(uint16_t value)
+{
+    if (value > (uint16_t)(CONFIG_CURRENT_MAX_LIMIT * 1000)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_u16("run_ma", value);
+}
+
 int16_t config_get_dt_alert_threshold(void)
 {
     return nvs_get_i16_or_default("dt_alert", CONFIG_DEFAULT_DT_ALERT_THRESHOLD);
@@ -588,4 +692,30 @@ esp_err_t config_set_dt_alert_threshold(int16_t value)
         return ESP_ERR_INVALID_ARG;
     }
     return store_set_i16("dt_alert", value);
+}
+
+int16_t config_get_dt_high_threshold(void)
+{
+    return nvs_get_i16_or_default("dt_high", CONFIG_IDMS_DT_HIGH_C);
+}
+
+esp_err_t config_set_dt_high_threshold(int16_t value)
+{
+    if (value < 0 || value > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("dt_high", value);
+}
+
+uint32_t config_get_current_cal_x100(void)
+{
+    return nvs_get_u32_or_default("curr_cal", CONFIG_IDMS_CT_AMPS_PER_VOLT_X100);
+}
+
+esp_err_t config_set_current_cal_x100(uint32_t value)
+{
+    if (value < 10 || value > 500000) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_u32("curr_cal", value);
 }

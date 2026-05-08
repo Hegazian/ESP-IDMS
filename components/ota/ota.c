@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "telegram.h"
 #include "config_store.h"
+#include "telemetry.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -17,6 +18,7 @@
 #include "freertos/timers.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static const char *TAG = "ota";
 
@@ -37,7 +39,6 @@ static volatile bool s_update_in_progress = false;
 
 static char s_cached_user[64] = {0};
 static char s_cached_pass[64] = {0};
-static bool s_creds_cached = false;
 
 static struct {
     char token[17];
@@ -51,10 +52,8 @@ static struct {
 
 static void load_cached_creds(void)
 {
-    if (s_creds_cached) return;
     config_get_ota_user(s_cached_user, sizeof(s_cached_user));
     config_get_ota_pass(s_cached_pass, sizeof(s_cached_pass));
-    s_creds_cached = true;
 }
 
 static int b64_encode(char *out, size_t out_sz, const uint8_t *in, size_t in_len)
@@ -135,11 +134,23 @@ bool ota_check_token(const char *token)
         s_ota_token.token[0] = '\0';
         return false;
     }
-    if (ct_memcmp(token, s_ota_token.token, strlen(s_ota_token.token))) {
-        s_ota_token.token[0] = '\0';
+
+    const size_t expected_len = strlen(s_ota_token.token);
+    const size_t token_len = strlen(token);
+    char supplied[sizeof(s_ota_token.token)] = {0};
+    size_t copy_len = token_len < expected_len ? token_len : expected_len;
+    memcpy(supplied, token, copy_len);
+
+    if (token_len == expected_len && ct_memcmp(supplied, s_ota_token.token, expected_len)) {
         return true;
     }
     return false;
+}
+
+static void ota_clear_token(void)
+{
+    s_ota_token.token[0] = '\0';
+    s_ota_token.created_tick = 0;
 }
 
 static bool extract_token_from_uri(httpd_req_t *req, char *token, size_t token_sz)
@@ -578,6 +589,7 @@ upload_complete:
     }
 
     ESP_LOGI(TAG, "OTA complete: %zu bytes written, rebooting...", total);
+    ota_clear_token();
 
     httpd_resp_set_type(req, "application/json");
     char msg[256];
@@ -644,6 +656,41 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t ota_export_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+
+    FILE *f = fopen(telemetry_csv_path(), "r");
+    if (!f) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "No telemetry CSV has been collected yet");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"esp-idms-telemetry.csv\"");
+
+    char buf[1024];
+    size_t n;
+    esp_err_t err = ESP_OK;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        err = httpd_resp_send_chunk(req, buf, n);
+        if (err != ESP_OK) {
+            break;
+        }
+    }
+    fclose(f);
+
+    if (err == ESP_OK) {
+        httpd_resp_send_chunk(req, NULL, 0);
+    }
+    return err;
+}
+
 static esp_err_t ota_page_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) {
@@ -656,6 +703,12 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
 #else
     const char *proto_note = "<p>Connection is <b>unencrypted</b> HTTP. Credentials are sent in plaintext.</p>";
 #endif
+
+    char token[32] = {0};
+    char form_action[64] = "/";
+    if (extract_token_from_uri(req, token, sizeof(token)) && ota_check_token(token)) {
+        snprintf(form_action, sizeof(form_action), "/?token=%s", token);
+    }
 
     const char *page =
         "<!DOCTYPE html>"
@@ -671,7 +724,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         "<h1>ESP-IDMS Firmware Update</h1>"
         "<p>Current version: <strong>" PROJECT_VER "</strong></p>"
         "<div class=\"info\">" "%s" "</div>"
-        "<form method=\"POST\" enctype=\"multipart/form-data\">"
+        "<form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\">"
         "<label>Firmware binary (.bin):</label><br>"
         "<input type=\"file\" name=\"firmware\" accept=\".bin\" required><br>"
         "<input type=\"submit\" value=\"Upload &amp; Update\">"
@@ -684,7 +737,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    snprintf(html, 2048, page, proto_note);
+    snprintf(html, 2048, page, proto_note, form_action);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, html);
     free(html);
@@ -701,6 +754,9 @@ static void register_uri_handlers(httpd_handle_t server)
 
     httpd_uri_t info_uri = { .uri = "/info", .method = HTTP_GET, .handler = ota_info_handler };
     httpd_register_uri_handler(server, &info_uri);
+
+    httpd_uri_t export_uri = { .uri = "/export.csv", .method = HTTP_GET, .handler = ota_export_handler };
+    httpd_register_uri_handler(server, &export_uri);
 }
 
 #if CONFIG_IDMS_OTA_HTTPS_ENABLE
@@ -718,7 +774,7 @@ static esp_err_t start_ota_http_server(uint16_t port)
     httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.servercert = ota_server_cert_pem_start;
     ssl_cfg.servercert_len = (ota_server_cert_pem_end - ota_server_cert_pem_start);
-    ssl_cfg.prvtkey = ota_server_key_pem_start;
+    ssl_cfg.prvtkey_pem = ota_server_key_pem_start;
     ssl_cfg.prvtkey_len = (ota_server_key_pem_end - ota_server_key_pem_start);
     ssl_cfg.httpd.server_port = port;
     ssl_cfg.httpd.max_uri_handlers = 8;
@@ -807,14 +863,6 @@ static void build_version_string(void)
     }
 }
 
-static void valid_mark_timer_cb(TimerHandle_t timer)
-{
-    (void)timer;
-    esp_ota_mark_app_valid_cancel_rollback();
-    ESP_LOGI(TAG, "App marked valid after delay — rollback cancelled");
-    strncpy(s_status, "ready", sizeof(s_status) - 1);
-}
-
 esp_err_t ota_init(void)
 {
     memset(&s_ota_token, 0, sizeof(s_ota_token));
@@ -854,23 +902,35 @@ void ota_mark_app_valid(void)
     strncpy(s_status, "ready", sizeof(s_status) - 1);
 }
 
-void ota_schedule_valid_mark(uint32_t delay_ms)
+void ota_mark_app_invalid_and_reboot(void)
+{
+    ESP_LOGE(TAG, "App health validation failed — marking invalid and rebooting for rollback");
+    strncpy(s_status, "rollback", sizeof(s_status) - 1);
+    s_status[sizeof(s_status) - 1] = '\0';
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
+bool ota_is_pending_validation(void)
 {
     esp_ota_img_states_t state;
     const esp_partition_t *running = esp_ota_get_running_partition();
-    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
-        state == ESP_OTA_IMG_PENDING_VERIFY) {
-        TimerHandle_t timer = xTimerCreate("ota_valid", pdMS_TO_TICKS(delay_ms),
-                                           pdFALSE, NULL, valid_mark_timer_cb);
-        if (timer) {
-            xTimerStart(timer, 0);
-            ESP_LOGI(TAG, "OTA valid mark scheduled in %lu ms", (unsigned long)delay_ms);
-        } else {
-            ESP_LOGE(TAG, "Failed to create OTA valid mark timer");
-            ota_mark_app_valid();
-        }
+    return esp_ota_get_state_partition(running, &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+void ota_schedule_valid_mark(uint32_t delay_ms)
+{
+    if (ota_is_pending_validation()) {
+        strncpy(s_status, "pending-health", sizeof(s_status) - 1);
+        s_status[sizeof(s_status) - 1] = '\0';
+        ESP_LOGI(TAG,
+                 "OTA image pending health validation; not marking valid by time alone "
+                 "(legacy delay=%lu ms ignored)",
+                 (unsigned long)delay_ms);
     } else {
-        ota_mark_app_valid();
+        strncpy(s_status, "ready", sizeof(s_status) - 1);
+        s_status[sizeof(s_status) - 1] = '\0';
+        ESP_LOGI(TAG, "No pending OTA validation for current partition");
     }
 }
 

@@ -4,6 +4,8 @@
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 static const char *TAG = "tg_parse";
 
@@ -132,6 +134,41 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
     ESP_LOGW(TAG, "Update %d has no message or callback_query", out->update_id);
     cJSON_Delete(root);
     return false;
+}
+
+bool tg_parse_first_update_id(const char *json_response, int *update_id)
+{
+    if (!json_response || !update_id) return false;
+
+    cJSON *root = cJSON_Parse(json_response);
+    if (!root) {
+        const char *p = strstr(json_response, "\"update_id\"");
+        if (!p) return false;
+        p = strchr(p, ':');
+        if (!p) return false;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = NULL;
+        long id = strtol(p, &end, 10);
+        if (end == p || id <= 0 || id > INT32_MAX) return false;
+        *update_id = (int)id;
+        return true;
+    }
+
+    bool found = false;
+    cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (cJSON_IsTrue(ok) && cJSON_IsArray(result) && cJSON_GetArraySize(result) > 0) {
+        cJSON *update = cJSON_GetArrayItem(result, 0);
+        cJSON *uid = update ? cJSON_GetObjectItem(update, "update_id") : NULL;
+        if (cJSON_IsNumber(uid)) {
+            *update_id = uid->valueint;
+            found = true;
+        }
+    }
+
+    cJSON_Delete(root);
+    return found;
 }
 
 bool tg_is_authorized_id(const char *from_id)

@@ -27,6 +27,10 @@ esp_err_t config_get_ota_user(char *out, size_t out_len);
 esp_err_t config_set_ota_user(const char *user);
 esp_err_t config_get_ota_pass(char *out, size_t out_len);
 esp_err_t config_set_ota_pass(const char *pass);
+esp_err_t config_get_cloud_url(char *out, size_t out_len);
+esp_err_t config_set_cloud_url(const char *url);
+esp_err_t config_get_cloud_token(char *out, size_t out_len);
+esp_err_t config_set_cloud_token(const char *token);
 
 /* ------------------------------------------------------------------ */
 /*  Device information shown on the Topway INFO page                   */
@@ -88,5 +92,13 @@ uint16_t config_get_min_current(void);
 esp_err_t config_set_min_current(uint16_t value);
 uint16_t config_get_max_current(void);
 esp_err_t config_set_max_current(uint16_t value);
+uint16_t config_get_power_loss_current_ma(void);
+esp_err_t config_set_power_loss_current_ma(uint16_t value);
+uint16_t config_get_machine_running_current_ma(void);
+esp_err_t config_set_machine_running_current_ma(uint16_t value);
 int16_t config_get_dt_alert_threshold(void);
 esp_err_t config_set_dt_alert_threshold(int16_t value);
+int16_t config_get_dt_high_threshold(void);
+esp_err_t config_set_dt_high_threshold(int16_t value);
+uint32_t config_get_current_cal_x100(void);
+esp_err_t config_set_current_cal_x100(uint32_t value);

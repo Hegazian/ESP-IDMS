@@ -20,6 +20,8 @@ esp_err_t tg_broadcast_alert(const char *text);
 
 esp_err_t tg_send_ring_alert(const char *chat_id, const char *alert_text);
 
+esp_err_t tg_enqueue_ring_alert(const char *chat_id, const char *alert_text);
+
 void tg_flush_offline_queue(void);
 
 esp_err_t tg_queue_message(const char *chat_id, const char *text);

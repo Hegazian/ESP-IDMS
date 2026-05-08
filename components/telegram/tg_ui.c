@@ -2,6 +2,7 @@
 #include "config_store.h"
 #include "monitor.h"
 #include "ota.h"
+#include "telemetry.h"
 #include "wifi_manager.h"
 #include <stdio.h>
 #include <string.h>
@@ -35,10 +36,47 @@ void tg_build_status(char *buf, size_t sz)
         config_get_tech_count());
 }
 
+void tg_build_weekly(char *buf, size_t sz)
+{
+    telemetry_build_weekly_report(buf, sz);
+}
+
+void tg_build_export(char *buf, size_t sz)
+{
+    char ip[16];
+    wifi_manager_get_ip(ip, sizeof(ip));
+    const char *proto =
+#if CONFIG_IDMS_OTA_HTTPS_ENABLE
+        "https";
+#else
+        "http";
+#endif
+
+    char token[17] = {0};
+    if (ota_generate_token(token, sizeof(token))) {
+        snprintf(buf, sz,
+            "<b>ESP-IDMS Telemetry Export</b>\n\n"
+            "Download CSV history:\n"
+            "<code>%s://%s:%d/export.csv?token=%s</code>\n\n"
+            "<i>Token expires in 5 minutes. CSV is stored locally and grows with one sample per minute.</i>",
+            proto, ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT, token);
+    } else {
+        snprintf(buf, sz,
+            "<b>ESP-IDMS Telemetry Export</b>\n\n"
+            "Failed to generate export token. Try again later or use OTA HTTP Basic Auth.");
+    }
+}
+
 void tg_build_ota(char *buf, size_t sz)
 {
     char ip[16];
     wifi_manager_get_ip(ip, sizeof(ip));
+    const char *proto =
+#if CONFIG_IDMS_OTA_HTTPS_ENABLE
+        "https";
+#else
+        "http";
+#endif
 
     char token[17] = {0};
     bool has_token = ota_generate_token(token, sizeof(token));
@@ -50,11 +88,11 @@ void tg_build_ota(char *buf, size_t sz)
             "<b>Partition:</b> %s\n"
             "<b>Status:</b> %s\n\n"
             "Upload firmware at:\n"
-            "<code>http://%s:%d/?token=%s</code>\n\n"
+            "<code>%s://%s:%d/?token=%s</code>\n\n"
             "<i>Token expires in 5 minutes. Use it in the browser URL above.\n"
             "Alternatively use HTTP Basic Auth via serial console credentials.</i>",
             ota_get_version(), ota_get_partition(), ota_get_status(),
-            ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT,
+            proto, ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT,
             token);
     } else {
         snprintf(buf, sz,
@@ -62,9 +100,9 @@ void tg_build_ota(char *buf, size_t sz)
             "<b>Current:</b> %s\n"
             "<b>Partition:</b> %s\n"
             "<b>Status:</b> %s\n\n"
-            "<i>Failed to generate access token. Use serial console to set OTA credentials, then access http://%s:%d/</i>",
+            "<i>Failed to generate access token. Use serial console to set OTA credentials, then access %s://%s:%d/</i>",
             ota_get_version(), ota_get_partition(), ota_get_status(),
-            ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT);
+            proto, ip[0] ? ip : "?.?.?.?", CONFIG_IDMS_OTA_HTTP_PORT);
     }
 }
 

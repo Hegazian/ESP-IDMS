@@ -1,10 +1,14 @@
 #include "esp_log.h"
 #include "driver/spi_master.h"
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "config_store.h"
 #include "wifi_manager.h"
 #include "monitor.h"
+#include "telemetry.h"
+#include "cloud_sync.h"
 
 #if CONFIG_IDMS_DISPLAY_TOPWAY
 #include "ui_topway.h"
@@ -30,6 +34,86 @@
 #endif
 
 static const char *TAG = "app";
+
+#if CONFIG_IDMS_PRODUCTION_BUILD
+#if !CONFIG_SECURE_BOOT
+#error "Production build requires CONFIG_SECURE_BOOT=y"
+#endif
+#if !CONFIG_SECURE_FLASH_ENC_ENABLED
+#error "Production build requires CONFIG_SECURE_FLASH_ENC_ENABLED=y"
+#endif
+#if !CONFIG_NVS_ENCRYPTION
+#error "Production build requires CONFIG_NVS_ENCRYPTION=y"
+#endif
+#endif
+
+#define OTA_HEALTH_INITIAL_DELAY_MS 30000
+#define OTA_HEALTH_POLL_MS          5000
+#define OTA_HEALTH_TIMEOUT_MS       180000
+
+static bool s_telemetry_ready;
+static bool s_ui_ready;
+static bool s_telegram_ready;
+
+static bool app_health_ok_for_ota(void)
+{
+    idms_metrics_t m;
+    monitor_get_metrics(&m);
+
+    if (!s_telemetry_ready || !s_ui_ready || !s_telegram_ready) {
+        return false;
+    }
+    if (!m.sensor_preflight_done || !m.sensor_preflight_ok || m.sensor_error_flags != 0) {
+        return false;
+    }
+    if (!m.current_valid || !m.t_in_valid || !m.t_out_valid || !m.delta_valid) {
+        return false;
+    }
+    return true;
+}
+
+static void ota_health_validation_task(void *arg)
+{
+    (void)arg;
+    if (!ota_is_pending_validation()) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ota_schedule_valid_mark(0);
+    ESP_LOGI(TAG, "OTA health validation started");
+    vTaskDelay(pdMS_TO_TICKS(OTA_HEALTH_INITIAL_DELAY_MS));
+
+    uint32_t elapsed = OTA_HEALTH_INITIAL_DELAY_MS;
+    while (elapsed <= OTA_HEALTH_TIMEOUT_MS) {
+        if (app_health_ok_for_ota()) {
+            ESP_LOGI(TAG, "OTA health validation passed after %lu ms", (unsigned long)elapsed);
+            ota_mark_app_valid();
+            vTaskDelete(NULL);
+            return;
+        }
+
+        idms_metrics_t m;
+        monitor_get_metrics(&m);
+        ESP_LOGW(TAG,
+                 "OTA health pending: telemetry=%s ui=%s telegram=%s sensors=%s flags=0x%02lx current=%s Tin=%s Tout=%s dT=%s",
+                 s_telemetry_ready ? "ok" : "fail",
+                 s_ui_ready ? "ok" : "fail",
+                 s_telegram_ready ? "ok" : "fail",
+                 m.sensor_preflight_ok ? "ok" : m.sensor_status,
+                 (unsigned long)m.sensor_error_flags,
+                 m.current_valid ? "ok" : "invalid",
+                 m.t_in_valid ? "ok" : "invalid",
+                 m.t_out_valid ? "ok" : "invalid",
+                 m.delta_valid ? "ok" : "invalid");
+
+        vTaskDelay(pdMS_TO_TICKS(OTA_HEALTH_POLL_MS));
+        elapsed += OTA_HEALTH_POLL_MS;
+    }
+
+    ota_mark_app_invalid_and_reboot();
+    vTaskDelete(NULL);
+}
 
 #if !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_SPI
 static void init_lcd_spi_bus(void)
@@ -148,17 +232,50 @@ void app_main(void)
         ESP_LOGE(TAG, "Monitor sensor preflight reported errors: %s", esp_err_to_name(monitor_err));
     }
 
+    esp_err_t telemetry_err = telemetry_init();
+    if (telemetry_err != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry init failed: %s", esp_err_to_name(telemetry_err));
+        s_telemetry_ready = false;
+    } else {
+        s_telemetry_ready = true;
+    }
+
+    esp_err_t cloud_err = cloud_sync_init();
+    if (cloud_err != ESP_OK) {
+        ESP_LOGE(TAG, "Cloud sync init failed: %s", esp_err_to_name(cloud_err));
+    }
+
 #if CONFIG_IDMS_DISPLAY_TOPWAY
-    idms_ui_topway_init();
+    esp_err_t ui_err = idms_ui_topway_init();
+    if (ui_err != ESP_OK) {
+        ESP_LOGE(TAG, "Topway UI init failed: %s", esp_err_to_name(ui_err));
+        s_ui_ready = false;
+    } else {
+        s_ui_ready = true;
+    }
 #else
     idms_ui_init();
+    s_ui_ready = true;
 #endif
 
-    telegram_command_poll_start();
+    esp_err_t telegram_err = telegram_command_poll_start();
+    if (telegram_err != ESP_OK) {
+        ESP_LOGE(TAG, "Telegram init failed: %s", esp_err_to_name(telegram_err));
+        s_telegram_ready = false;
+    } else {
+        s_telegram_ready = true;
+    }
     serial_console_start();
 
     ESP_ERROR_CHECK(ota_init());
-    ota_schedule_valid_mark(30000);
+    if (ota_is_pending_validation()) {
+        BaseType_t ok = xTaskCreatePinnedToCore(ota_health_validation_task, "ota_health",
+                                                4096, NULL, 4, NULL, tskNO_AFFINITY);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create OTA health task");
+            ota_mark_app_invalid_and_reboot();
+        }
+    }
 
     ESP_LOGI(TAG, "All subsystems started (version: %s)", ota_get_version());
 }

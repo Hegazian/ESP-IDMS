@@ -109,6 +109,59 @@ static void copy_info_cache(char *dst, const char *src)
   dst[INFO_FIELD_MAX_LEN - 1] = '\0';
 }
 
+static bool is_ascii_printable_string(const char *value, bool require_nonblank)
+{
+  if (!value) {
+    return false;
+  }
+
+  bool nonblank = false;
+  for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+    if (*p < 0x20 || *p > 0x7E) {
+      return false;
+    }
+    if (*p != ' ' && *p != '\t') {
+      nonblank = true;
+    }
+  }
+  return !require_nonblank || nonblank;
+}
+
+static bool validate_info_required(const char *value)
+{
+  return is_ascii_printable_string(value, true);
+}
+
+static bool validate_info_optional(const char *value)
+{
+  return is_ascii_printable_string(value, false);
+}
+
+static bool validate_info_email(const char *value)
+{
+  if (!validate_info_optional(value)) {
+    return false;
+  }
+  if (!value || value[0] == '\0') {
+    return true;
+  }
+  return strchr(value, '@') != NULL && strchr(value, ' ') == NULL;
+}
+
+static bool validate_info_phone(const char *value)
+{
+  if (!validate_info_optional(value)) {
+    return false;
+  }
+  for (const char *p = value; p && *p; p++) {
+    if ((*p < '0' || *p > '9') && *p != '+' && *p != '-' &&
+        *p != ' ' && *p != '(' && *p != ')') {
+      return false;
+    }
+  }
+  return true;
+}
+
 static void generate_default_serial_number(char *out, size_t out_sz)
 {
   if (!out || out_sz == 0) {
@@ -135,12 +188,14 @@ static void generate_default_manufacture_date(char *out, size_t out_sz)
 }
 
 typedef esp_err_t (*info_setter_t)(const char *value);
+typedef bool (*info_validator_t)(const char *value);
 
 typedef struct {
   uint32_t vp;
   char *cache;
   const char *label;
   info_setter_t set;
+  info_validator_t validate;
 } info_field_t;
 
 static void idms_ui_topway_poll_info_fields(void)
@@ -156,12 +211,12 @@ static void idms_ui_topway_poll_info_fields(void)
   s_info_last_poll = now;
 
   static info_field_t fields[] = {
-      { VP_STR_DEVICE_MODEL, s_info_device_model, "Device Model", config_set_device_model },
-      { VP_STR_SERIAL_NUMBER, s_info_serial_number, "Serial Number", config_set_serial_number },
-      { VP_STR_MANUFACTURE_DATE, s_info_manufacture_date, "Manufacture Date", config_set_manufacture_date },
-      { VP_STR_SUPPORT_EMAIL, s_info_support_email, "Support Email", config_set_support_email },
-      { VP_STR_SUPPORT_PHONE, s_info_support_phone, "Support Phone", config_set_support_phone },
-      { VP_STR_QR_CODE, s_info_qr_code, "QR Code", config_set_qr_code },
+      { VP_STR_DEVICE_MODEL, s_info_device_model, "Device Model", config_set_device_model, validate_info_required },
+      { VP_STR_SERIAL_NUMBER, s_info_serial_number, "Serial Number", config_set_serial_number, validate_info_required },
+      { VP_STR_MANUFACTURE_DATE, s_info_manufacture_date, "Manufacture Date", config_set_manufacture_date, validate_info_required },
+      { VP_STR_SUPPORT_EMAIL, s_info_support_email, "Support Email", config_set_support_email, validate_info_email },
+      { VP_STR_SUPPORT_PHONE, s_info_support_phone, "Support Phone", config_set_support_phone, validate_info_phone },
+      { VP_STR_QR_CODE, s_info_qr_code, "QR Code", config_set_qr_code, validate_info_required },
   };
   const size_t field_count = sizeof(fields) / sizeof(fields[0]);
   info_field_t *field = &fields[s_info_next_field];
@@ -174,6 +229,12 @@ static void idms_ui_topway_poll_info_fields(void)
   }
 
   if (strcmp(value, field->cache) == 0) {
+    return;
+  }
+
+  if (field->validate && !field->validate(value)) {
+    ESP_LOGW(TAG, "Rejected invalid %s from LCD; restoring NVS value", field->label);
+    topway_str_write(field->vp, field->cache);
     return;
   }
 
@@ -445,6 +506,10 @@ void idms_ui_topway_check_apply_button(void) {
       new_dt_alert = (int16_t)val;
       if (new_dt_alert < 0 || new_dt_alert > 100) valid = false;
     }
+
+    if (new_min_tin > new_max_tin) valid = false;
+    if (new_min_tout > new_max_tout) valid = false;
+    if (new_min_current > new_max_current) valid = false;
     
     if (!valid) {
       topway_n16_write(VP_N16_CFG_APPLY_BTN, 0);
@@ -515,6 +580,9 @@ void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
     if (new_min_current > CONFIG_CURRENT_MAX_LIMIT) valid = false;
     if (new_max_current > CONFIG_CURRENT_MAX_LIMIT) valid = false;
     if (new_dt_alert < 0 || new_dt_alert > 100) valid = false;
+    if (new_min_tin > new_max_tin) valid = false;
+    if (new_min_tout > new_max_tout) valid = false;
+    if (new_min_current > new_max_current) valid = false;
     
     if (!valid) {
       ESP_LOGW(TAG, "Config validation failed");
