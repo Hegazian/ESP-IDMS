@@ -4,6 +4,14 @@
 **Date:** April 2026  
 **Target:** ESP32-S3 N16R8 + Topway HKT070DTA-1C
 
+> Current-state note, 2026-05-10:
+> This BOM remains the hardware purchasing baseline for the ESP32-S3 + Topway
+> version. Firmware has moved to the finalized current state documented in
+> `README.md`, `Specifications.md`, and `PROJECT_HANDOFF.md`. Before production
+> purchasing, re-check prices, preferred suppliers, enclosure fit, mains safety
+> requirements, and whether the selected SCT variant is 30A/1V, 100A/1V, or
+> SCT-013-000 current-output.
+
 > All prices are approximate retail (USD). Bulk pricing reduces unit cost.  
 > DNP = Do Not Populate (marked on PCB, not soldered).
 
@@ -181,10 +189,13 @@ Factory baud rate is 115200. Verify the RS232-TTL jumpers on the LCD module:
 | Document | Path |
 |----------|------|
 | Hardware Deep-Dive & PCB Redesign | `./HARDWARE_DEEP_DIVE.md` |
+| Current Project Handoff | `./PROJECT_HANDOFF.md` |
+| Cloud Setup | `./CLOUD_SETUP.md` |
+| OTA Implementation | `./OTA_IMPLEMENTATION.md` |
 | atopile Schematic v3 | `./hardware/esp-idms_v3.ato` |
 | Original atopile Schematic v2 | `./hardware/esp-idms.ato` |
 | PCB Layout (v2) | `./PCB_Layout.md` |
-| Specifications (v2) | `./Specifications.md` |
+| Specifications (v3) | `./Specifications.md` |
 | Project Definition | `./Project Definition.md` |
 | Firmware README | `./README.md` |
 

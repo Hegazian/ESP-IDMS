@@ -4,6 +4,12 @@
 **Date:** April 2026  
 **Analysis Scope:** Complete hardware audit, PCB gap analysis, and redesign specification
 
+> Current-state note, 2026-05-10:
+> Firmware documentation has been refreshed for the finalized current phase.
+> Treat this hardware deep dive as design input for the next phase, not as a
+> statement that production EDA files already exist. Start new sessions with
+> `PROJECT_HANDOFF.md`, then return here for PCB and enclosure work.
+
 ---
 
 ## 1. EXECUTIVE SUMMARY
@@ -191,12 +197,22 @@ I_rms(A) = (RMS(ADC_counts - 2048) × 3.3V / 4096) × 30.0 (A/V) × (1 / autozer
 |------------|------|---------|--------|
 | 0x000000 | String | Current display ("--" if invalid) | monitor |
 | 0x000200 | String | Wi-Fi IP address | wifi_manager |
-| 0x000280 | String | Firmware version | app_main |
+| 0x000080 | String | Wi-Fi password input | ui_topway |
+| 0x000100 | String | Support email | config_store |
+| 0x000180 | String | Support phone | config_store |
+| 0x000280 | String | QR payload | config_store |
 | 0x000300 | String | OTA status | ota |
 | 0x000380 | String | ACTIVE / INACTIVE | monitor |
+| 0x000400 | String | Wi-Fi status message | ui_topway |
 | 0x000500 | String | Diagnostic detail | monitor |
 | 0x000600 | String | ERROR status | monitor |
 | 0x000700 | String | WARNING status | monitor |
+| 0x000900 | String | Wi-Fi SSID input | ui_topway |
+| 0x000980 | String | Device model | config_store |
+| 0x000A00 | String | Firmware version | ota |
+| 0x000A80 | String | Hardware version | ui_topway |
+| 0x000B00 | String | Serial number | config_store |
+| 0x000B80 | String | Manufacture date | config_store |
 | 0x080000 | N16 | Current × 10 | monitor |
 | 0x080002 | N16 | T_in × 10 | monitor |
 | 0x080004 | N16 | T_out × 10 | monitor |
@@ -209,7 +225,11 @@ I_rms(A) = (RMS(ADC_counts - 2048) × 3.3V / 4096) × 30.0 (A/V) × (1 / autozer
 | 0x08001A | N16 | OTA status | ota |
 | 0x08001C | N16 | Technician count | config_store |
 | 0x08001E | N16 | Power fault | monitor |
-| 0x080020 | N16 | Cooling fault | monitor |
+| 0x080020 | N16 | Wi-Fi connect button | ui_topway |
+| 0x080022 | N16 | Cooling fault | monitor |
+| 0x080024 | N16 | Delta T low threshold | config_store |
+| 0x080026 | N16 | Delta T alert flag | monitor |
+| 0x080030-0x08003C | N16 | Configuration page fields and Apply button | ui_topway |
 
 ### 3.6 Touch Controller Subsystem — XPT2046
 
@@ -285,12 +305,12 @@ I_rms(A) = (RMS(ADC_counts - 2048) × 3.3V / 4096) × 30.0 (A/V) × (1 / autozer
 4. ADC oneshot init for SCT-013 (monitor.c)
 5. Topway UART handshake (topway_lcd.c, 5 retries max)
 6. SPI init for XPT2046 touch (xpt2046.c, optional)
-7. UI task start (ui_topway.c, 500ms timer)
+7. UI task start (ui_topway.c, 500 ms task loop)
 8. Monitor task start (monitor.c, 500ms, priority 5)
 9. Telegram bot poll task (tg_bot.c, 5s/30s, priority 3)
 10. OTA HTTP server (ota.c, port 8080)
 11. Serial console (cli/serial_console.c, priority 2)
-12. OTA validity timer (30s delayed mark)
+12. OTA health validation task if booting a pending OTA image
 ```
 
 ### 4.2 Critical Timings
@@ -839,10 +859,12 @@ To support the redesigned PCB with status LEDs:
 | Document | Path |
 |----------|------|
 | README | `README.md` |
-| Specifications (v2.0) | `Specifications.md` |
+| Project handoff | `PROJECT_HANDOFF.md` |
+| Cloud setup | `CLOUD_SETUP.md` |
+| Specifications (v3.0) | `Specifications.md` |
 | PCB Layout (v2.0) | `PCB_Layout.md` |
 | Original BOM (v2.0) | `BOM.md` |
-| Project Definition (v2.0) | `Project Definition.md` |
+| Project Definition (v3.0) | `Project Definition.md` |
 | Original atopile schematic | `hardware/esp-idms.ato` |
 | OTA Implementation | `OTA_IMPLEMENTATION.md` |
 | DS18B20 Datasheet | `ds18b20.pdf` |

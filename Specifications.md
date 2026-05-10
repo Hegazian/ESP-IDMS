@@ -1,185 +1,224 @@
-# Technical Specifications — ESP-IDMS (ESP32-S3 + Topway LCD)
+﻿# Technical Specifications - ESP-IDMS
 
-**Document Version:** 2.0  
-**Date:** April 2026  
-**Target:** ESP32-S3 N16R8 + Topway HKT070DTA-1C
+Document version: 3.0
+Last updated: 2026-05-10
+Target: ESP32-S3 N16R8 + Topway HKT070DTA-1C
 
----
+## 1. System Overview
 
-## 1. Connectivity & Network
+| Area | Specification |
+|------|---------------|
+| MCU | ESP32-S3, 16 MB flash, 8 MB PSRAM |
+| Framework | ESP-IDF v5.5.x |
+| Display | Topway HKT070DTA-1C, 800x480, UART smart LCD |
+| Current sensor | SCT-013 voltage-output CT by default |
+| Temperature sensors | Two DS18B20 waterproof probes |
+| Connectivity | Wi-Fi STA, SNTP |
+| Alerting | Telegram Bot API over HTTPS |
+| OTA | HTTPS server on port 8080 |
+| Storage | NVS for config/secrets, SPIFFS for telemetry CSV |
+| Cloud | Generic HTTPS POST endpoint with Bearer token |
 
-| Parameter | Specification |
-|-----------|---------------|
-| Wi-Fi Standard | IEEE 802.11 b/g/n (2.4 GHz) |
-| Reconnect Strategy | Automatic with exponential back-off; local monitoring continues during outage |
-| Alert Transport | HTTPS POST via Telegram Bot API |
-| TLS Security | esp-x509-certificate-bundle (Mozilla root CAs) |
-| Heartbeat Interval | Every 120 s (20 min bot poll cycle) |
-| Max Technicians | 5 (Telegram Chat IDs in NVS) |
-
----
-
-## 2. Current Monitoring (SCT-013)
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Sensor | SCT-013-030 (30 A/1 V) or SCT-013-000 (100 A/50 mA) | Non-invasive split-core CT |
-| ADC GPIO | GPIO 6 (ESP32-S3 ADC_UNIT_0 CH5) | 12-bit, 0–3.3 V range, attenuation 12 dB |
-| ADC Bias Circuit | 2× 10 kΩ voltage divider + 10 µF capacitor | Creates 1.65 V midpoint at ADC input |
-| Burden Resistor | 33 Ω (SCT-013-000 only) | Built-in on SCT-013-030 |
-| Sampling | 512-sample RMS window every 500 ms | EMA filter (α=0.15) for display stability |
-| Auto-Zero | 512 samples at boot | Measures DC offset, subtracted from RMS |
-| Sensor Disconnect Detect | ADC mean < 15 or > 4080 counts | Marks current_valid = false |
-| Calibration Factor | 300 A/V (CONFIG_IDMS_CT_AMPS_PER_VOLT_X100=30000) | Configurable in menuconfig |
-| Power-Loss Threshold | < 350 mA for ≥ 5 s | Configurable (CONFIG_IDMS_CURRENT_THRESHOLD_MA) |
-
-### 2.1 SCT-013 Bias Circuit Schematic
-
-```
-                    3.3V
-                     |
-                   [10kΩ]
-                     |
-    SCT-013  ───────┤──────── GPIO6 (ADC)
-    output    │      │
-             [33Ω]  │
-             burden  │
-               │   [10µF]
-               │     │
-              GND   GND
-
-    (33Ω burden only needed for SCT-013-000 100A variant)
-```
-
-The voltage divider (2× 10 kΩ) creates a stable 1.65 V DC bias. The SCT-013 AC output rides on top of this bias, allowing the ADC to sample the full AC waveform within the 0–3.3 V range.
-
----
-
-## 3. Temperature Monitoring (DS18B20)
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Sensor Type | DS18B20 waterproof probe | 1-Wire digital, ±0.5 °C accuracy |
-| T_in Bus | GPIO 4 | Inlet temperature, separate bus |
-| T_out Bus | GPIO 15 | Outlet temperature, separate bus |
-| Pull-up Resistor | 4.7 kΩ to 3.3 V | Required on each 1-Wire bus |
-| Temperature Range | −55 °C to +125 °C | Per DS18B20 datasheet |
-| Conversion Time | ~750 ms (12-bit, pipelined) | Read + request-next alternated |
-| CRC Validation | 8-bit CRC checked on every read | Invalid readings are discarded |
-
-### 3.1 Cooling Thresholds
-
-| Parameter | Value | Config Key |
-|-----------|-------|------------|
-| ΔT Low | 5 °C | `IDMS_DT_LOW_C` |
-| ΔT High | 15 °C | `IDMS_DT_HIGH_C` |
-| Fault Debounce | 5 s continuous | Hard-coded |
-
-ΔT = T_out − T_in. Values outside [5 °C, 15 °C] for ≥ 5 s trigger a cooling fault alert.
-
----
-
-## 4. Display (Topway HKT070DTA-1C)
-
-| Parameter | Specification |
-|-----------|---------------|
-| Display Module | Topway HKT070DTA-1C smart LCD |
-| Resolution | 800 × 480 px |
-| Interface | UART (TTL 3.3 V) |
-| Baud Rate | 115200 (8N1) |
-| TX Pin | GPIO 1 |
-| RX Pin | GPIO 3 |
-| RTS Pin | Not used (−1) |
-| Protocol | Topway DGUS-style: `AA [cmd] [3-byte-addr] [data] CC 33 C3 3C` |
-| Handshake | 5 retries at boot; non-fatal if display not connected |
-
-### 4.1 Topway VP Address Map
-
-| VP Address | Type | Content |
-|------------|------|---------|
-| 0x000000 | String | Current text ("--" if invalid) |
-| 0x000200 | String | Wi-Fi IP address |
-| 0x000280 | String | Firmware version |
-| 0x000300 | String | OTA status |
-| 0x000380 | String | ACTIVE / INACTIVE status |
-| 0x000500 | String | Diagnostic detail |
-| 0x000600 | String | ERROR status |
-| 0x000700 | String | WARNING status |
-| 0x080000 | N16 | Current × 10 (A × 10) |
-| 0x080002 | N16 | T_in × 10 (°C × 10) |
-| 0x080004 | N16 | T_out × 10 (°C × 10) |
-| 0x080006 | N16 | ΔT × 10 (signed, °C × 10) |
-| 0x080010–0x080020 | N16 | Valid flags and status indicators |
-
----
-
-## 5. GPIO Pin Mapping (ESP32-S3)
+## 2. GPIO Map
 
 | Signal | GPIO | Direction | Notes |
 |--------|------|-----------|-------|
-| Console TX | GPIO 44 | Output | USB-Serial (fixed) |
-| Console RX | GPIO 43 | Input | USB-Serial (fixed) |
-| Topway UART TX | GPIO 1 | Output | UART1 to LCD |
-| Topway UART RX | GPIO 3 | Input | UART1 from LCD |
-| DS18B20 T_in | GPIO 4 | Bidirectional | 1-Wire bus 0, 4.7 kΩ pull-up |
-| DS18B20 T_out | GPIO 15 | Bidirectional | 1-Wire bus 1, 4.7 kΩ pull-up |
-| SCT-013 ADC | GPIO 6 | Input (ADC) | ADC_UNIT_0 channel 5, bias circuit required |
-| Touch SCLK | GPIO 12 | Output | XPT2046 SPI clock |
-| Touch MOSI | GPIO 13 | Output | XPT2046 SPI data out |
-| Touch MISO | GPIO 16 | Input | XPT2046 SPI data in |
-| Touch CS | GPIO 11 | Output | XPT2046 chip select |
-| Touch IRQ | GPIO 14 | Input | XPT2046 pen-down interrupt |
+| Console UART TX | 44 | Output | USB serial console |
+| Console UART RX | 43 | Input | USB serial console |
+| Topway UART TX | 1 | Output | ESP32 to LCD |
+| Topway UART RX | 3 | Input | LCD to ESP32 |
+| SCT-013 ADC | 6 | Analog input | ADC unit 0, channel 5 |
+| DS18B20 T_in | 4 | Bidirectional | 1-Wire bus 0 |
+| DS18B20 T_out | 15 | Bidirectional | 1-Wire bus 1 |
+| Touch SCLK | 12 | Output | Optional/legacy |
+| Touch MOSI | 13 | Output | Optional/legacy |
+| Touch MISO | 16 | Input | Optional/legacy |
+| Touch CS | 11 | Output | Optional/legacy |
+| Touch IRQ | 14 | Input | Optional/legacy |
 
-> **Note:** All GPIO assignments (except console UART) are configurable via `idf.py menuconfig`.
+## 3. Current Sensor
 
----
+| Parameter | Current value |
+|-----------|---------------|
+| ADC pin | GPIO6 |
+| ADC bias expected | About 1.65 V at TP_ADC |
+| Bias circuit | 2 x 10 kOhm divider plus 10 uF capacitor |
+| Sampling | 512-sample RMS window |
+| Display smoothing | EMA filter |
+| Default scale | 30.00 A/V |
+| Scale storage | NVS `curr_cal`, fixed-point x100 |
+| Auto-zero samples | 512 |
+| Auto-zero guard | Skip RMS subtraction when no-load RMS is above 50 mV |
+| Power-loss threshold | NVS `power_ma`, default 350 mA |
+| Machine-running threshold | NVS `run_ma`, default 1000 mA |
 
-## 6. NVS Data Model
+### SCT Variants
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `tech_count` | uint8 | Number of registered technician IDs (0–5) |
-| `tech_id_0`…`tech_id_4` | string | Telegram Chat IDs |
-| `wifi_ssid` | string | Wi-Fi SSID (overrides Kconfig default) |
-| `wifi_password` | string | Wi-Fi password (overrides Kconfig default) |
-| `telegram_token` | string | Bot token (overrides Kconfig default) |
-| `ota_user` | string | OTA HTTP auth username |
-| `ota_password` | string | OTA HTTP auth password |
+| Sensor type | Hardware | Firmware calibration |
+|-------------|----------|----------------------|
+| SCT-013 30A/1V | Internal burden | `set_current_cal 30.00` |
+| SCT-013 100A/1V | Internal burden | `set_current_cal 100.00` |
+| SCT-013-000 100A/50mA | External burden required | Calibrate with known load |
 
----
+The CT wire polarity does not change RMS current magnitude. It only changes
+waveform phase, which this firmware does not use.
 
-## 7. Alert Message Definitions
+## 4. Temperature Sensors
 
-| Alert Type | Trigger | Example Message |
-|------------|---------|-----------------|
-| **Power Loss** | Current < 350 mA for ≥ 5 s | ⚠️ ALERT: Machine power loss detected. Current: 0.0A |
-| **Power Restored** | Current rises above threshold | ✅ Machine power has been RESTORED. |
-| **Cooling Failure (Low ΔT)** | ΔT < 5 °C for ≥ 5 s | ⚠️ ALERT: Cooling failure. ΔT = 2.3°C (below minimum). |
-| **Cooling Failure (High ΔT)** | ΔT > 15 °C for ≥ 5 s | ⚠️ ALERT: Thermal overload. ΔT = 18.7°C (above maximum). |
-| **Cooling Restored** | ΔT returns to normal | ✅ Cooling system has returned to NORMAL. |
+| Parameter | Current value |
+|-----------|---------------|
+| Sensor | DS18B20 waterproof probe |
+| T_in GPIO | GPIO4 |
+| T_out GPIO | GPIO15 |
+| Pull-up | 4.7 kOhm to 3.3 V on each bus |
+| Mode | Powered mode, not parasite power |
+| CRC | Checked on every scratchpad read |
+| Conversion | Pipelined read/request cycle |
 
----
+Delta T is calculated as:
 
-## 8. Status Indication on Display
+```text
+Delta T = T_out - T_in
+```
 
-| Condition | 0x000600 | 0x000700 | 0x000380 | 0x000500 |
-|-----------|----------|----------|----------|----------|
-| All OK, current ≥ 0.5 A | — | — | ACTIVE | OK |
-| Standby, current < 0.5 A | — | — | INACTIVE | Standby |
-| Current sensor disconnected | — | WARNING | — | Current Sensor |
-| Temp sensor invalid | — | WARNING | — | Temp Sensor |
-| Power loss | ERROR | — | — | Power Loss |
-| Cooling fault | ERROR | — | — | Cooling Fault |
-| Both faults | ERROR | — | — | Power + Cooling |
-| All sensors offline | ERROR | — | — | Sensors Offline |
+## 5. Fault Logic
 
----
+| Fault | Trigger | Restore |
+|-------|---------|---------|
+| Power loss | Current below `power_ma` for 5 seconds | Current rises above threshold |
+| Cooling low | Machine running and Delta T below `dt_alert` for 5 seconds | Delta T returns to allowed range |
+| Cooling high | Machine running and Delta T above `dt_high` for 5 seconds | Delta T returns to allowed range |
+| Current sensor | ADC missing, ADC read error, or bias outside range | Valid ADC readings return |
+| Temperature sensor | DS18B20 missing/CRC/read failures | Valid temperature readings return |
 
-## 9. Related Documents
+## 6. Runtime Thresholds
 
-| Document | Description |
-|----------|-------------|
-| [README.md](./README.md) | Project overview, pin map, console commands |
-| [PCB_Layout.md](./PCB_Layout.md) | PCB design, schematic, component placement |
-| [BOM.md](./BOM.md) | Bill of Materials |
-| [Project Definition.md](./Project%20Definition.md) | Project scope and objectives |
+| Name | Default | Storage | Console command |
+|------|---------|---------|-----------------|
+| Power-loss current | 0.350 A | `power_ma` | `set_power_threshold <A>` |
+| Machine-running current | 1.000 A | `run_ma` | `set_running_threshold <A>` |
+| Display current min | 1 A | `min_curr` | Topway config page |
+| Display current max | 20 A | `max_curr` | Topway config page |
+| T_in min | -10 C | `min_tin` | Topway config page |
+| T_in max | 0 C | `max_tin` | Topway config page |
+| T_out min | 0 C | `min_tout` | Topway config page |
+| T_out max | 55 C | `max_tout` | Topway config page |
+| Delta T low | 5 C | `dt_alert` | Topway config page |
+| Delta T high | 15 C | `dt_high` | `set_dt_high <C>` |
+
+## 7. Topway VP Map
+
+### Home/status values
+
+| VP | Type | Meaning |
+|----|------|---------|
+| `0x080000` | N16 | Current x10 |
+| `0x080002` | N16 | T_in x10 |
+| `0x080004` | N16 | T_out x10 |
+| `0x080006` | N16 | Delta T x10, signed |
+| `0x000380` | String | ACTIVE or INACTIVE |
+| `0x000600` | String | ERROR |
+| `0x000700` | String | WARNING |
+| `0x000500` | String | Diagnostic detail |
+
+### Settings page
+
+| VP | Type | Meaning |
+|----|------|---------|
+| `0x000400` | String | Wi-Fi status message |
+| `0x000900` | String | Wi-Fi SSID input |
+| `0x000080` | String | Wi-Fi password input |
+| `0x080020` | N16 | Wi-Fi connect button |
+
+### Configuration page
+
+| VP | Type | Meaning |
+|----|------|---------|
+| `0x080030` | N16 | T_in min |
+| `0x080036` | N16 | T_in max |
+| `0x080032` | N16 | T_out min |
+| `0x080038` | N16 | T_out max |
+| `0x080034` | N16 | Current min |
+| `0x08003A` | N16 | Current max |
+| `0x080024` | N16 | Delta T low threshold |
+| `0x08003C` | N16 | Apply button |
+
+### Info page
+
+| VP | Type | Meaning |
+|----|------|---------|
+| `0x000980` | String | Device model |
+| `0x000B00` | String | Serial number |
+| `0x000B80` | String | Manufacture date |
+| `0x000100` | String | Support email |
+| `0x000180` | String | Support phone |
+| `0x000280` | String | QR payload |
+
+Default QR payload: `@IDMS_USERBOT`.
+
+## 8. NVS Namespaces And Important Keys
+
+| Namespace | Keys |
+|-----------|------|
+| `idms` | technicians, thresholds, calibration, device info |
+| `secrets` | Wi-Fi, Telegram, OTA, cloud URL/token |
+| `telemetry` | weekly report state |
+| `cloud` | uploaded CSV offset |
+| `tg_bot` | Telegram update offset |
+
+Important keys:
+
+| Key | Meaning |
+|-----|---------|
+| `wifi_ssid`, `wifi_pass` | Wi-Fi credentials |
+| `tg_token` | Telegram bot token |
+| `ota_user`, `ota_pass` | OTA Basic Auth |
+| `cloud_url`, `cloud_token` | Cloud upload endpoint and token |
+| `tech_count`, `tech_id_0..4` | Telegram technicians |
+| `curr_cal` | Current calibration A/V x100 |
+| `power_ma` | Power-loss threshold in mA |
+| `run_ma` | Machine-running threshold in mA |
+| `qr_code` | Info page QR payload |
+
+Automatic NVS erase is disabled. If NVS cannot mount because of no free pages or
+version mismatch, the firmware returns an error instead of wiping provisioned
+data.
+
+## 9. OTA
+
+| Parameter | Value |
+|-----------|-------|
+| Server port | 8080 |
+| HTTPS | Enabled by default |
+| Auth methods | Basic Auth and short-lived token |
+| Upload form | Browser multipart upload |
+| Verification | `esp_ota_end`, optional client SHA256 header |
+| Rollback | Health validation before marking valid |
+| Health gate | Telemetry ready, UI ready, Telegram task created, sensors valid |
+
+## 10. Telemetry
+
+| Parameter | Value |
+|-----------|-------|
+| Local path | `/spiffs/telemetry.csv` |
+| Rotation | 512 KiB to `/spiffs/telemetry.old.csv` |
+| Sample period | 60 seconds |
+| Cloud upload interval | 300 seconds by default |
+| Cloud payload | JSON with CSV rows |
+| Weekly report | Monday 09:00 UTC if time is synced |
+
+## 11. Production Security
+
+Use `sdkconfig.defaults.production` as the release baseline.
+
+Required production controls:
+
+- `CONFIG_IDMS_PRODUCTION_BUILD=y`
+- `CONFIG_SECURE_BOOT=y`
+- `CONFIG_SECURE_FLASH_ENC_ENABLED=y`
+- `CONFIG_NVS_ENCRYPTION=y`
+- Empty compiled-in secrets
+- Runtime/manufacturing provisioning
+
+Secure boot and flash encryption are manufacturing steps. Test on sacrificial
+hardware before enabling irreversible eFuse settings on production units.

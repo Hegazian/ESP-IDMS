@@ -4,6 +4,13 @@
 **Date:** April 2026  
 **Target:** ESP32-S3 N16R8 + Topway HKT070DTA-1C
 
+> Current-state note, 2026-05-10:
+> This file is still a PCB/layout guidance document, not a fabricable PCB
+> package. Use `README.md`, `Specifications.md`, and `PROJECT_HANDOFF.md` for
+> the current firmware contract before updating the PCB. The next hardware
+> phase should produce real EDA files, Gerbers, assembly drawings, and a
+> manufacturing test procedure.
+
 ---
 
 ## 1. System Architecture
@@ -261,5 +268,8 @@ Left side (J1):                    Right side (J2):
 |----------|-------------|
 | [README.md](./README.md) | Project overview, pin map, console commands |
 | [Specifications.md](./Specifications.md) | Electrical specs, thresholds, GPIO mapping |
+| [PROJECT_HANDOFF.md](./PROJECT_HANDOFF.md) | Current handoff for next phase |
+| [CLOUD_SETUP.md](./CLOUD_SETUP.md) | Cloud telemetry setup |
+| [OTA_IMPLEMENTATION.md](./OTA_IMPLEMENTATION.md) | OTA behavior and validation |
 | [BOM.md](./BOM.md) | Bill of Materials |
 | [hardware/esp-idms.ato](./hardware/esp-idms.ato) | atopile schematic description |

@@ -1,91 +1,166 @@
-# Project Definition — ESP-IDMS
+﻿# Project Definition - ESP-IDMS
 
-**Document Version:** 2.0  
-**Date:** April 2026  
-**Status:** Active Development
+Document version: 3.0
+Last updated: 2026-05-10
+Status: Feature-complete firmware, entering production hardening and field validation
 
----
+## 1. Project Summary
 
-## 1. Project Overview
+ESP-IDMS is an ESP32-S3 based industrial monitoring device. It monitors machine
+power state through a current transformer, monitors cooling performance through
+two temperature probes, shows live values on a Topway smart LCD, sends Telegram
+alerts, supports OTA firmware updates, and stores/uploads telemetry for later
+analysis.
 
-ESP-IDMS (ESP-IDF Industrial Device Monitoring System) is firmware for ESP32-S3 that monitors industrial machine status through non-invasive current sensing (SCT-013) and cooling efficiency (DS18B20 ΔT), displays real-time data on a Topway HKT070DTA-1C smart LCD, and sends Telegram alerts when fault conditions are detected.
+The project is now ready to start a new phase:
 
-## 2. Objectives
+- Pilot deployment
+- Cloud dashboard/export work
+- Production security provisioning
+- PCB/enclosure finalization
+- Manufacturing test process
 
-1. **Current monitoring** — Detect machine power loss when AC current falls below a configurable threshold for 5+ seconds
-2. **Cooling monitoring** — Detect cooling system failure when ΔT (T_out − T_in) falls outside a configurable range for 5+ seconds
-3. **Remote alerts** — Send instant Telegram notifications to registered technicians on fault detection and restoration
-4. **Local display** — Show real-time current, temperatures, ΔT, status, and diagnostics on a 7-inch smart LCD
-5. **OTA updates** — Allow firmware updates over Wi-Fi via HTTP upload with rollback protection
-6. **NVS persistence** — Store Wi-Fi credentials, Telegram token, and technician IDs in non-volatile storage
+## 2. Primary Goals
 
-## 3. Design Philosophy
+1. Detect machine power loss from AC current.
+2. Detect cooling problems from `Delta T = T_out - T_in`.
+3. Show status locally on a 7-inch Topway LCD.
+4. Alert technicians through Telegram.
+5. Allow safe OTA updates with rollback.
+6. Persist configuration, credentials, calibration, and device info in NVS.
+7. Record telemetry locally and upload it to a cloud endpoint.
+8. Support production hardening with secure boot, flash encryption, and NVS
+   encryption.
 
-| Decision | Rationale |
-|----------|-----------|
-| Wi-Fi over GSM | Lower cost, higher bandwidth, existing infrastructure |
-| Telegram Bot API | No custom server required, end-to-end encryption, group notification |
-| DS18B20 1-Wire | Digital accuracy (±0.5 °C), single-wire interface, waterproof probes |
-| SCT-013 CT | Non-invasive, safe, split-core for easy installation |
-| Topway smart LCD | Built-in HMI controller, UART protocol, no SPI overhead on ESP32 |
-| NVS secrets | Avoids plaintext credentials in firmware binary |
-| Dual 1-Wire buses | Separate buses for T_in and T_out for reliability |
+## 3. Current Implemented Features
 
-## 4. Functional Modules
+| Area | Current implementation |
+|------|------------------------|
+| Current sensing | SCT-013 ADC RMS sampling, auto-zero guard, runtime calibration |
+| Temperature | DS18B20 T_in and T_out on separate 1-Wire buses |
+| Fault detection | Power-loss and cooling-fault state machines with debounce |
+| Sensor health | Startup preflight plus runtime recovery for current/temp faults |
+| Display | Topway Home, Settings, Configuration, and Info pages |
+| Config persistence | NVS storage for thresholds, device info, secrets, technicians |
+| Wi-Fi | STA mode, reconnect, SNTP |
+| Telegram | Bot menu, status, alerts, reminders, weekly report, OTA link |
+| OTA | HTTPS upload, Basic Auth/token, SHA256, rollback health validation |
+| Telemetry | SPIFFS CSV, weekly stats, cloud upload batching |
+| Cloud | Generic HTTPS POST with Bearer token |
+| Console | Runtime provisioning, diagnostics, calibration commands |
 
-| Module | Source Files | Description |
-|--------|-------------|-------------|
-| Monitor | `monitor/monitor.c` | Main 500 ms polling loop: ADC RMS current, DS18B20 temperature, fault detection |
-| DS18B20 | `drivers/ds18b20.c`, `drivers/onewire.c` | 1-Wire bus driver, temperature conversion with CRC validation |
-| Topway LCD | `drivers/topway_lcd.c` | UART protocol driver for Topway smart LCD |
-| UI | `ui/ui_topway.c` | Display update logic, status/diagnostic routing, VP address management |
-| Wi-Fi | `wifi/wifi_manager.c` | STA mode, auto-reconnect, IP acquisition |
-| Telegram | `telegram/tg_bot.c`, `tg_http.c`, `tg_send.c`, `tg_parse.c`, `tg_ui.c` | Bot polling, HTTPS client, message sending, JSON parsing |
-| Config Store | `core/config_store.c` | NVS secrets: Wi-Fi SSID/password, Telegram token, OTA credentials |
-| OTA | `ota/ota.c` | HTTP firmware upload server on port 8080, basic auth, SHA256 verification |
-| Console | `cli/serial_console.c` | Serial command interface for configuration and debugging |
+## 4. Key Architecture
 
-## 5. Alert Behavior
+```text
+Sensors -> monitor task -> metrics/state
+                    |-> Topway UI task
+                    |-> Telegram alerts
+                    |-> telemetry CSV
+                    |-> cloud sync task
 
-| Condition | Trigger | Action |
-|-----------|---------|--------|
-| Power loss | Current < threshold for ≥ 5 s | Telegram alert to all technicians |
-| Power restored | Current rises above threshold | Telegram restoration notice |
-| Cooling fault (low ΔT) | ΔT < 5 °C for ≥ 5 s | Telegram alert |
-| Cooling fault (high ΔT) | ΔT > 15 °C for ≥ 5 s | Telegram alert |
-| Cooling restored | ΔT returns to normal | Telegram restoration notice |
-| Wi-Fi outage | Connection lost | Local monitoring continues; alerts queued |
-| Wi-Fi restored | Connection re-established | Queued alerts sent |
+Serial console -> config_store -> NVS
+Topway settings -> config_store -> NVS
+OTA server -> new firmware -> health validation -> rollback or accept
+```
 
-## 6. Display Pages
+## 5. Source Modules
 
-The Topway HKT070DTA-1C display shows (Page 0):
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| App orchestration | `main/app_main.c` | Init order and OTA health validation |
+| Config store | `components/core/config_store.c` | NVS config, secrets, thresholds, device info |
+| Monitor | `components/monitor/monitor.c` | Sensor sampling, calibration, faults, metrics |
+| Topway driver | `components/drivers/topway_lcd.c` | UART protocol for smart LCD |
+| Topway UI | `components/ui/ui_topway.c` | Display updates, Wi-Fi/config/info page handling |
+| Wi-Fi | `components/wifi/wifi_manager.c` | STA connection and SNTP |
+| Telegram | `components/telegram/*` | Bot polling, HTTP, parsing, sending, menus |
+| OTA | `components/ota/ota.c` | Firmware upload server and rollback helpers |
+| Telemetry | `components/telemetry/telemetry.c` | CSV history and weekly statistics |
+| Cloud sync | `components/cloud_sync/cloud_sync.c` | HTTPS upload of pending CSV rows |
+| Console | `components/cli/serial_console.c` | Serial commands for provisioning and tests |
 
-- **Current (A)** — N16 value at VP 0x080000; text "--" at VP 0x000000 when invalid
-- **T_in (°C)** — N16 at VP 0x080002; valid flag at 0x080012
-- **T_out (°C)** — N16 at VP 0x080004; valid flag at 0x080014
-- **ΔT (°C)** — N16 at VP 0x080006 (signed); valid flag at 0x080016
-- **Wi-Fi IP** — String at VP 0x000200
-- **OTA status** — String at VP 0x000300
-- **Firmware version** — String at VP 0x000280
-- **Status** — ACTIVE/INACTIVE at VP 0x000380, ERROR at 0x000600, WARNING at 0x000700
-- **Diagnostic** — String at VP 0x000500
+## 6. Operational Behavior
 
-## 7. Out of Scope
+### Power Loss
 
-- Direct SCADA/Modbus integration (may be added later)
-- Local data logging / historical trends (SD card or flash)
-- Wi-Fi AP mode (STA only)
-- Bluetooth configuration
-- LCD touch input handling (display is output-only in current firmware)
+Power loss is detected when valid current stays below the NVS-backed
+`power_ma` threshold for at least 5 seconds. This threshold is separate from the
+display's min/max current limits.
 
----
+### Cooling Fault
 
-## Related Documents
+Cooling fault is checked only when the machine is considered running. The
+machine-running gate uses the NVS-backed `run_ma` threshold. Cooling is faulty
+when valid Delta T is below `dt_alert` or above `dt_high` for at least 5
+seconds.
 
-| Document | Description |
-|----------|-------------|
-| [README.md](./README.md) | Project overview, pin map, console commands |
-| [Specifications.md](./Specifications.md) | Electrical specs, thresholds, GPIO mapping |
-| [PCB_Layout.md](./PCB_Layout.md) | PCB design, schematic, component placement |
-| [BOM.md](./BOM.md) | Bill of Materials |
+### Sensor Faults
+
+Sensor preflight and runtime checks report current ADC/bias faults, T_in faults,
+T_out faults, and Delta T invalid state. Faults can recover automatically once
+readings become valid again.
+
+### Alerts
+
+Critical alerts are sent through Telegram. Ringing alerts are queued through a
+Telegram worker, reminders are protected by a mutex, and offline messages are
+kept for later flush when Wi-Fi returns.
+
+## 7. Production Security Model
+
+Development builds keep hardware security features off for convenience.
+Production builds must use:
+
+- `CONFIG_IDMS_PRODUCTION_BUILD=y`
+- `CONFIG_SECURE_BOOT=y`
+- `CONFIG_SECURE_FLASH_ENC_ENABLED=y`
+- `CONFIG_NVS_ENCRYPTION=y`
+
+The repository includes `sdkconfig.defaults.production` as the production
+baseline. Enabling these settings is part of manufacturing because secure boot
+and flash encryption can involve irreversible eFuse operations.
+
+## 8. Cloud Strategy
+
+The firmware uploads telemetry to a generic HTTPS endpoint. The recommended
+first cloud implementation is Cloudflare Worker + KV because it accepts the
+firmware's Bearer token flow without putting database credentials on the ESP32.
+
+Firebase is a useful next layer for dashboards, but direct Firebase REST writes
+from the device should be avoided unless a safe token issuing mechanism is
+designed.
+
+See [CLOUD_SETUP.md](./CLOUD_SETUP.md).
+
+## 9. Out Of Scope For This Phase
+
+- Full mobile app
+- Web dashboard charts
+- Factory provisioning GUI
+- Final certified PCB design
+- Modbus/SCADA integration
+- Cellular/GSM fallback
+- Multi-device fleet management UI
+
+These are good candidates for the next phase.
+
+## 10. Exit Criteria For Current Phase
+
+The current firmware phase is considered complete when:
+
+- Full firmware build passes.
+- Topway VP contract matches the HMI project.
+- Sensor preflight/recovery behavior is stable on real hardware.
+- OTA health validation works on a real OTA update.
+- Telegram alerts and technician setup work after NVS provisioning.
+- Cloud endpoint receives telemetry rows.
+- Documentation reflects the current state.
+
+## 11. Next Phase Entry Points
+
+For a new chat/session, start with:
+
+1. [PROJECT_HANDOFF.md](./PROJECT_HANDOFF.md)
+2. [README.md](./README.md)
+3. [Specifications.md](./Specifications.md)
+4. [CLOUD_SETUP.md](./CLOUD_SETUP.md)
