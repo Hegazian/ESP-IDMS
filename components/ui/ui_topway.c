@@ -34,7 +34,7 @@ static float s_last_current = -999.0f;
 static float s_last_tin = -999.0f;
 static float s_last_tout = -999.0f;
 static float s_last_dt = -999.0f;
-static const char *s_last_diag = "";
+static char s_last_diag[sizeof(((idms_metrics_t *)0)->sensor_status)] = "";
 static uint16_t s_last_apply_btn = 0;  /* Track apply button state */
 
 /* Runtime config values - can be modified via LCD */
@@ -437,7 +437,8 @@ static void update_display_values(void) {
   topway_str_write(VP_STR_DIAG, diag_str);
   if (strcmp(diag_str, s_last_diag) != 0) {
     ESP_LOGI(TAG, "Status=%s Diag=%s", status_str, diag_str);
-    s_last_diag = diag_str;
+    strncpy(s_last_diag, diag_str, sizeof(s_last_diag) - 1);
+    s_last_diag[sizeof(s_last_diag) - 1] = '\0';
   }
 }
 

@@ -71,11 +71,12 @@ menu "ESP-IDMS Configuration"
             Optional default technician chat ID. If empty, add technicians via serial console or Telegram.
 
     config IDMS_TELEGRAM_ALLOW_FIRST_USER_CLAIM
-        bool "Allow first Telegram user to self-register"
+        bool "Deprecated: allow first Telegram user to self-register"
         default n
         help
-            Development convenience only. When disabled, technicians must be
-            provisioned from the serial console or manufacturing NVS data.
+            Deprecated and ignored. Telegram onboarding now uses the shared
+            admin name/password stored in NVS; successful logins are saved as
+            technician IDs.
 
     config IDMS_CURRENT_THRESHOLD_MA
         int "RMS current below this = machine off (milliamps)"

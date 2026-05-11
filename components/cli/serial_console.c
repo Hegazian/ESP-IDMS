@@ -35,73 +35,52 @@ static void handle_cmd(const char *cmd)
 
     if (strncmp(cmd, "add ", 4) == 0) {
         const char *id_str = cmd + 4;
-        esp_err_t err = config_add_tech_id(id_str);
+        char id[64] = {0};
+        char name[CONFIG_TECH_NAME_MAX_LEN + 1] = {0};
+        int consumed = 0;
+        if (sscanf(id_str, "%63s%n", id, &consumed) != 1) {
+            ESP_LOGW(TAG, "Usage: add <chat_id> [name]");
+            return;
+        }
+        const char *name_arg = id_str + consumed;
+        while (*name_arg && isspace((unsigned char)*name_arg)) {
+            name_arg++;
+        }
+        if (*name_arg) {
+            strncpy(name, name_arg, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+        esp_err_t err = config_add_tech(id, name);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Added technician ID: %s (count: %u)", id_str, config_get_tech_count());
+            ESP_LOGI(TAG, "Added technician ID: %s%s%s (count: %u)",
+                     id, name[0] ? " name=" : "", name[0] ? name : "", config_get_tech_count());
         } else {
-            ESP_LOGW(TAG, "Failed to add: %s (err=%s)", id_str, esp_err_to_name(err));
+            ESP_LOGW(TAG, "Failed to add: %s (err=%s)", id, esp_err_to_name(err));
         }
     } else if (strcmp(cmd, "list") == 0) {
         uint8_t count = config_get_tech_count();
-        ESP_LOGI(TAG, "Technician IDs (%u/5):", count);
+        ESP_LOGI(TAG, "Technician IDs (%u/%d):", count, CONFIG_TECH_MAX_COUNT);
         for (int i = 0; i < count; i++) {
             char id[64];
+            char name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
             if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
-                ESP_LOGI(TAG, "  [%d] %s", i, id);
+                config_get_tech_name(i, name, sizeof(name));
+                ESP_LOGI(TAG, "  [%d] %s%s%s", i,
+                         name[0] ? name : "", name[0] ? " " : "", id);
             }
         }
     } else if (strncmp(cmd, "remove ", 7) == 0) {
         int idx = atoi(cmd + 7);
-        if (idx < 0 || idx >= 5) {
-            ESP_LOGW(TAG, "Invalid index: %d (must be 0-4)", idx);
+        if (idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
+            ESP_LOGW(TAG, "Invalid index: %d (must be 0-%d)", idx, CONFIG_TECH_MAX_COUNT - 1);
             return;
         }
-        /* Shift remaining IDs down */
-        uint8_t count = config_get_tech_count();
-        if (idx >= count) {
-            ESP_LOGW(TAG, "Index %d out of range (count=%u)", idx, count);
-            return;
-        }
-        /* Remove: shift IDs above idx down by one */
-        nvs_handle_t h;
-        if (nvs_open("idms", NVS_READWRITE, &h) != ESP_OK) {
-            ESP_LOGE(TAG, "NVS open failed");
-            return;
-        }
-        for (int i = idx; i < count - 1; i++) {
-            char src_key[16], dst_key[16];
-            snprintf(src_key, sizeof(src_key), "tech_id_%d", i + 1);
-            snprintf(dst_key, sizeof(dst_key), "tech_id_%d", i);
-            char val[64];
-            size_t len = sizeof(val);
-            if (nvs_get_str(h, src_key, val, &len) == ESP_OK) {
-                nvs_set_str(h, dst_key, val);
-            }
-        }
-        /* Delete the last key */
-        char last_key[16];
-        snprintf(last_key, sizeof(last_key), "tech_id_%d", count - 1);
-        nvs_erase_key(h, last_key);
-        nvs_set_u8(h, "tech_count", count - 1);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI(TAG, "Removed index %d (count now %u)", idx, count - 1);
+        esp_err_t err = config_remove_tech(idx);
+        ESP_LOGI(TAG, "Remove index %d: %s (count now %u)",
+                 idx, esp_err_to_name(err), config_get_tech_count());
     } else if (strcmp(cmd, "clear") == 0) {
-        nvs_handle_t h;
-        if (nvs_open("idms", NVS_READWRITE, &h) != ESP_OK) {
-            ESP_LOGE(TAG, "NVS open failed");
-            return;
-        }
-        uint8_t count = config_get_tech_count();
-        for (int i = 0; i < count; i++) {
-            char key[16];
-            snprintf(key, sizeof(key), "tech_id_%d", i);
-            nvs_erase_key(h, key);
-        }
-        nvs_set_u8(h, "tech_count", 0);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI(TAG, "Cleared all technician IDs");
+        esp_err_t err = config_clear_techs();
+        ESP_LOGI(TAG, "Cleared all technician IDs: %s", esp_err_to_name(err));
     } else if (strcmp(cmd, "status") == 0) {
         idms_metrics_t m;
         monitor_get_metrics(&m);
@@ -162,6 +141,22 @@ static void handle_cmd(const char *cmd)
             ESP_LOGW(TAG, "Telegram token: %s (%zu chars — TOO SHORT, expected ~45)", tok, tlen);
         } else {
             ESP_LOGI(TAG, "Telegram token: %.5s...%s (%zu chars)", tok, &tok[tlen-3], tlen);
+        }
+    } else if (strncmp(cmd, "set_bot_admin ", 14) == 0) {
+        const char *val = cmd + 14;
+        if (strlen(val) < 1 || strlen(val) > CONFIG_TECH_NAME_MAX_LEN) {
+            ESP_LOGW(TAG, "Bot admin name must be 1-%d characters", CONFIG_TECH_NAME_MAX_LEN);
+        } else {
+            esp_err_t err = config_set_telegram_admin_name(val);
+            ESP_LOGI(TAG, "Set Telegram bot admin name: %s (%s)", val, esp_err_to_name(err));
+        }
+    } else if (strncmp(cmd, "set_bot_password ", 17) == 0) {
+        const char *val = cmd + 17;
+        if (strlen(val) < 6 || strlen(val) > CONFIG_TECH_PASSWORD_MAX_LEN) {
+            ESP_LOGW(TAG, "Bot password must be 6-%d characters", CONFIG_TECH_PASSWORD_MAX_LEN);
+        } else {
+            esp_err_t err = config_set_telegram_admin_password(val);
+            ESP_LOGI(TAG, "Set Telegram bot password: **** (%s)", esp_err_to_name(err));
         }
     } else if (strncmp(cmd, "set_ota_user ", 13) == 0) {
         const char *val = cmd + 13;
@@ -228,14 +223,17 @@ static void handle_cmd(const char *cmd)
                      (double)ma / 1000.0, esp_err_to_name(err));
         }
     } else if (strcmp(cmd, "show_secrets") == 0) {
-        char ssid[64], ota_user[64], cloud_url[256], cloud_token[128];
+        char ssid[64], ota_user[64], cloud_url[256], cloud_token[128], bot_admin[CONFIG_TECH_NAME_MAX_LEN + 1];
         config_get_wifi_ssid(ssid, sizeof(ssid));
         config_get_ota_user(ota_user, sizeof(ota_user));
         config_get_cloud_url(cloud_url, sizeof(cloud_url));
         config_get_cloud_token(cloud_token, sizeof(cloud_token));
+        config_get_telegram_admin_name(bot_admin, sizeof(bot_admin));
         ESP_LOGI(TAG, "Wi-Fi SSID:     %s", ssid[0] ? ssid : "(not set)");
         ESP_LOGI(TAG, "Wi-Fi password: ****");
         ESP_LOGI(TAG, "Telegram token: ****");
+        ESP_LOGI(TAG, "Bot admin name: %s", bot_admin[0] ? bot_admin : "(not set)");
+        ESP_LOGI(TAG, "Bot password:   %s", config_has_telegram_admin_password() ? "****" : "(not set)");
         ESP_LOGI(TAG, "OTA user:       %s", ota_user[0] ? ota_user : "(not set)");
         ESP_LOGI(TAG, "OTA password:   ****");
         ESP_LOGI(TAG, "Cloud URL:      %s", cloud_url[0] ? cloud_url : "(not set)");
@@ -343,15 +341,17 @@ static void handle_cmd(const char *cmd)
 #endif
     } else if (strcmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
-        ESP_LOGI(TAG, "  add <chat_id>    — Add technician ID to NVS");
-        ESP_LOGI(TAG, "  list             — List registered IDs");
-        ESP_LOGI(TAG, "  remove <index>   — Remove ID by index (0-4)");
+        ESP_LOGI(TAG, "  add <chat_id> [name] - Add authorized technician ID");
+        ESP_LOGI(TAG, "  list             - List registered IDs");
+        ESP_LOGI(TAG, "  remove <index>   - Remove ID by index (0-%d)", CONFIG_TECH_MAX_COUNT - 1);
         ESP_LOGI(TAG, "  clear            — Remove all IDs");
         ESP_LOGI(TAG, "  status           — Show device status");
         ESP_LOGI(TAG, "  set_ssid <ssid>  — Set Wi-Fi SSID (NVS)");
         ESP_LOGI(TAG, "  set_pass <pass>  — Set Wi-Fi password (NVS)");
         ESP_LOGI(TAG, "  set_token <tok>  — Set Telegram bot token (format: 1234567890:AAHxxxxx)");
         ESP_LOGI(TAG, "  show_token       — Show current token (first/last chars only)");
+        ESP_LOGI(TAG, "  set_bot_admin <name> - Set shared Telegram login admin name");
+        ESP_LOGI(TAG, "  set_bot_password <p> - Set shared Telegram login password");
         ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
         ESP_LOGI(TAG, "  set_ota_pass <p> — Set OTA HTTP password (NVS)");
         ESP_LOGI(TAG, "  set_cloud_url <url> — Set telemetry upload endpoint (NVS)");

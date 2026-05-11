@@ -5,12 +5,22 @@
 #include <stdint.h>
 #include "esp_err.h"
 
+#define CONFIG_TECH_MAX_COUNT        5
+#define CONFIG_TECH_NAME_MAX_LEN     32
+#define CONFIG_TECH_PASSWORD_MAX_LEN 64
+
 esp_err_t config_store_init(void);
 
 uint8_t config_get_tech_count(void);
 esp_err_t config_get_tech_id(int idx, char *out, size_t out_len);
 esp_err_t config_set_tech_id(int idx, const char *id);
 esp_err_t config_add_tech_id(const char *id);
+esp_err_t config_find_tech_id(const char *id, int *idx_out);
+esp_err_t config_get_tech_name(int idx, char *out, size_t out_len);
+esp_err_t config_set_tech_name(int idx, const char *name);
+esp_err_t config_add_tech(const char *id, const char *name);
+esp_err_t config_remove_tech(int idx);
+esp_err_t config_clear_techs(void);
 
 /**
  * Secrets stored in NVS namespace "secrets".
@@ -23,6 +33,12 @@ esp_err_t config_get_wifi_password(char *out, size_t out_len);
 esp_err_t config_set_wifi_password(const char *password);
 esp_err_t config_get_telegram_token(char *out, size_t out_len);
 esp_err_t config_set_telegram_token(const char *token);
+esp_err_t config_get_telegram_admin_name(char *out, size_t out_len);
+esp_err_t config_set_telegram_admin_name(const char *name);
+bool config_has_telegram_admin_password(void);
+bool config_has_telegram_admin_credentials(void);
+esp_err_t config_set_telegram_admin_password(const char *password);
+esp_err_t config_check_telegram_admin_credentials(const char *name, const char *password, bool *match);
 esp_err_t config_get_ota_user(char *out, size_t out_len);
 esp_err_t config_set_ota_user(const char *user);
 esp_err_t config_get_ota_pass(char *out, size_t out_len);

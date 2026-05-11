@@ -10,6 +10,7 @@ typedef struct {
     bool is_callback;
     char from_id[32];
     char chat_id[32];
+    char chat_type[16];
     char message_text[512];
     char callback_id[64];
     char callback_data[64];

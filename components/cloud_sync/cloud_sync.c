@@ -233,6 +233,10 @@ static esp_err_t upload_pending_rows(void)
 {
     char url[CLOUD_URL_MAX] = {0};
     char token[CLOUD_TOKEN_MAX] = {0};
+    char *payload = NULL;
+    FILE *f = NULL;
+    esp_err_t result = ESP_OK;
+    bool csv_locked = false;
 
     ESP_RETURN_ON_ERROR(config_get_cloud_url(url, sizeof(url)), TAG, "get cloud url");
     if (url[0] == '\0') {
@@ -252,21 +256,29 @@ static esp_err_t upload_pending_rows(void)
 
     config_get_cloud_token(token, sizeof(token));
 
+    result = telemetry_csv_lock(15000);
+    if (result != ESP_OK) {
+        return result;
+    }
+    csv_locked = true;
+
     struct stat st;
     const char *path = telemetry_csv_path();
     if (stat(path, &st) != 0 || st.st_size <= 0) {
-        return ESP_ERR_NOT_FOUND;
+        result = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
 
-    FILE *f = fopen(path, "r");
+    f = fopen(path, "r");
     if (!f) {
-        return ESP_FAIL;
+        result = ESP_FAIL;
+        goto cleanup;
     }
 
     uint64_t offset = load_csv_offset();
     if (offset == (uint64_t)st.st_size) {
-        fclose(f);
-        return ESP_ERR_NOT_FOUND;
+        result = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
     if (offset == 0 || offset > (uint64_t)st.st_size) {
         offset = skip_header(f);
@@ -275,34 +287,43 @@ static esp_err_t upload_pending_rows(void)
         fseek(f, (long)offset, SEEK_SET);
     }
 
-    char *payload = calloc(1, CLOUD_PAYLOAD_MAX);
+    payload = calloc(1, CLOUD_PAYLOAD_MAX);
     if (!payload) {
-        fclose(f);
-        return ESP_ERR_NO_MEM;
+        result = ESP_ERR_NO_MEM;
+        goto cleanup;
     }
 
     int rows = 0;
     uint64_t new_offset = offset;
     bool built = build_payload(f, payload, CLOUD_PAYLOAD_MAX, &rows, &new_offset);
     fclose(f);
+    f = NULL;
 
     if (!built) {
-        free(payload);
-        return ESP_ERR_NO_MEM;
+        result = ESP_ERR_NO_MEM;
+        goto cleanup;
     }
     if (rows == 0) {
-        free(payload);
-        return ESP_ERR_NOT_FOUND;
+        result = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
 
-    esp_err_t err = post_payload(url, token, payload);
-    free(payload);
-    if (err == ESP_OK) {
+    result = post_payload(url, token, payload);
+    if (result == ESP_OK) {
         save_csv_offset(new_offset);
         ESP_LOGI(TAG, "Uploaded %d telemetry row(s), csv_offset=%llu",
                  rows, (unsigned long long)new_offset);
     }
-    return err;
+
+cleanup:
+    if (f) {
+        fclose(f);
+    }
+    free(payload);
+    if (csv_locked) {
+        telemetry_csv_unlock();
+    }
+    return result;
 }
 
 esp_err_t cloud_sync_init(void)

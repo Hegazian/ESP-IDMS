@@ -7,7 +7,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "tg_send";
@@ -19,6 +18,7 @@ static const char *TAG = "tg_send";
 #define RING_MAX_REMINDERS      3
 #define MAX_RING_REMINDERS      8
 #define MAX_TG_WORK_QUEUE       8
+#define TG_BODY_BUF_SZ          3584
 
 typedef struct {
     char chat_id[32];
@@ -105,15 +105,15 @@ esp_err_t tg_send_kb(const char *chat_id, const char *text, const char *kb)
     snprintf(reply_markup, sizeof(reply_markup), "{\"inline_keyboard\":%s}", kb);
     char rm_enc[1024]; rm_enc[0] = '\0';
     tg_urlenc_append(rm_enc, sizeof(rm_enc), reply_markup);
-    int body_sz = 128 + (int)strlen(chat_id) + (int)strlen(enc) + (int)strlen(rm_enc);
-    char *body = malloc(body_sz);
-    if (!body) return ESP_ERR_NO_MEM;
-    snprintf(body, body_sz,
-             "chat_id=%s&parse_mode=HTML&text=%s&reply_markup=%s",
-             chat_id, enc, rm_enc);
-    esp_err_t ret = tg_http_post_form("/sendMessage", body);
-    free(body);
-    return ret;
+    char body[TG_BODY_BUF_SZ];
+    int needed = snprintf(body, sizeof(body),
+                          "chat_id=%s&parse_mode=HTML&text=%s&reply_markup=%s",
+                          chat_id, enc, rm_enc);
+    if (needed < 0 || needed >= (int)sizeof(body)) {
+        ESP_LOGW(TAG, "Telegram keyboard message too large");
+        return ESP_ERR_NO_MEM;
+    }
+    return tg_http_post_form("/sendMessage", body);
 }
 
 esp_err_t tg_answer_cb(const char *cb_id)
@@ -223,13 +223,6 @@ static void remember_ring_alert(const char *chat_id, const char *alert_text)
     xSemaphoreGive(s_remind_mux);
 }
 
-static void note_send_error(esp_err_t err, esp_err_t *first_err)
-{
-    if (err != ESP_OK && first_err && *first_err == ESP_OK) {
-        *first_err = err;
-    }
-}
-
 esp_err_t tg_send_ring_alert(const char *chat_id, const char *alert_text)
 {
     if (!chat_id || !alert_text) return ESP_ERR_INVALID_ARG;
@@ -238,46 +231,18 @@ esp_err_t tg_send_ring_alert(const char *chat_id, const char *alert_text)
         return ESP_OK;
     }
 
-    esp_err_t first_err = ESP_OK;
-
-    const char *burst1[] = {
-        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
-        "\xf0\x9f\x94\x94 <b>INCOMING ALERT</b> \xf0\x9f\x94\x94",
-        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
-        "\xf0\x9f\x94\x94 <b>INCOMING ALERT</b> \xf0\x9f\x94\x94",
-        "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
-    };
-    for (int i = 0; i < 5; i++) {
-        note_send_error(tg_send_text(chat_id, burst1[i]), &first_err);
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(800));
-
-    const char *burst2[] = {
-        "\xf0\x9f\x9a\xa8 <b>FAULT DETECTED</b> \xf0\x9f\x9a\xa8",
-        "\xe2\x9a\xa0\xef\xb8\x8f <b>DEVICE ALERT</b> \xe2\x9a\xa0\xef\xb8\x8f",
-        "\xf0\x9f\x9a\xa8 <b>FAULT DETECTED</b> \xf0\x9f\x9a\xa8",
-        "\xe2\x9a\xa0\xef\xb8\x8f <b>DEVICE ALERT</b> \xe2\x9a\xa0\xef\xb8\x8f",
-    };
-    for (int i = 0; i < 4; i++) {
-        note_send_error(tg_send_text(chat_id, burst2[i]), &first_err);
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(600));
-
-    note_send_error(tg_send_text_ext(chat_id, alert_text, true), &first_err);
-
-    vTaskDelay(pdMS_TO_TICKS(400));
-
-    note_send_error(tg_send_text(chat_id, "\xf0\x9f\x94\xb4 <b>ALERT ACTIVE</b> \xf0\x9f\x94\xb4\nThis alert will repeat until acknowledged."), &first_err);
-
-    if (first_err == ESP_OK) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "\xf0\x9f\x9a\xa8 <b>DEVICE ALERT</b>\n\n"
+             "%s\n\n"
+             "<i>Send /status to check. Reminders repeat until acknowledged.</i>",
+             alert_text);
+    esp_err_t err = tg_send_text_ext(chat_id, msg, true);
+    if (err == ESP_OK) {
         remember_ring_alert(chat_id, alert_text);
     }
 
-    return first_err;
+    return err;
 }
 
 esp_err_t tg_enqueue_ring_alert(const char *chat_id, const char *alert_text)
@@ -329,24 +294,13 @@ void tg_send_process_reminders(void)
         ESP_LOGI(TAG, "Alert reminder %d/%d for %s",
                  due[i].reminders_sent, RING_MAX_REMINDERS, due[i].chat_id);
 
-        const char *remind_burst[] = {
-            "\xf0\x9f\x93\xb2 \xf0\x9f\x94\xb4 <b>ALERT STILL ACTIVE</b> \xf0\x9f\x94\xb4 \xf0\x9f\x93\xb2",
-            "\xf0\x9f\x9a\xa8 <b>UNACKNOWLEDGED ALERT</b> \xf0\x9f\x9a\xa8",
-            "\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e\xf0\x9f\x93\x9e",
-        };
-        for (int j = 0; j < 3; j++) {
-            tg_send_text(due[i].chat_id, remind_burst[j]);
-            vTaskDelay(pdMS_TO_TICKS(200));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-        tg_send_text_ext(due[i].chat_id, due[i].text, true);
-
-        char footer[128];
-        snprintf(footer, sizeof(footer),
-                 "\n\xf0\x9f\x94\x81 Reminder %d of %d. Send /status to check.",
-                 due[i].reminders_sent, RING_MAX_REMINDERS);
-        tg_send_text(due[i].chat_id, footer);
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "\xf0\x9f\x94\x81 <b>Alert reminder %d/%d</b>\n\n"
+                 "%s\n\n"
+                 "<i>Send /status to check.</i>",
+                 due[i].reminders_sent, RING_MAX_REMINDERS, due[i].text);
+        tg_send_text_ext(due[i].chat_id, msg, true);
     }
 }
 

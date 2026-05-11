@@ -3,12 +3,147 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_random.h"
 #include "sdkconfig.h"
+#include "mbedtls/sha256.h"
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "cfg";
 static const char *NS = "idms";
+static const char *SECRETS_NS = "secrets";
+
+#define TECH_ID_MAX_LEN        63
+#define TECH_PASSWORD_MIN_LEN  6
+#define TECH_SALT_HEX_LEN      32
+#define TECH_HASH_HEX_LEN      64
+
+static void hex_encode(const uint8_t *src, size_t src_len, char *dst, size_t dst_len)
+{
+    static const char hex[] = "0123456789abcdef";
+    if (!dst || dst_len < (src_len * 2 + 1)) {
+        return;
+    }
+    for (size_t i = 0; i < src_len; i++) {
+        dst[i * 2] = hex[(src[i] >> 4) & 0x0f];
+        dst[i * 2 + 1] = hex[src[i] & 0x0f];
+    }
+    dst[src_len * 2] = '\0';
+}
+
+static void random_hex(char *out, size_t out_len, size_t random_bytes)
+{
+    uint8_t bytes[32];
+    if (!out || out_len < random_bytes * 2 + 1 || random_bytes > sizeof(bytes)) {
+        return;
+    }
+    for (size_t i = 0; i < random_bytes; i += 4) {
+        uint32_t r = esp_random();
+        size_t left = random_bytes - i;
+        size_t chunk = left < sizeof(r) ? left : sizeof(r);
+        memcpy(bytes + i, &r, chunk);
+    }
+    hex_encode(bytes, random_bytes, out, out_len);
+}
+
+static bool valid_tech_name(const char *name)
+{
+    if (!name) {
+        return true;
+    }
+    size_t len = strlen(name);
+    if (len > CONFIG_TECH_NAME_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool valid_password(const char *password)
+{
+    if (!password) {
+        return false;
+    }
+    size_t len = strlen(password);
+    return len >= TECH_PASSWORD_MIN_LEN && len <= CONFIG_TECH_PASSWORD_MAX_LEN;
+}
+
+static void tech_key(char *out, size_t out_len, const char *prefix, int idx)
+{
+    snprintf(out, out_len, "%s_%d", prefix, idx);
+}
+
+static esp_err_t password_hash_hex(const char *salt_hex, const char *password,
+                                   char *hash_hex, size_t hash_hex_len)
+{
+    if (!salt_hex || !password || !hash_hex || hash_hex_len < TECH_HASH_HEX_LEN + 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    unsigned char hash[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, (const unsigned char *)salt_hex, strlen(salt_hex));
+    mbedtls_sha256_update(&ctx, (const unsigned char *)":", 1);
+    mbedtls_sha256_update(&ctx, (const unsigned char *)password, strlen(password));
+    mbedtls_sha256_finish(&ctx, hash);
+    mbedtls_sha256_free(&ctx);
+
+    hex_encode(hash, sizeof(hash), hash_hex, hash_hex_len);
+    return ESP_OK;
+}
+
+static bool ct_equal_hex(const char *a, const char *b, size_t len)
+{
+    if (!a || !b) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < len; i++) {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+static void erase_tech_slot(nvs_handle_t h, int idx)
+{
+    char key[20];
+    tech_key(key, sizeof(key), "tech_id", idx);
+    nvs_erase_key(h, key);
+    tech_key(key, sizeof(key), "tech_name", idx);
+    nvs_erase_key(h, key);
+    tech_key(key, sizeof(key), "tech_salt", idx);
+    nvs_erase_key(h, key);
+    tech_key(key, sizeof(key), "tech_pwd", idx);
+    nvs_erase_key(h, key);
+}
+
+static void move_str_key(nvs_handle_t h, const char *prefix, int dst_idx, int src_idx, size_t buf_len)
+{
+    char src_key[20];
+    char dst_key[20];
+    char val[96];
+    if (buf_len > sizeof(val)) {
+        buf_len = sizeof(val);
+    }
+    tech_key(src_key, sizeof(src_key), prefix, src_idx);
+    tech_key(dst_key, sizeof(dst_key), prefix, dst_idx);
+    size_t len = buf_len;
+    if (nvs_get_str(h, src_key, val, &len) == ESP_OK) {
+        nvs_set_str(h, dst_key, val);
+    } else {
+        nvs_erase_key(h, dst_key);
+    }
+}
 
 static void copy_str_or_empty(char *out, size_t out_len, const char *value)
 {
@@ -187,7 +322,7 @@ uint8_t config_get_tech_count(void)
     if (err != ESP_OK) {
         return 0;
     }
-    if (count > 5) {
+    if (count > CONFIG_TECH_MAX_COUNT) {
         return 0;
     }
     return count;
@@ -195,11 +330,11 @@ uint8_t config_get_tech_count(void)
 
 esp_err_t config_get_tech_id(int idx, char *out, size_t out_len)
 {
-    if (!out || out_len == 0 || idx < 0 || idx >= 5) {
+    if (!out || out_len == 0 || idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
     char key[16];
-    snprintf(key, sizeof(key), "tech_id_%d", idx);
+    tech_key(key, sizeof(key), "tech_id", idx);
 
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READONLY, &h), TAG, "open");
@@ -212,11 +347,11 @@ esp_err_t config_get_tech_id(int idx, char *out, size_t out_len)
 
 esp_err_t config_set_tech_id(int idx, const char *id)
 {
-    if (!id || idx < 0 || idx >= 5) {
+    if (!id || idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
     char key[16];
-    snprintf(key, sizeof(key), "tech_id_%d", idx);
+    tech_key(key, sizeof(key), "tech_id", idx);
 
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
@@ -229,46 +364,171 @@ esp_err_t config_set_tech_id(int idx, const char *id)
     return err;
 }
 
-esp_err_t config_add_tech_id(const char *id)
+esp_err_t config_find_tech_id(const char *id, int *idx_out)
 {
     if (!id || id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t count = config_get_tech_count();
+    for (int i = 0; i < count; i++) {
+        char existing[64];
+        if (config_get_tech_id(i, existing, sizeof(existing)) == ESP_OK &&
+            strcmp(existing, id) == 0) {
+            if (idx_out) {
+                *idx_out = i;
+            }
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t config_get_tech_name(int idx, char *out, size_t out_len)
+{
+    if (!out || out_len == 0 || idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_name", idx);
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READONLY, &h), TAG, "open");
+
+    size_t required = out_len;
+    esp_err_t err = nvs_get_str(h, key, out, &required);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        out[0] = '\0';
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t config_set_tech_name(int idx, const char *name)
+{
+    if (idx < 0 || idx >= CONFIG_TECH_MAX_COUNT || !valid_tech_name(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_name", idx);
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+
+    esp_err_t err;
+    if (name && name[0] != '\0') {
+        err = nvs_set_str(h, key, name);
+    } else {
+        err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_add_tech(const char *id, const char *name)
+{
+    if (!id || id[0] == '\0' || !valid_tech_name(name)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     /* Validate ID length to prevent buffer overflow */
     size_t id_len = strlen(id);
-    if (id_len < 3 || id_len >= 60) {
+    if (id_len < 3 || id_len > TECH_ID_MAX_LEN) {
         ESP_LOGE(TAG, "Invalid technician ID length: %zu (must be 3-59 chars)", id_len);
         return ESP_ERR_INVALID_SIZE;
     }
 
     uint8_t count = config_get_tech_count();
-    if (count >= 5) {
-        ESP_LOGW(TAG, "Maximum technician IDs (5) reached");
-        return ESP_ERR_NO_MEM;
-    }
 
     /* Check for duplicates */
     for (int i = 0; i < count; i++) {
         char existing[64];
         if (config_get_tech_id(i, existing, sizeof(existing)) == ESP_OK && strcmp(existing, id) == 0) {
             ESP_LOGI(TAG, "Technician ID already exists: %s", id);
+            if (name && name[0] != '\0') {
+                ESP_RETURN_ON_ERROR(config_set_tech_name(i, name), TAG, "set name");
+            }
             return ESP_OK;
         }
     }
 
-    ESP_RETURN_ON_ERROR(config_set_tech_id((int)count, id), TAG, "set");
-    count++;
+    if (count >= CONFIG_TECH_MAX_COUNT) {
+        ESP_LOGW(TAG, "Maximum technician IDs (%d) reached", CONFIG_TECH_MAX_COUNT);
+        return ESP_ERR_NO_MEM;
+    }
+
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
-    esp_err_t err = nvs_set_u8(h, "tech_count", count);
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_id", count);
+    esp_err_t err = nvs_set_str(h, key, id);
+    if (err == ESP_OK && name && name[0] != '\0') {
+        tech_key(key, sizeof(key), "tech_name", count);
+        err = nvs_set_str(h, key, name);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "tech_count", count + 1);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
     nvs_close(h);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Added technician ID: %s (count: %u)", id, count);
+        ESP_LOGI(TAG, "Added technician ID: %s (count: %u)", id, count + 1);
     }
+    return err;
+}
+
+esp_err_t config_add_tech_id(const char *id)
+{
+    return config_add_tech(id, "");
+}
+
+esp_err_t config_remove_tech(int idx)
+{
+    uint8_t count = config_get_tech_count();
+    if (idx < 0 || idx >= count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+
+    for (int i = idx; i < count - 1; i++) {
+        move_str_key(h, "tech_id", i, i + 1, TECH_ID_MAX_LEN + 1);
+        move_str_key(h, "tech_name", i, i + 1, CONFIG_TECH_NAME_MAX_LEN + 1);
+    }
+    erase_tech_slot(h, count - 1);
+    esp_err_t err = nvs_set_u8(h, "tech_count", count - 1);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_clear_techs(void)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    for (int i = 0; i < CONFIG_TECH_MAX_COUNT; i++) {
+        erase_tech_slot(h, i);
+    }
+    esp_err_t err = nvs_set_u8(h, "tech_count", 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
     return err;
 }
 
@@ -276,8 +536,6 @@ esp_err_t config_add_tech_id(const char *id)
 /*  Secrets: Wi-Fi & Telegram credentials stored in NVS "secrets" NS   */
 /*  Falls back to Kconfig defaults if not set in NVS.                  */
 /* ------------------------------------------------------------------ */
-
-static const char *SECRETS_NS = "secrets";
 
 static esp_err_t secrets_get(const char *key, const char *fallback, char *out, size_t out_len)
 {
@@ -339,6 +597,109 @@ esp_err_t config_get_telegram_token(char *out, size_t out_len)
 esp_err_t config_set_telegram_token(const char *token)
 {
     return secrets_set("tg_token", token);
+}
+
+esp_err_t config_get_telegram_admin_name(char *out, size_t out_len)
+{
+    return secrets_get("tg_admin_name", "", out, out_len);
+}
+
+esp_err_t config_set_telegram_admin_name(const char *name)
+{
+    if (!name || name[0] == '\0' || !valid_tech_name(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return secrets_set("tg_admin_name", name);
+}
+
+bool config_has_telegram_admin_password(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SECRETS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+
+    char salt[TECH_SALT_HEX_LEN + 1] = {0};
+    char hash[TECH_HASH_HEX_LEN + 1] = {0};
+    size_t len = sizeof(salt);
+    esp_err_t salt_err = nvs_get_str(h, "tg_admin_salt", salt, &len);
+    len = sizeof(hash);
+    esp_err_t hash_err = nvs_get_str(h, "tg_admin_pwd", hash, &len);
+    nvs_close(h);
+
+    return salt_err == ESP_OK && hash_err == ESP_OK &&
+           strlen(salt) == TECH_SALT_HEX_LEN &&
+           strlen(hash) == TECH_HASH_HEX_LEN;
+}
+
+bool config_has_telegram_admin_credentials(void)
+{
+    char name[CONFIG_TECH_NAME_MAX_LEN + 1] = {0};
+    if (config_get_telegram_admin_name(name, sizeof(name)) != ESP_OK) {
+        return false;
+    }
+    return name[0] != '\0' && config_has_telegram_admin_password();
+}
+
+esp_err_t config_set_telegram_admin_password(const char *password)
+{
+    if (!valid_password(password)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char salt[TECH_SALT_HEX_LEN + 1] = {0};
+    char hash[TECH_HASH_HEX_LEN + 1] = {0};
+    random_hex(salt, sizeof(salt), TECH_SALT_HEX_LEN / 2);
+    ESP_RETURN_ON_ERROR(password_hash_hex(salt, password, hash, sizeof(hash)), TAG, "hash");
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(SECRETS_NS, NVS_READWRITE, &h), TAG, "secrets open");
+    esp_err_t err = nvs_set_str(h, "tg_admin_salt", salt);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "tg_admin_pwd", hash);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_check_telegram_admin_credentials(const char *name, const char *password, bool *match)
+{
+    if (match) {
+        *match = false;
+    }
+    if (!name || !password || !match) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char stored_name[CONFIG_TECH_NAME_MAX_LEN + 1] = {0};
+    ESP_RETURN_ON_ERROR(config_get_telegram_admin_name(stored_name, sizeof(stored_name)), TAG, "admin name");
+    if (stored_name[0] == '\0' || strcmp(stored_name, name) != 0) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(SECRETS_NS, NVS_READONLY, &h), TAG, "secrets open");
+
+    char salt[TECH_SALT_HEX_LEN + 1] = {0};
+    char stored_hash[TECH_HASH_HEX_LEN + 1] = {0};
+    size_t len = sizeof(salt);
+    esp_err_t err = nvs_get_str(h, "tg_admin_salt", salt, &len);
+    if (err == ESP_OK) {
+        len = sizeof(stored_hash);
+        err = nvs_get_str(h, "tg_admin_pwd", stored_hash, &len);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char candidate[TECH_HASH_HEX_LEN + 1] = {0};
+    ESP_RETURN_ON_ERROR(password_hash_hex(salt, password, candidate, sizeof(candidate)), TAG, "hash");
+    *match = ct_equal_hex(candidate, stored_hash, TECH_HASH_HEX_LEN);
+    return ESP_OK;
 }
 
 esp_err_t config_get_ota_user(char *out, size_t out_len)

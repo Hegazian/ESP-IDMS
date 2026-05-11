@@ -113,12 +113,26 @@ set_ota_user admin
 set_ota_pass STRONG_PASSWORD
 set_cloud_url https://YOUR_ENDPOINT/ingest
 set_cloud_token YOUR_RANDOM_CLOUD_TOKEN
-add YOUR_TELEGRAM_CHAT_ID
 reboot
 ```
 
 Use `show_secrets` to confirm which secrets are configured without printing the
 secret values.
+
+Telegram bot login is configured once from Telegram on a blank device:
+
+1. Set Wi-Fi and the bot token, then reboot.
+2. Open the bot in a private Telegram chat and send `/start`.
+3. If no technicians are saved yet, the bot starts a setup wizard for the shared
+   admin name and password and registers that Telegram account as the first
+   technician.
+4. Share the same bot URL with other technicians. Each technician enters the
+   shared admin name and password once; after that, the ESP stores their
+   Telegram ID and does not ask again.
+
+After that first Telegram setup, the shared admin name and password cannot be
+changed from Telegram. Use serial console commands `set_bot_admin` and
+`set_bot_password` to change them.
 
 ## Serial Console Commands
 
@@ -136,12 +150,14 @@ secret values.
 | `set_ssid <ssid>` | Save Wi-Fi SSID to NVS |
 | `set_pass <password>` | Save Wi-Fi password to NVS |
 | `set_token <token>` | Save Telegram bot token to NVS |
+| `set_bot_admin <name>` | Save shared Telegram bot login admin name |
+| `set_bot_password <password>` | Save shared Telegram bot login password hash |
 | `set_ota_user <user>` | Save OTA username to NVS |
 | `set_ota_pass <password>` | Save OTA password to NVS |
 | `set_cloud_url <url>` | Save telemetry upload endpoint |
 | `set_cloud_token <token>` | Save telemetry Bearer token |
-| `add <chat_id>` | Add Telegram technician |
-| `list` | List Telegram technicians |
+| `add <chat_id> [name]` | Add authorized Telegram technician manually |
+| `list` | List Telegram technicians and names |
 | `remove <index>` | Remove one technician |
 | `clear` | Remove all technicians |
 | `show_secrets` | Show secret status with values hidden |
@@ -248,12 +264,44 @@ Telegram supports:
 - `/weekly`
 - OTA link generation
 - Technician management
+- Shared admin-name/password technician enrollment
 - Ringing-style critical alerts
 - Reminder/cancel flow
 - Offline queue flushing after Wi-Fi returns
 
-First-user auto-claim is disabled by default. Register technicians through the
-serial console or manufacturing provisioning.
+Provision the shared Telegram admin name and password from the bot itself only
+once, on a blank device with no saved technicians. The first user who opens the
+bot with `/start` creates the shared admin name/password and is saved as the
+first technician. Later technicians open the same bot, send the shared admin
+name, then send the shared password. If both are correct, the ESP saves that
+Telegram ID in the technician list and future bot use does not ask again.
+
+After the first Telegram setup, changing the shared admin name/password is a
+serial-console-only operation:
+
+```text
+set_bot_admin NEW_SHARED_ADMIN_NAME
+set_bot_password NEW_SHARED_ADMIN_PASSWORD
+show_secrets
+```
+
+The shared password is stored only as a salted hash, and Telegram chat input is
+not hidden by Telegram clients.
+
+## Telegram Login Scenarios
+
+| Scenario | Expected behavior | Operator action |
+|----------|-------------------|-----------------|
+| Blank device, no technicians, no shared login | First `/start` opens the one-time Telegram setup wizard | Enter shared admin name, password, and password confirmation in a private chat |
+| First setup completed | First Telegram user is saved as technician slot 0 | Use `/start` normally; no more password prompts for that Telegram account |
+| New technician joins later | Bot asks for shared admin name and password once | Share the bot URL; technician sends `/start`, enters the shared credentials, then is saved |
+| Registered technician returns | Bot recognizes saved Telegram ID | Use menu commands directly; no admin name/password prompt |
+| Wrong shared credentials | Bot rejects login and allows up to 3 attempts | Send the admin name again, then the correct password |
+| Technician list is full | New technician login is rejected | Remove an old technician from Telegram Technician IDs or serial `remove <index>` |
+| Need to change shared admin name/password | Telegram has no credential-change command after first setup | Use serial `set_bot_admin` and `set_bot_password`; existing saved technicians stay authorized |
+| Technicians exist but shared login is missing | Telegram setup is blocked because it is no longer a blank device | Set the shared login from serial console |
+| `clear` removes all technicians | Shared login remains in NVS if already configured | Next user can register with the existing shared credentials; change credentials from serial if needed |
+| Full NVS erase / factory blank state | Device has no technicians and no shared login | Telegram one-time setup is available again |
 
 ## OTA
 

@@ -85,6 +85,10 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
                     snprintf(out->chat_id, sizeof(out->chat_id), "%lld", (long long)cid->valuedouble);
                 }
             }
+            cJSON *ctype = cJSON_GetObjectItem(chat, "type");
+            if (cJSON_IsString(ctype)) {
+                safe_strcpy(out->chat_type, sizeof(out->chat_type), ctype->valuestring);
+            }
         }
         cJSON *text = cJSON_GetObjectItem(msg, "text");
         if (cJSON_IsString(text)) {
@@ -116,6 +120,10 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
                     } else if (cJSON_IsNumber(cid)) {
                         snprintf(out->chat_id, sizeof(out->chat_id), "%lld", (long long)cid->valuedouble);
                     }
+                }
+                cJSON *ctype = cJSON_GetObjectItem(chat, "type");
+                if (cJSON_IsString(ctype)) {
+                    safe_strcpy(out->chat_type, sizeof(out->chat_type), ctype->valuestring);
                 }
             }
         }

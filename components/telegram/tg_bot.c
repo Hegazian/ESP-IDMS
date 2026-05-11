@@ -18,6 +18,8 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,12 +32,77 @@ static const char *TAG = "tg_bot";
 #define OFFSET_BUMP_ON_REBOOT   100000
 #define NVS_NS                 "tg_bot"
 #define DNS_RETRY_INTERVAL_S   60
+#define SESSION_MAX             8
+#define SESSION_TTL_MS          (10 * 60 * 1000)
+#define PASSWORD_MIN_LEN        6
+#define LOGIN_THROTTLE_MAX      8
+#define LOGIN_FAIL_WINDOW_MS    (10 * 60 * 1000)
+#define LOGIN_USER_LOCK_MS      (5 * 60 * 1000)
+#define LOGIN_GLOBAL_LOCK_MS    (2 * 60 * 1000)
+#define LOGIN_USER_FAIL_LIMIT   3
+#define LOGIN_GLOBAL_FAIL_LIMIT 12
+#define RECENT_CALLBACK_MAX     8
+#define CALLBACK_DEDUPE_MS      (12 * 1000)
 
 static char *s_resp_buf = NULL;
 static bool s_dns_ok = false;
 static int s_update_offset = -1;
 static bool s_commands_registered = false;
 static TaskHandle_t s_poll_task = NULL;
+
+typedef enum {
+    SESSION_NONE = 0,
+    SESSION_SETUP_ADMIN_NAME,
+    SESSION_SETUP_ADMIN_PASSWORD,
+    SESSION_SETUP_ADMIN_CONFIRM,
+    SESSION_LOGIN_NAME,
+    SESSION_LOGIN_PASSWORD,
+} session_state_t;
+
+typedef enum {
+    ACTION_NONE = 0,
+    ACTION_OTA,
+    ACTION_REBOOT_MENU,
+    ACTION_REBOOT_NOW,
+    ACTION_REMOVE_MENU,
+    ACTION_REMOVE_INDEX,
+} sensitive_action_t;
+
+typedef struct {
+    bool active;
+    char from_id[32];
+    char chat_id[32];
+    session_state_t state;
+    sensitive_action_t action;
+    int action_index;
+    int attempts;
+    int64_t expires_ms;
+    char name[CONFIG_TECH_NAME_MAX_LEN + 1];
+    char password[CONFIG_TECH_PASSWORD_MAX_LEN + 1];
+} tg_session_t;
+
+typedef struct {
+    bool active;
+    char from_id[32];
+    int failures;
+    int64_t window_start_ms;
+    int64_t lock_until_ms;
+} login_throttle_t;
+
+typedef struct {
+    bool active;
+    char from_id[32];
+    char chat_id[32];
+    char data[64];
+    int64_t seen_ms;
+} recent_callback_t;
+
+static tg_session_t s_sessions[SESSION_MAX];
+static login_throttle_t s_login_throttle[LOGIN_THROTTLE_MAX];
+static recent_callback_t s_recent_callbacks[RECENT_CALLBACK_MAX];
+static int s_global_login_failures = 0;
+static int64_t s_global_login_window_ms = 0;
+static int64_t s_global_login_lock_until_ms = 0;
 
 static void load_state(void)
 {
@@ -58,6 +125,394 @@ static void save_state(void)
     }
 }
 
+static int64_t now_ms(void)
+{
+    return (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static void safe_copy(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    if (!src) {
+        src = "";
+    }
+    strncpy(dst, src, dst_len - 1);
+    dst[dst_len - 1] = '\0';
+}
+
+static void trim_copy(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+    while (*src && isspace((unsigned char)*src)) {
+        src++;
+    }
+    size_t len = strlen(src);
+    while (len > 0 && isspace((unsigned char)src[len - 1])) {
+        len--;
+    }
+    if (len >= dst_len) {
+        len = dst_len - 1;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static bool valid_name(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+    size_t len = strlen(name);
+    if (len > CONFIG_TECH_NAME_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool valid_password(const char *password)
+{
+    if (!password) {
+        return false;
+    }
+    size_t len = strlen(password);
+    return len >= PASSWORD_MIN_LEN && len <= CONFIG_TECH_PASSWORD_MAX_LEN;
+}
+
+static void html_escape(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+    size_t used = 0;
+    for (size_t i = 0; src[i] && used + 1 < dst_len; i++) {
+        const char *rep = NULL;
+        switch (src[i]) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        default: break;
+        }
+        if (rep) {
+            size_t rlen = strlen(rep);
+            if (used + rlen >= dst_len) {
+                break;
+            }
+            memcpy(dst + used, rep, rlen);
+            used += rlen;
+        } else {
+            dst[used++] = src[i];
+        }
+    }
+    dst[used] = '\0';
+}
+
+static void clear_session(tg_session_t *s)
+{
+    if (s) {
+        memset(s, 0, sizeof(*s));
+    }
+}
+
+static tg_session_t *find_session(const char *from_id)
+{
+    int64_t now = now_ms();
+    for (int i = 0; i < SESSION_MAX; i++) {
+        if (s_sessions[i].active && s_sessions[i].expires_ms <= now) {
+            clear_session(&s_sessions[i]);
+        }
+        if (s_sessions[i].active && strcmp(s_sessions[i].from_id, from_id) == 0) {
+            return &s_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static tg_session_t *get_session(const char *from_id, const char *chat_id, bool create)
+{
+    tg_session_t *s = find_session(from_id);
+    if (s || !create) {
+        return s;
+    }
+
+    int slot = -1;
+    int64_t oldest = INT64_MAX;
+    for (int i = 0; i < SESSION_MAX; i++) {
+        if (!s_sessions[i].active) {
+            slot = i;
+            break;
+        }
+        if (s_sessions[i].expires_ms < oldest) {
+            oldest = s_sessions[i].expires_ms;
+            slot = i;
+        }
+    }
+
+    s = &s_sessions[slot];
+    memset(s, 0, sizeof(*s));
+    s->active = true;
+    safe_copy(s->from_id, sizeof(s->from_id), from_id);
+    safe_copy(s->chat_id, sizeof(s->chat_id), chat_id);
+    s->expires_ms = now_ms() + SESSION_TTL_MS;
+    return s;
+}
+
+static bool session_waits_for_secret(const char *from_id)
+{
+    tg_session_t *s = find_session(from_id);
+    if (!s) {
+        return false;
+    }
+    return s->state == SESSION_LOGIN_PASSWORD ||
+           s->state == SESSION_SETUP_ADMIN_PASSWORD ||
+           s->state == SESSION_SETUP_ADMIN_CONFIRM;
+}
+
+static bool is_private_chat(const tg_update_t *update)
+{
+    return update && strcmp(update->chat_type, "private") == 0;
+}
+
+static bool callback_seen_recently(const tg_update_t *update)
+{
+    if (!update || !update->is_callback || update->callback_data[0] == '\0') {
+        return false;
+    }
+
+    int64_t now = now_ms();
+    int slot = -1;
+    int64_t oldest = INT64_MAX;
+    for (int i = 0; i < RECENT_CALLBACK_MAX; i++) {
+        recent_callback_t *r = &s_recent_callbacks[i];
+        if (r->active && now - r->seen_ms > CALLBACK_DEDUPE_MS) {
+            memset(r, 0, sizeof(*r));
+        }
+        if (r->active &&
+            strcmp(r->from_id, update->from_id) == 0 &&
+            strcmp(r->chat_id, update->chat_id) == 0 &&
+            strcmp(r->data, update->callback_data) == 0) {
+            r->seen_ms = now;
+            return true;
+        }
+        if (!r->active && slot < 0) {
+            slot = i;
+        } else if (r->active && r->seen_ms < oldest) {
+            oldest = r->seen_ms;
+            slot = i;
+        }
+    }
+
+    if (slot >= 0) {
+        recent_callback_t *r = &s_recent_callbacks[slot];
+        memset(r, 0, sizeof(*r));
+        r->active = true;
+        safe_copy(r->from_id, sizeof(r->from_id), update->from_id);
+        safe_copy(r->chat_id, sizeof(r->chat_id), update->chat_id);
+        safe_copy(r->data, sizeof(r->data), update->callback_data);
+        r->seen_ms = now;
+    }
+    return false;
+}
+
+static login_throttle_t *get_login_throttle(const char *from_id, bool create)
+{
+    if (!from_id || from_id[0] == '\0') {
+        return NULL;
+    }
+
+    int empty_slot = -1;
+    int oldest_slot = 0;
+    int64_t oldest = INT64_MAX;
+    for (int i = 0; i < LOGIN_THROTTLE_MAX; i++) {
+        if (s_login_throttle[i].active &&
+            strcmp(s_login_throttle[i].from_id, from_id) == 0) {
+            return &s_login_throttle[i];
+        }
+        if (!s_login_throttle[i].active && empty_slot < 0) {
+            empty_slot = i;
+        } else if (s_login_throttle[i].active &&
+                   s_login_throttle[i].window_start_ms < oldest) {
+            oldest = s_login_throttle[i].window_start_ms;
+            oldest_slot = i;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    int slot = empty_slot >= 0 ? empty_slot : oldest_slot;
+    login_throttle_t *t = &s_login_throttle[slot];
+    memset(t, 0, sizeof(*t));
+    t->active = true;
+    safe_copy(t->from_id, sizeof(t->from_id), from_id);
+    t->window_start_ms = now_ms();
+    return t;
+}
+
+static bool login_throttle_blocked(const char *from_id, const char *chat_id)
+{
+    int64_t now = now_ms();
+    if (s_global_login_lock_until_ms > now) {
+        tg_send_text(chat_id,
+            "\xe2\x9d\x8c Too many failed login attempts. Try again in a few minutes.");
+        return true;
+    }
+
+    login_throttle_t *t = get_login_throttle(from_id, false);
+    if (t && t->lock_until_ms > now) {
+        tg_send_text(chat_id,
+            "\xe2\x9d\x8c Too many wrong login attempts. Try again in a few minutes.");
+        return true;
+    }
+    return false;
+}
+
+static void login_throttle_record_failure(const char *from_id)
+{
+    int64_t now = now_ms();
+    login_throttle_t *t = get_login_throttle(from_id, true);
+    if (t) {
+        if (now - t->window_start_ms > LOGIN_FAIL_WINDOW_MS) {
+            t->window_start_ms = now;
+            t->failures = 0;
+        }
+        t->failures++;
+        if (t->failures >= LOGIN_USER_FAIL_LIMIT) {
+            t->lock_until_ms = now + LOGIN_USER_LOCK_MS;
+            t->failures = 0;
+            t->window_start_ms = now;
+        }
+    }
+
+    if (now - s_global_login_window_ms > LOGIN_FAIL_WINDOW_MS) {
+        s_global_login_window_ms = now;
+        s_global_login_failures = 0;
+    }
+    s_global_login_failures++;
+    if (s_global_login_failures >= LOGIN_GLOBAL_FAIL_LIMIT) {
+        s_global_login_lock_until_ms = now + LOGIN_GLOBAL_LOCK_MS;
+        s_global_login_failures = 0;
+        s_global_login_window_ms = now;
+    }
+}
+
+static void login_throttle_reset_user(const char *from_id)
+{
+    login_throttle_t *t = get_login_throttle(from_id, false);
+    if (t) {
+        memset(t, 0, sizeof(*t));
+    }
+}
+
+static void send_main_menu(const char *chat)
+{
+    snprintf(s_resp_buf, RESP_BUF_SZ,
+        "<b>\xf0\x9f\x8f\xad ESP-IDMS Bot</b>\n\n"
+        "Industrial Device Monitoring System\n"
+        "Firmware: %s\n\nUse the menu below.", ota_get_version());
+    tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+}
+
+static void execute_sensitive_action(const char *chat, const char *from_id,
+                                     sensitive_action_t action, int action_index);
+static void require_sensitive_action(const char *chat, const char *from_id,
+                                     sensitive_action_t action, int action_index);
+
+static void send_serial_login_change_notice(const char *chat)
+{
+    tg_send_text(chat,
+        "\xe2\x9d\x8c <b>Telegram Login Is Locked</b>\n\n"
+        "The shared admin name and password can only be created once from Telegram on a blank device.\n"
+        "To change them now, use the serial console:\n"
+        "<code>set_bot_admin NAME</code>\n"
+        "<code>set_bot_password PASSWORD</code>");
+}
+
+static bool begin_admin_setup(const char *chat_id, const char *from_id)
+{
+    if (config_has_telegram_admin_credentials() ||
+        config_get_tech_count() != 0) {
+        send_serial_login_change_notice(chat_id);
+        return true;
+    }
+
+    tg_session_t *s = get_session(from_id, chat_id, true);
+    if (!s) {
+        tg_send_text(chat_id, "\xe2\x9d\x8c Could not start setup session.");
+        return true;
+    }
+
+    s->state = SESSION_SETUP_ADMIN_NAME;
+    s->attempts = 0;
+    s->name[0] = '\0';
+    s->password[0] = '\0';
+
+    tg_send_text(chat_id,
+        "\xf0\x9f\x94\x90 <b>Telegram Login Setup</b>\n\n"
+        "Create the shared admin name used by technicians to register this bot.\n"
+        "Send the admin name now.");
+    return true;
+}
+
+static bool begin_shared_login(const tg_update_t *update)
+{
+    if (!config_has_telegram_admin_credentials()) {
+        if (config_get_tech_count() == 0) {
+            return begin_admin_setup(update->chat_id, update->from_id);
+        }
+
+        tg_send_text(update->chat_id,
+            "\xe2\x9d\x8c <b>Bot Login Not Configured</b>\n\n"
+            "Telegram setup is only allowed when the device has no saved technicians. "
+            "Use the serial console to set the shared login:\n"
+            "<code>set_bot_admin NAME</code>\n"
+            "<code>set_bot_password PASSWORD</code>");
+        return true;
+    }
+
+    if (login_throttle_blocked(update->from_id, update->chat_id)) {
+        return true;
+    }
+
+    if (config_get_tech_count() >= CONFIG_TECH_MAX_COUNT) {
+        tg_send_text(update->chat_id,
+            "\xe2\x9d\x8c Technician list is full. Ask an admin to remove an old technician.");
+        return true;
+    }
+
+    tg_session_t *s = get_session(update->from_id, update->chat_id, true);
+    if (!s) {
+        tg_send_text(update->chat_id, "\xe2\x9d\x8c Could not start login session.");
+        return true;
+    }
+    s->state = SESSION_LOGIN_NAME;
+    s->attempts = 0;
+    s->name[0] = '\0';
+    tg_send_text(update->chat_id,
+        "\xf0\x9f\x94\x90 <b>Technician Login</b>\n\n"
+        "Send the shared admin name.");
+    return true;
+}
+
 static void clear_pending(void)
 {
     ESP_LOGI(TAG, "Clearing pending updates");
@@ -74,16 +529,249 @@ static void do_reboot(void)
     esp_restart();
 }
 
-static void handle_cmd(const char *chat, const char *cmd)
+static void send_remove_menu(const char *chat)
+{
+    tg_build_tech_remove(s_resp_buf, RESP_BUF_SZ);
+    char kb[512] = "[";
+    uint8_t count = config_get_tech_count();
+    for (int i = 0; i < count; i++) {
+        char btn[96];
+        snprintf(btn, sizeof(btn), "[{\"text\":\"Remove [%d]\",\"callback_data\":\"rm_%d\"}]%s",
+                 i, i, (i < count - 1) ? "," : "");
+        size_t cur = strlen(kb);
+        size_t blen = strlen(btn);
+        if (cur + blen < sizeof(kb) - 64) {
+            memcpy(kb + cur, btn, blen + 1);
+        }
+    }
+    size_t klen = strlen(kb);
+    snprintf(kb + klen, sizeof(kb) - klen, "%s[{\"text\":\"Back\",\"callback_data\":\"back_main\"}]]",
+             count > 0 ? "," : "");
+    tg_send_kb(chat, s_resp_buf, kb);
+}
+
+static void remove_tech_at(const char *chat, int idx)
+{
+    uint8_t count = config_get_tech_count();
+    if (idx < 0 || idx >= count) {
+        snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9d\x8c Invalid index. Use /techs to list.");
+        tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
+        return;
+    }
+
+    char removed_id[64] = "";
+    char removed_name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
+    char esc_name[96] = "";
+    config_get_tech_id(idx, removed_id, sizeof(removed_id));
+    config_get_tech_name(idx, removed_name, sizeof(removed_name));
+    html_escape(esc_name, sizeof(esc_name), removed_name);
+
+    esp_err_t err = config_remove_tech(idx);
+    if (err == ESP_OK) {
+        snprintf(s_resp_buf, RESP_BUF_SZ,
+            "\xe2\x9c\x85 Removed technician [%d]: %s<code>%s</code>\nRemaining: %u/%d",
+            idx, esc_name[0] ? esc_name : "", removed_id, count - 1, CONFIG_TECH_MAX_COUNT);
+    } else {
+        snprintf(s_resp_buf, RESP_BUF_SZ,
+            "\xe2\x9d\x8c Failed to remove technician: %s", esp_err_to_name(err));
+    }
+    tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
+}
+
+static void require_sensitive_action(const char *chat, const char *from_id,
+                                     sensitive_action_t action, int action_index)
+{
+    execute_sensitive_action(chat, from_id, action, action_index);
+}
+
+static void execute_sensitive_action(const char *chat, const char *from_id,
+                                     sensitive_action_t action, int action_index)
+{
+    switch (action) {
+    case ACTION_OTA:
+        tg_build_ota(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
+        break;
+    case ACTION_REBOOT_MENU:
+        tg_build_reboot_confirm(s_resp_buf, RESP_BUF_SZ);
+        tg_send_kb(chat, s_resp_buf, TG_KB_REBOOT_CONFIRM);
+        break;
+    case ACTION_REBOOT_NOW:
+        tg_broadcast_alert("\xe2\x9a\xa0\xef\xb8\x8f <b>REBOOT</b>\n\nRebooting now...");
+        snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Rebooting device...");
+        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        do_reboot();
+        break;
+    case ACTION_REMOVE_MENU:
+        send_remove_menu(chat);
+        break;
+    case ACTION_REMOVE_INDEX:
+        remove_tech_at(chat, action_index);
+        break;
+    case ACTION_NONE:
+    default:
+        send_main_menu(chat);
+        break;
+    }
+}
+
+static bool handle_session_message(const tg_update_t *update)
+{
+    tg_session_t *s = find_session(update->from_id);
+    if (!s || !update->is_message) {
+        return false;
+    }
+
+    if (tg_is_cmd_text(update->message_text, "cancel")) {
+        clear_session(s);
+        tg_send_text(update->chat_id, "Cancelled.");
+        return true;
+    }
+
+    s->expires_ms = now_ms() + SESSION_TTL_MS;
+
+    char value[CONFIG_TECH_PASSWORD_MAX_LEN + 33];
+    trim_copy(value, sizeof(value), update->message_text);
+
+    switch (s->state) {
+    case SESSION_SETUP_ADMIN_NAME:
+        if (!valid_name(value)) {
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Admin name must be 1-32 characters and cannot contain control characters.");
+            return true;
+        }
+        safe_copy(s->name, sizeof(s->name), value);
+        s->state = SESSION_SETUP_ADMIN_PASSWORD;
+        tg_send_text(update->chat_id,
+            "\xf0\x9f\x94\x91 Send the shared admin password.\n\n"
+            "Telegram will show this message in chat history, so use a private chat.");
+        return true;
+
+    case SESSION_SETUP_ADMIN_PASSWORD:
+        if (!valid_password(value)) {
+            snprintf(s_resp_buf, RESP_BUF_SZ,
+                "\xe2\x9d\x8c Password must be %d-%d characters. Send a new password.",
+                PASSWORD_MIN_LEN, CONFIG_TECH_PASSWORD_MAX_LEN);
+            tg_send_text(update->chat_id, s_resp_buf);
+            return true;
+        }
+        safe_copy(s->password, sizeof(s->password), value);
+        s->state = SESSION_SETUP_ADMIN_CONFIRM;
+        tg_send_text(update->chat_id, "\xf0\x9f\x94\x81 Send the same password again to confirm.");
+        return true;
+
+    case SESSION_SETUP_ADMIN_CONFIRM: {
+        if (strcmp(value, s->password) != 0) {
+            s->password[0] = '\0';
+            s->state = SESSION_SETUP_ADMIN_PASSWORD;
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Passwords did not match. Send the shared admin password again.");
+            return true;
+        }
+
+        if (config_has_telegram_admin_credentials() || config_get_tech_count() != 0) {
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Telegram setup is no longer available. "
+                "The shared login was already configured.");
+            clear_session(s);
+            return true;
+        }
+
+        esp_err_t err = config_set_telegram_admin_name(s->name);
+        if (err == ESP_OK) {
+            err = config_set_telegram_admin_password(s->password);
+        }
+        if (err == ESP_OK) {
+            err = config_add_tech(update->from_id, s->name);
+        }
+        if (err != ESP_OK) {
+            snprintf(s_resp_buf, RESP_BUF_SZ,
+                "\xe2\x9d\x8c Could not save Telegram login setup: %s", esp_err_to_name(err));
+            tg_send_text(update->chat_id, s_resp_buf);
+            clear_session(s);
+            return true;
+        }
+
+        char esc_name[96];
+        html_escape(esc_name, sizeof(esc_name), s->name);
+        snprintf(s_resp_buf, RESP_BUF_SZ,
+            "\xe2\x9c\x85 <b>Telegram Login Configured</b>\n\n"
+            "Saved shared admin name <b>%s</b> and registered this Telegram account. "
+            "You will not be asked for the admin name/password again.",
+            esc_name);
+        clear_session(s);
+        tg_send_kb(update->chat_id, s_resp_buf, TG_KB_MAIN);
+        return true;
+    }
+
+    case SESSION_LOGIN_NAME:
+        if (!valid_name(value)) {
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Admin name must be 1-32 characters and cannot contain control characters.");
+            return true;
+        }
+        safe_copy(s->name, sizeof(s->name), value);
+        s->state = SESSION_LOGIN_PASSWORD;
+        tg_send_text(update->chat_id, "\xf0\x9f\x94\x91 Send the shared admin password.");
+        return true;
+
+    case SESSION_LOGIN_PASSWORD: {
+        bool match = false;
+        esp_err_t err = config_check_telegram_admin_credentials(s->name, value, &match);
+        if (err == ESP_OK && match) {
+            if (config_get_tech_count() >= CONFIG_TECH_MAX_COUNT) {
+                tg_send_text(update->chat_id,
+                    "\xe2\x9d\x8c Technician list is full. Ask an admin to remove an old technician.");
+                clear_session(s);
+                return true;
+            }
+            err = config_add_tech(update->from_id, s->name);
+            if (err != ESP_OK) {
+                snprintf(s_resp_buf, RESP_BUF_SZ,
+                    "\xe2\x9d\x8c Could not save technician credentials: %s", esp_err_to_name(err));
+                tg_send_text(update->chat_id, s_resp_buf);
+                clear_session(s);
+                return true;
+            }
+            login_throttle_reset_user(update->from_id);
+            char esc_name[96];
+            html_escape(esc_name, sizeof(esc_name), s->name);
+            snprintf(s_resp_buf, RESP_BUF_SZ,
+                "\xe2\x9c\x85 <b>Access Granted</b>\n\n"
+                "Saved this Telegram account for <b>%s</b>. You will not be asked for the admin name/password again.",
+                esc_name);
+            clear_session(s);
+            tg_send_kb(update->chat_id, s_resp_buf, TG_KB_MAIN);
+            return true;
+        }
+
+        login_throttle_record_failure(update->from_id);
+        s->attempts++;
+        if (s->attempts >= 3) {
+            tg_send_text(update->chat_id, "\xe2\x9d\x8c Too many wrong login attempts. Send /start to try again.");
+            clear_session(s);
+        } else {
+            tg_send_text(update->chat_id, "\xe2\x9d\x8c Wrong admin name or password. Send the admin name again.");
+            s->state = SESSION_LOGIN_NAME;
+            s->name[0] = '\0';
+        }
+        return true;
+    }
+
+    case SESSION_NONE:
+    default:
+        clear_session(s);
+        return false;
+    }
+}
+
+static void handle_cmd(const char *chat, const char *from_id, const char *cmd)
 {
     if (!s_resp_buf) return;
 
     if (strcmp(cmd, "start") == 0 || strcmp(cmd, "help") == 0) {
-        snprintf(s_resp_buf, RESP_BUF_SZ,
-            "<b>\xf0\x9f\x8f\xad ESP-IDMS Bot</b>\n\n"
-            "Industrial Device Monitoring System\n"
-            "Firmware: %s\n\nUse the menu below.", ota_get_version());
-        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
+        send_main_menu(chat);
     } else if (strcmp(cmd, "status") == 0) {
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
@@ -102,68 +790,35 @@ static void handle_cmd(const char *chat, const char *cmd)
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Test alert sent.");
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
     } else if (strcmp(cmd, "ota") == 0) {
-        tg_build_ota(s_resp_buf, RESP_BUF_SZ);
-        tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
+        require_sensitive_action(chat, from_id, ACTION_OTA, -1);
     } else if (strcmp(cmd, "reboot") == 0) {
-        tg_build_reboot_confirm(s_resp_buf, RESP_BUF_SZ);
-        tg_send_kb(chat, s_resp_buf, TG_KB_REBOOT_CONFIRM);
+        require_sensitive_action(chat, from_id, ACTION_REBOOT_MENU, -1);
     } else if (strcmp(cmd, "techs") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
     } else if (strncmp(cmd, "remove_tech", 11) == 0) {
         const char *idx_str = cmd + 11;
-        while (*idx_str == ' ') idx_str++;
-        int idx = atoi(idx_str);
-        uint8_t count = config_get_tech_count();
-        if (idx < 0 || idx >= count) {
-            snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9d\x8c Invalid index. Use /techs to list.");
-            tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
-        } else {
-            nvs_handle_t h;
-            if (nvs_open("idms", NVS_READWRITE, &h) == ESP_OK) {
-                char removed_id[64] = "";
-                size_t rlen = sizeof(removed_id);
-                char rkey[16];
-                snprintf(rkey, sizeof(rkey), "tech_id_%d", idx);
-                nvs_get_str(h, rkey, removed_id, &rlen);
-
-                for (int i = idx; i < count - 1; i++) {
-                    char src_key[16], dst_key[16];
-                    snprintf(src_key, sizeof(src_key), "tech_id_%d", i + 1);
-                    snprintf(dst_key, sizeof(dst_key), "tech_id_%d", i);
-                    char val[64];
-                    size_t len = sizeof(val);
-                    if (nvs_get_str(h, src_key, val, &len) == ESP_OK) {
-                        nvs_set_str(h, dst_key, val);
-                    }
-                }
-                char last_key[16];
-                snprintf(last_key, sizeof(last_key), "tech_id_%d", count - 1);
-                nvs_erase_key(h, last_key);
-                nvs_set_u8(h, "tech_count", count - 1);
-                nvs_commit(h);
-                nvs_close(h);
-                snprintf(s_resp_buf, RESP_BUF_SZ,
-                    "\xe2\x9c\x85 Removed technician [%d]: <code>%s</code>\nRemaining: %u/5",
-                    idx, removed_id, count - 1);
-            } else {
-                snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9d\x8c Failed to access NVS.");
+        if (*idx_str == '@') {
+            while (*idx_str && !isspace((unsigned char)*idx_str)) {
+                idx_str++;
             }
-            tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
         }
+        while (*idx_str == ' ') idx_str++;
+        if (!isdigit((unsigned char)*idx_str)) {
+            tg_send_kb(chat, "\xe2\x9d\x8c Usage: /remove_tech <index>", TG_KB_TECHS);
+            return;
+        }
+        int idx = atoi(idx_str);
+        require_sensitive_action(chat, from_id, ACTION_REMOVE_INDEX, idx);
     } else {
         tg_send_kb(chat, "\xe2\x9d\x93 Unknown. Use /start.", TG_KB_MAIN);
     }
 }
 
-static void handle_cb(const char *chat, const char *cb_id, const char *data)
+static void handle_cb(const char *chat, const char *from_id, const char *cb_id, const char *data)
 {
+    (void)cb_id;
     if (!s_resp_buf) return;
-
-    esp_err_t e = tg_answer_cb(cb_id);
-    if (e != ESP_OK) {
-        ESP_LOGD(TAG, "answerCallbackQuery failed for %s (expired or dup)", data);
-    }
 
     if (strcmp(data, "cmd_status") == 0) {
         tg_build_status(s_resp_buf, RESP_BUF_SZ);
@@ -180,92 +835,29 @@ static void handle_cb(const char *chat, const char *cb_id, const char *data)
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Test alert sent.");
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
     } else if (strcmp(data, "cmd_ota") == 0) {
-        tg_build_ota(s_resp_buf, RESP_BUF_SZ);
-        tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
+        require_sensitive_action(chat, from_id, ACTION_OTA, -1);
     } else if (strcmp(data, "cmd_reboot") == 0) {
-        tg_build_reboot_confirm(s_resp_buf, RESP_BUF_SZ);
-        tg_send_kb(chat, s_resp_buf, TG_KB_REBOOT_CONFIRM);
+        require_sensitive_action(chat, from_id, ACTION_REBOOT_MENU, -1);
     } else if (strcmp(data, "cmd_techs") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
     } else if (strcmp(data, "confirm_reboot") == 0) {
-        tg_broadcast_alert("\xe2\x9a\xa0\xef\xb8\x8f <b>REBOOT</b>\n\nRebooting now...");
-        snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9c\x85 Rebooting device...");
-        tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        do_reboot();
+        require_sensitive_action(chat, from_id, ACTION_REBOOT_NOW, -1);
     } else if (strcmp(data, "cancel_reboot") == 0) {
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xf0\x9f\x8f\xad <b>ESP-IDMS</b>\nReboot cancelled. Choose:");
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
     } else if (strcmp(data, "ota_status") == 0) {
-        snprintf(s_resp_buf, RESP_BUF_SZ,
-            "<b>\xf0\x9f\x93\xa1 OTA</b>\nVersion: %s\nPartition: %s\nState: %s",
-            ota_get_version(), ota_get_partition(), ota_get_status());
-        tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
+        require_sensitive_action(chat, from_id, ACTION_OTA, -1);
     } else if (strcmp(data, "ota_url") == 0) {
-        tg_build_ota(s_resp_buf, RESP_BUF_SZ);
-        tg_send_kb(chat, s_resp_buf, TG_KB_OTA);
+        require_sensitive_action(chat, from_id, ACTION_OTA, -1);
     } else if (strcmp(data, "tech_list") == 0) {
         tg_build_techs(s_resp_buf, RESP_BUF_SZ);
         tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
     } else if (strcmp(data, "tech_remove") == 0) {
-        tg_build_tech_remove(s_resp_buf, RESP_BUF_SZ);
-        {
-            char kb[512] = "[";
-            uint8_t count = config_get_tech_count();
-            for (int i = 0; i < count; i++) {
-                char btn[96];
-                snprintf(btn, sizeof(btn), "[{\"text\":\"Remove [%d]\",\"callback_data\":\"rm_%d\"}]%s",
-                         i, i, (i < count - 1) ? "," : "");
-                size_t cur = strlen(kb);
-                size_t blen = strlen(btn);
-                if (cur + blen < sizeof(kb) - 64) {
-                    memcpy(kb + cur, btn, blen + 1);
-                }
-            }
-            size_t klen = strlen(kb);
-            snprintf(kb + klen, sizeof(kb) - klen, "%s[{\"text\":\"Back\",\"callback_data\":\"back_main\"}]]",
-                     count > 0 ? "," : "");
-            tg_send_kb(chat, s_resp_buf, kb);
-        }
+        require_sensitive_action(chat, from_id, ACTION_REMOVE_MENU, -1);
     } else if (strncmp(data, "rm_", 3) == 0) {
         int idx = atoi(data + 3);
-        nvs_handle_t h;
-        if (nvs_open("idms", NVS_READWRITE, &h) == ESP_OK) {
-            uint8_t count = config_get_tech_count();
-            if (idx >= 0 && idx < count) {
-                char removed_id[64] = "";
-                size_t rlen = sizeof(removed_id);
-                char rkey[16];
-                snprintf(rkey, sizeof(rkey), "tech_id_%d", idx);
-                nvs_get_str(h, rkey, removed_id, &rlen);
-
-                for (int i = idx; i < count - 1; i++) {
-                    char src_key[16], dst_key[16];
-                    snprintf(src_key, sizeof(src_key), "tech_id_%d", i + 1);
-                    snprintf(dst_key, sizeof(dst_key), "tech_id_%d", i);
-                    char val[64];
-                    size_t len = sizeof(val);
-                    if (nvs_get_str(h, src_key, val, &len) == ESP_OK) {
-                        nvs_set_str(h, dst_key, val);
-                    }
-                }
-                char last_key[16];
-                snprintf(last_key, sizeof(last_key), "tech_id_%d", count - 1);
-                nvs_erase_key(h, last_key);
-                nvs_set_u8(h, "tech_count", count - 1);
-                nvs_commit(h);
-                snprintf(s_resp_buf, RESP_BUF_SZ,
-                    "\xe2\x9c\x85 Removed technician [%d]: <code>%s</code>\nRemaining: %u/5",
-                    idx, removed_id, count - 1);
-            } else {
-                snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9d\x8c Invalid index.");
-            }
-            nvs_close(h);
-        } else {
-            snprintf(s_resp_buf, RESP_BUF_SZ, "\xe2\x9d\x8c NVS access failed.");
-        }
-        tg_send_kb(chat, s_resp_buf, TG_KB_TECHS);
+        require_sensitive_action(chat, from_id, ACTION_REMOVE_INDEX, idx);
     } else if (strcmp(data, "back_main") == 0) {
         snprintf(s_resp_buf, RESP_BUF_SZ, "\xf0\x9f\x8f\xad <b>ESP-IDMS</b>\nChoose:");
         tg_send_kb(chat, s_resp_buf, TG_KB_MAIN);
@@ -337,8 +929,7 @@ static void poll_task(void *arg)
             return;
         }
         size_t tlen = strlen(token);
-        ESP_LOGI(TAG, "Bot token: %zu chars, starts '%.5s...%s'",
-                 tlen, token, tlen > 8 ? &token[tlen - 3] : "");
+        ESP_LOGI(TAG, "Bot token configured (%zu chars)", tlen);
         if (tlen < 20) {
             ESP_LOGE(TAG, "Token too short (%zu chars) — expected ~45 chars. Set via serial: set_token <your_token>", tlen);
             vTaskDelete(NULL);
@@ -455,13 +1046,18 @@ static void poll_task(void *arg)
                 ESP_LOGW(TAG, "Dropping unparseable update %d to keep polling moving", bad_update_id);
                 s_update_offset = bad_update_id + 1;
                 save_state();
+                poll_int = 0;
+            } else {
+                poll_int = POLL_OK_S;
             }
             continue;
         }
+        poll_int = 0;
 
+        const char *log_text = session_waits_for_secret(update.from_id) ? "<redacted>" : update.message_text;
         ESP_LOGI(TAG, "Update %d: msg=%d cb=%d from=%s chat=%s text='%.40s'",
                  update.update_id, update.is_message, update.is_callback,
-                 update.from_id, update.chat_id, update.message_text);
+                 update.from_id, update.chat_id, log_text);
 
         if (update.update_id > 0) {
             s_update_offset = update.update_id + 1;
@@ -473,67 +1069,78 @@ static void poll_task(void *arg)
             continue;
         }
 
+        if (update.is_callback && update.callback_id[0]) {
+            esp_err_t cb_err = tg_answer_cb(update.callback_id);
+            if (cb_err != ESP_OK) {
+                ESP_LOGD(TAG, "answerCallbackQuery failed for update %d: %s",
+                         update.update_id, esp_err_to_name(cb_err));
+            }
+        }
+
+        if (!is_private_chat(&update)) {
+            ESP_LOGW(TAG, "Ignoring non-private Telegram update %d from=%s chat=%s type=%s",
+                     update.update_id, update.from_id, update.chat_id,
+                     update.chat_type[0] ? update.chat_type : "(missing)");
+            if (update.is_message) {
+                tg_send_text(update.chat_id,
+                    "\xe2\x9d\x8c ESP-IDMS bot commands are only available in a private chat.");
+            }
+            continue;
+        }
+
+        if (callback_seen_recently(&update)) {
+            ESP_LOGI(TAG, "Ignoring repeated callback within %d ms: from=%s data=%s",
+                     CALLBACK_DEDUPE_MS, update.from_id, update.callback_data);
+            continue;
+        }
+
+        if (handle_session_message(&update)) {
+            continue;
+        }
+
         if (!tg_is_authorized_id(update.from_id)) {
             uint8_t tech_count = config_get_tech_count();
-#if CONFIG_IDMS_TELEGRAM_ALLOW_FIRST_USER_CLAIM
-            if (tech_count == 0 && update.is_message &&
-                (tg_is_cmd_text(update.message_text, "start") || tg_is_cmd_text(update.message_text, "help"))) {
-                esp_err_t add_err = config_add_tech_id(update.from_id);
-                if (add_err == ESP_OK) {
-                    ESP_LOGI(TAG, "First user auto-registered: from_id=%s", update.from_id);
-                    snprintf(s_resp_buf, RESP_BUF_SZ,
-                        "\xe2\x9c\x85 <b>Welcome!</b>\n\n"
-                        "You are the first registered technician (ID: <code>%s</code>).\n"
-                        "You will receive all alerts. Use the menu below.",
-                        update.from_id);
-                    tg_send_kb(update.chat_id, s_resp_buf, TG_KB_MAIN);
-                    continue;
-                } else {
-                    ESP_LOGE(TAG, "Failed to auto-register first user: %s", esp_err_to_name(add_err));
-                }
+            if (update.is_message) {
+                begin_shared_login(&update);
+                continue;
             }
-
-#endif
 
             ESP_LOGW(TAG, "Unauthorized %s (from_id=%s, techs=%u) — ignored",
                      update.is_callback ? "callback" : "message",
                      update.from_id, tech_count);
-            if (update.is_callback && update.callback_id[0]) {
-                tg_answer_cb(update.callback_id);
-            }
             snprintf(s_resp_buf, RESP_BUF_SZ,
                 "\xe2\x9d\x8c <b>Access Denied</b>\n\n"
                 "Your Telegram ID: <code>%s</code>\n"
                 "You are not registered as a technician.\n"
-                "Ask an admin to add your ID via serial console:\n"
-                "<code>add %s</code>",
-                update.from_id, update.from_id);
+                "Send /start to enter the shared admin name and password.",
+                update.from_id);
             tg_send_text(update.chat_id, s_resp_buf);
             continue;
         }
 
         if (update.is_callback) {
             ESP_LOGI(TAG, "Callback: %s", update.callback_data);
-            handle_cb(update.chat_id, update.callback_id, update.callback_data);
+            handle_cb(update.chat_id, update.from_id, update.callback_id, update.callback_data);
         } else if (update.is_message) {
             if (tg_is_cmd_text(update.message_text, "start") || tg_is_cmd_text(update.message_text, "help"))
-                handle_cmd(update.chat_id, "start");
+                handle_cmd(update.chat_id, update.from_id, "start");
             else if (tg_is_cmd_text(update.message_text, "status"))
-                handle_cmd(update.chat_id, "status");
+                handle_cmd(update.chat_id, update.from_id, "status");
             else if (tg_is_cmd_text(update.message_text, "weekly"))
-                handle_cmd(update.chat_id, "weekly");
+                handle_cmd(update.chat_id, update.from_id, "weekly");
             else if (tg_is_cmd_text(update.message_text, "export"))
-                handle_cmd(update.chat_id, "export");
+                handle_cmd(update.chat_id, update.from_id, "export");
             else if (tg_is_cmd_text(update.message_text, "test"))
-                handle_cmd(update.chat_id, "test");
+                handle_cmd(update.chat_id, update.from_id, "test");
             else if (tg_is_cmd_text(update.message_text, "ota"))
-                handle_cmd(update.chat_id, "ota");
+                handle_cmd(update.chat_id, update.from_id, "ota");
             else if (tg_is_cmd_text(update.message_text, "reboot"))
-                handle_cmd(update.chat_id, "reboot");
+                handle_cmd(update.chat_id, update.from_id, "reboot");
             else if (tg_is_cmd_text(update.message_text, "techs"))
-                handle_cmd(update.chat_id, "techs");
+                handle_cmd(update.chat_id, update.from_id, "techs");
             else if (tg_is_cmd_text(update.message_text, "remove_tech"))
-                handle_cmd(update.chat_id, update.message_text);
+                handle_cmd(update.chat_id, update.from_id,
+                           update.message_text[0] == '/' ? update.message_text + 1 : update.message_text);
             else
                 tg_send_kb(update.chat_id, "\xf0\x9f\x91\x8b Use /start for menu.", TG_KB_MAIN);
         }

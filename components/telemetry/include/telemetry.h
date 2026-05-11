@@ -38,3 +38,5 @@ void telemetry_build_weekly_report(char *buf, size_t buf_sz);
 bool telemetry_weekly_report_due(void);
 void telemetry_mark_weekly_report_sent(void);
 const char *telemetry_csv_path(void);
+esp_err_t telemetry_csv_lock(uint32_t timeout_ms);
+void telemetry_csv_unlock(void);

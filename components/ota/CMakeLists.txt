@@ -21,6 +21,11 @@ idf_component_register(
 )
 
 if(CONFIG_IDMS_OTA_HTTPS_ENABLE)
+    if(CONFIG_IDMS_PRODUCTION_BUILD)
+        message(FATAL_ERROR
+            "Production builds must not embed the development OTA TLS private key. "
+            "Provision production certificate/key material before enabling HTTPS OTA.")
+    endif()
     target_add_binary_data(${COMPONENT_LIB}
         "certs/ota_server_cert.pem" BINARY)
     target_add_binary_data(${COMPONENT_LIB}

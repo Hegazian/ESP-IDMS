@@ -18,6 +18,7 @@ static const char *TAG = "telemetry";
 #define TELEMETRY_REPORT_HOUR_UTC  9
 #define TELEMETRY_REPORT_WDAY      1  /* Monday, struct tm: Sunday=0 */
 #define TELEMETRY_NVS_NS           "telemetry"
+#define TELEMETRY_NVS_SPIFFS_READY "spiffs_ready"
 #define TELEMETRY_BASE_PATH        "/spiffs"
 #define TELEMETRY_CSV_PATH         TELEMETRY_BASE_PATH "/telemetry.csv"
 #define TELEMETRY_CSV_MAX_BYTES    (512 * 1024)
@@ -63,6 +64,28 @@ static bool s_storage_ready;
 static void telemetry_task(void *arg);
 static esp_err_t init_storage(void);
 static void append_csv_sample(const idms_metrics_t *m, time_t now);
+
+static bool storage_marked_ready(void)
+{
+    nvs_handle_t h;
+    uint8_t ready = 0;
+    if (nvs_open(TELEMETRY_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    esp_err_t err = nvs_get_u8(h, TELEMETRY_NVS_SPIFFS_READY, &ready);
+    nvs_close(h);
+    return err == ESP_OK && ready == 1;
+}
+
+static void mark_storage_ready(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TELEMETRY_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, TELEMETRY_NVS_SPIFFS_READY, 1);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
 
 static void reset_week_locked(time_t now)
 {
@@ -196,6 +219,24 @@ const char *telemetry_csv_path(void)
     return TELEMETRY_CSV_PATH;
 }
 
+esp_err_t telemetry_csv_lock(uint32_t timeout_ms)
+{
+    if (!s_file_mux) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_file_mux, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+void telemetry_csv_unlock(void)
+{
+    if (s_file_mux) {
+        xSemaphoreGive(s_file_mux);
+    }
+}
+
 void telemetry_get_weekly_stats(telemetry_weekly_stats_t *out)
 {
     if (!out) return;
@@ -257,8 +298,23 @@ static esp_err_t init_storage(void)
         err = ESP_OK;
     }
     if (err != ESP_OK) {
+        bool already_ready = storage_marked_ready();
         ESP_LOGE(TAG, "Telemetry SPIFFS mount failed without formatting: %s", esp_err_to_name(err));
-        return err;
+        if (!already_ready) {
+            ESP_LOGW(TAG, "Telemetry storage has no ready marker; formatting blank first-boot SPIFFS partition");
+            esp_err_t fmt_err = esp_spiffs_format("storage");
+            if (fmt_err != ESP_OK) {
+                ESP_LOGE(TAG, "Telemetry SPIFFS first-boot format failed: %s", esp_err_to_name(fmt_err));
+                return err;
+            }
+            err = esp_vfs_spiffs_register(&conf);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Telemetry SPIFFS mount after format failed: %s", esp_err_to_name(err));
+                return err;
+            }
+        } else {
+            return err;
+        }
     }
 
     size_t total = 0;
@@ -268,6 +324,7 @@ static esp_err_t init_storage(void)
                  (unsigned long)used, (unsigned long)total);
     }
 
+    mark_storage_ready();
     return ESP_OK;
 }
 
@@ -295,7 +352,7 @@ static void rotate_csv_if_needed(void)
 static void append_csv_sample(const idms_metrics_t *m, time_t now)
 {
     if (!m || !s_file_mux || !s_storage_ready) return;
-    if (xSemaphoreTake(s_file_mux, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (telemetry_csv_lock(1000) != ESP_OK) {
         return;
     }
 
@@ -303,7 +360,7 @@ static void append_csv_sample(const idms_metrics_t *m, time_t now)
 
     FILE *f = fopen(TELEMETRY_CSV_PATH, "a");
     if (!f) {
-        xSemaphoreGive(s_file_mux);
+        telemetry_csv_unlock();
         return;
     }
 
@@ -320,7 +377,7 @@ static void append_csv_sample(const idms_metrics_t *m, time_t now)
             (unsigned long)m->sensor_error_flags,
             m->wifi_connected ? 1u : 0u);
     fclose(f);
-    xSemaphoreGive(s_file_mux);
+    telemetry_csv_unlock();
 }
 
 void telemetry_build_weekly_report(char *buf, size_t buf_sz)

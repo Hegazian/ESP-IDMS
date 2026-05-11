@@ -76,6 +76,8 @@ Production recommendation:
 
 - Generate a per-product or per-device certificate/key.
 - Do not reuse a public development private key across all shipped devices.
+- Production builds now fail if HTTPS OTA would embed the checked-in
+  development key; wire in production certificate provisioning before release.
 - Use OTA only on trusted LANs or behind a controlled service path.
 - Keep strong Basic Auth credentials provisioned in encrypted NVS.
 

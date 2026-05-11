@@ -7,6 +7,39 @@
 #include <stdio.h>
 #include <string.h>
 
+static void html_escape(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+    size_t used = 0;
+    for (size_t i = 0; src[i] && used + 1 < dst_len; i++) {
+        const char *rep = NULL;
+        switch (src[i]) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        default: break;
+        }
+        if (rep) {
+            size_t rlen = strlen(rep);
+            if (used + rlen >= dst_len) {
+                break;
+            }
+            memcpy(dst + used, rep, rlen);
+            used += rlen;
+        } else {
+            dst[used++] = src[i];
+        }
+    }
+    dst[used] = '\0';
+}
+
 void tg_build_status(char *buf, size_t sz)
 {
     idms_metrics_t m;
@@ -27,13 +60,13 @@ void tg_build_status(char *buf, size_t sz)
         "<b>T_out:</b> %s\n"
         "<b>\xce\x94T:</b> %s\n"
         "<b>Sensors:</b> %s\n\n"
-        "<b>Technicians:</b> %u/5",
+        "<b>Technicians:</b> %u/%d",
         ota_get_version(),
         ota_get_status(), ota_get_partition(),
         m.wifi_connected ? "\xe2\x9c\x85" : "\xe2\x9d\x8c", m.wifi_ip[0] ? m.wifi_ip : "N/A",
         a, ti, to, dt,
         m.sensor_preflight_ok ? "OK" : (m.sensor_status[0] ? m.sensor_status : "Preflight pending"),
-        config_get_tech_count());
+        config_get_tech_count(), CONFIG_TECH_MAX_COUNT);
 }
 
 void tg_build_weekly(char *buf, size_t sz)
@@ -109,12 +142,20 @@ void tg_build_ota(char *buf, size_t sz)
 void tg_build_techs(char *buf, size_t sz)
 {
     uint8_t count = config_get_tech_count();
-    char list[512] = "";
+    char list[1024] = "";
     char id[64];
     for (int i = 0; i < count; i++) {
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
-            char e[128];
-            snprintf(e, sizeof(e), "  [%d] <code>%s</code>\n", i, id);
+            char name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
+            char esc_name[96] = "";
+            config_get_tech_name(i, name, sizeof(name));
+            html_escape(esc_name, sizeof(esc_name), name);
+            char e[256];
+            snprintf(e, sizeof(e), "  [%d] %s%s<code>%s</code>\n",
+                     i,
+                     esc_name[0] ? esc_name : "",
+                     esc_name[0] ? " - " : "",
+                     id);
             size_t cur = strlen(list);
             size_t elen = strlen(e);
             if (cur + elen < sizeof(list) - 1) {
@@ -125,9 +166,9 @@ void tg_build_techs(char *buf, size_t sz)
     if (count == 0) snprintf(list, sizeof(list), "  (none)\n");
     snprintf(buf, sz,
         "<b>\xf0\x9f\x93\x8b Technician IDs</b>\n\n"
-        "Registered (%u/5):\n%s\n"
-        "<i>Use serial console or /remove_tech to manage.</i>",
-        count, list);
+        "Registered (%u/%d):\n%s\n"
+        "<i>New technicians can sign in once with the shared admin name and password.</i>",
+        count, CONFIG_TECH_MAX_COUNT, list);
 }
 
 void tg_build_reboot_confirm(char *buf, size_t sz)
@@ -145,12 +186,17 @@ void tg_build_tech_remove(char *buf, size_t sz)
         snprintf(buf, sz, "<b>\xf0\x9f\x93\x8b Technician IDs</b>\n\nNo technicians registered.");
         return;
     }
-    char list[512] = "";
+    char list[1024] = "";
     char id[64];
     for (int i = 0; i < count; i++) {
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
-            char e[128];
-            snprintf(e, sizeof(e), "  [%d] <code>%s</code>\n", i, id);
+            char name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
+            char esc_name[96] = "";
+            config_get_tech_name(i, name, sizeof(name));
+            html_escape(esc_name, sizeof(esc_name), name);
+            char e[256];
+            snprintf(e, sizeof(e), "  [%d] %s%s<code>%s</code>\n",
+                     i, esc_name[0] ? esc_name : "", esc_name[0] ? " - " : "", id);
             size_t cur = strlen(list);
             size_t elen = strlen(e);
             if (cur + elen < sizeof(list) - 1) {

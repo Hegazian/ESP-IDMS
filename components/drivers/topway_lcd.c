@@ -443,6 +443,7 @@ esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str)
 esp_err_t topway_successive_write(uint32_t addr, uint8_t length, const uint8_t *data, size_t data_len)
 {
     if (!data || length == 0) return ESP_ERR_INVALID_ARG;
+    if (data_len > 510 || data_len != (size_t)length) return ESP_ERR_INVALID_ARG;
 
     uint8_t pkt[7 + 510];
     pkt[0] = TOPWAY_CMD_SUCCESSIVE_WRITE;
