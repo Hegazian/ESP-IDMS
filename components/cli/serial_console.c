@@ -339,6 +339,21 @@ static void handle_cmd(const char *cmd)
 #else
         ESP_LOGW(TAG, "Topway display not enabled in config");
 #endif
+    } else if (strncmp(cmd, "topway_usb_unlock ", 18) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        const char *password = cmd + 18;
+        while (*password && isspace((unsigned char)*password)) {
+            password++;
+        }
+        if (password[0] == '\0') {
+            ESP_LOGW(TAG, "Usage: topway_usb_unlock <password>");
+        } else {
+            esp_err_t err = topway_usb_unlock(password);
+            ESP_LOGI(TAG, "Topway USB unlock packet sent: %s", esp_err_to_name(err));
+        }
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
     } else if (strcmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
         ESP_LOGI(TAG, "  add <chat_id> [name] - Add authorized technician ID");
@@ -359,6 +374,7 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  show_secrets     — Show secret status (values hidden)");
         ESP_LOGI(TAG, "  topway_test      — Write test values to Topway screen");
         ESP_LOGI(TAG, "  topway_str <hex_addr> <text> — Write string to Topway VP address");
+        ESP_LOGI(TAG, "  topway_usb_unlock <p> - Unlock Topway USB drive access");
         ESP_LOGI(TAG, "  adc              - Read raw ADC values (diagnose current sensor)");
         ESP_LOGI(TAG, "  cal_zero         - Safe no-load current zero calibration");
         ESP_LOGI(TAG, "  cal_all          - Sensor self-test + safe automatic calibration");

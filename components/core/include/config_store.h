@@ -18,6 +18,12 @@ esp_err_t config_add_tech_id(const char *id);
 esp_err_t config_find_tech_id(const char *id, int *idx_out);
 esp_err_t config_get_tech_name(int idx, char *out, size_t out_len);
 esp_err_t config_set_tech_name(int idx, const char *name);
+esp_err_t config_get_tech_phone(int idx, char *out, size_t out_len);
+esp_err_t config_set_tech_phone(int idx, const char *phone);
+esp_err_t config_find_tech_phone(const char *phone, int *idx_out);
+esp_err_t config_normalize_egypt_phone(const char *input, char *out, size_t out_len);
+esp_err_t config_add_pending_tech_phone(const char *phone, const char *name);
+esp_err_t config_bind_tech_phone(const char *phone, const char *telegram_id, const char *name);
 esp_err_t config_add_tech(const char *id, const char *name);
 esp_err_t config_remove_tech(int idx);
 esp_err_t config_clear_techs(void);
@@ -49,7 +55,7 @@ esp_err_t config_get_cloud_token(char *out, size_t out_len);
 esp_err_t config_set_cloud_token(const char *token);
 
 /* ------------------------------------------------------------------ */
-/*  Device information shown on the Topway INFO page                   */
+/*  Device/Telegram display strings shown on the Topway pages          */
 /*  Stored in NVS namespace "idms" and persisted across reboots.       */
 /* ------------------------------------------------------------------ */
 
@@ -57,7 +63,7 @@ esp_err_t config_set_cloud_token(const char *token);
 #define CONFIG_DEFAULT_DEVICE_MODEL      "ESP-IDMS"
 #define CONFIG_DEFAULT_SUPPORT_EMAIL     ""
 #define CONFIG_DEFAULT_SUPPORT_PHONE     ""
-#define CONFIG_DEFAULT_QR_CODE           "@IDMS_USERBOT"
+#define CONFIG_DEFAULT_QR_CODE           "https://t.me/IDMS_USERBOT"
 
 esp_err_t config_get_device_model(char *out, size_t out_len);
 esp_err_t config_set_device_model(const char *value);
@@ -96,6 +102,11 @@ esp_err_t config_set_qr_code(const char *value);
 /* Delta temperature alert threshold in C (pure value) */
 #define CONFIG_DEFAULT_DT_ALERT_THRESHOLD  5   /* 5 C */
 
+/* Sensor calibration offsets stored as Celsius x10. */
+#define CONFIG_TEMP_OFFSET_X10_MIN       -200  /* -20.0 C */
+#define CONFIG_TEMP_OFFSET_X10_MAX        200  /* +20.0 C */
+#define CONFIG_DEFAULT_TEMP_OFFSET_X10    0
+
 int16_t config_get_min_tin(void);
 esp_err_t config_set_min_tin(int16_t value);
 int16_t config_get_max_tin(void);
@@ -118,3 +129,7 @@ int16_t config_get_dt_high_threshold(void);
 esp_err_t config_set_dt_high_threshold(int16_t value);
 uint32_t config_get_current_cal_x100(void);
 esp_err_t config_set_current_cal_x100(uint32_t value);
+int16_t config_get_tin_offset_x10(void);
+esp_err_t config_set_tin_offset_x10(int16_t value);
+int16_t config_get_tout_offset_x10(void);
+esp_err_t config_set_tout_offset_x10(int16_t value);

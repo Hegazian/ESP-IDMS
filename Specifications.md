@@ -105,6 +105,8 @@ Delta T = T_out - T_in
 | T_out max | 55 C | `max_tout` | Topway config page |
 | Delta T low | 5 C | `dt_alert` | Topway config page |
 | Delta T high | 15 C | `dt_high` | `set_dt_high <C>` |
+| Temp In offset | 0.0 C | `tin_off_x10` | Topway settings calibration |
+| Temp Out offset | 0.0 C | `tout_off_x10` | Topway settings calibration |
 
 ## 7. Topway VP Map
 
@@ -112,13 +114,12 @@ Delta T = T_out - T_in
 
 | VP | Type | Meaning |
 |----|------|---------|
-| `0x080000` | N16 | Current x10 |
-| `0x080002` | N16 | T_in x10 |
-| `0x080004` | N16 | T_out x10 |
-| `0x080006` | N16 | Delta T x10, signed |
-| `0x000380` | String | ACTIVE or INACTIVE |
-| `0x000600` | String | ERROR |
-| `0x000700` | String | WARNING |
+| `0x080000` | N16 | Current, A |
+| `0x080002` | N16 | T_in, C |
+| `0x080004` | N16 | T_out, C |
+| `0x000800` | String | ESP RTC datetime, Cairo local `YYYY-MM-DD HH:MM` |
+| `0x080006` | N16 | Device status text color, RGB565 |
+| `0x000380` | String | Device status text |
 | `0x000500` | String | Diagnostic detail |
 
 ### Settings page
@@ -129,6 +130,13 @@ Delta T = T_out - T_in
 | `0x000900` | String | Wi-Fi SSID input |
 | `0x000080` | String | Wi-Fi password input |
 | `0x080020` | N16 | Wi-Fi connect button |
+| `0x080050` | N16 | Current calibration scale, A/V |
+| `0x080052` | N16 | Temp In offset, signed C |
+| `0x080054` | N16 | Temp Out offset, signed C |
+| `0x080056` | N16 | Current zero button |
+| `0x080058` | N16 | Calibration apply button |
+| `0x08005A` | N16 | Calibration save button |
+| `0x000700` | String | Calibration status message |
 
 ### Configuration page
 
@@ -142,25 +150,45 @@ Delta T = T_out - T_in
 | `0x08003A` | N16 | Current max |
 | `0x080024` | N16 | Delta T low threshold |
 | `0x08003C` | N16 | Apply button |
+| `0x000600` | String | Validation message below Apply |
 
-### Info page
+### Telegram page
 
 | VP | Type | Meaning |
 |----|------|---------|
-| `0x000980` | String | Device model |
-| `0x000B00` | String | Serial number |
-| `0x000B80` | String | Manufacture date |
-| `0x000100` | String | Support email |
-| `0x000180` | String | Support phone |
-| `0x000280` | String | QR payload |
+| `0x000280` | String | Telegram bot QR URL |
+| `0x000000-BUFF` | String | Technician number input |
+| `0x000C80` | String | Bot status message |
+| `0x000D00` | String | Authorized technician row 1 |
+| `0x000D80` | String | Authorized technician row 2 |
+| `0x000E00` | String | Authorized technician row 3 |
+| `0x000E80` | String | Authorized technician row 4 |
+| `0x000F00` | String | Authorized technician row 5 |
+| `0x080060` | N16 | Authorize technician button |
+| `0x080026` | N16 | Delete row 1 button |
+| `0x080028` | N16 | Delete row 2 button |
+| `0x08002A` | N16 | Delete row 3 button |
+| `0x08002C` | N16 | Delete row 4 button |
+| `0x08002E` | N16 | Delete row 5 button |
 
-Default QR payload: `@IDMS_USERBOT`.
+Default QR payload: `https://t.me/IDMS_USERBOT`. The bot task refreshes it
+from Telegram `getMe` when networking is ready.
+
+The technician input is a local Egyptian mobile number. Firmware accepts
+`01024912688`, `1024912688`, `+201024912688`, or `+20 01024912688` and stores
+the canonical `+201024912688`. The slot remains pending until the technician
+shares their own Telegram contact with the bot, after which the real Telegram
+ID is bound to the phone slot.
+
+Technician identity is one-to-one: one phone number maps to one Telegram ID,
+and one Telegram ID maps to one phone number. Display rows show phone numbers,
+not chat IDs.
 
 ## 8. NVS Namespaces And Important Keys
 
 | Namespace | Keys |
 |-----------|------|
-| `idms` | technicians, thresholds, calibration, device info |
+| `idms` | technicians, thresholds, calibration, Telegram QR |
 | `secrets` | Wi-Fi, Telegram, OTA, cloud URL/token |
 | `telemetry` | weekly report state |
 | `cloud` | uploaded CSV offset |
@@ -176,9 +204,10 @@ Important keys:
 | `cloud_url`, `cloud_token` | Cloud upload endpoint and token |
 | `tech_count`, `tech_id_0..4` | Telegram technicians |
 | `curr_cal` | Current calibration A/V x100 |
+| `tin_off_x10`, `tout_off_x10` | Temperature offsets in C x10 |
 | `power_ma` | Power-loss threshold in mA |
 | `run_ma` | Machine-running threshold in mA |
-| `qr_code` | Info page QR payload |
+| `qr_code` | Telegram bot QR URL payload |
 
 Automatic NVS erase is disabled. If NVS cannot mount because of no free pages or
 version mismatch, the firmware returns an error instead of wiping provisioned

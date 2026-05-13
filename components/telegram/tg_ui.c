@@ -146,16 +146,19 @@ void tg_build_techs(char *buf, size_t sz)
     char id[64];
     for (int i = 0; i < count; i++) {
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+            char phone[24] = "";
             char name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
             char esc_name[96] = "";
+            config_get_tech_phone(i, phone, sizeof(phone));
             config_get_tech_name(i, name, sizeof(name));
             html_escape(esc_name, sizeof(esc_name), name);
             char e[256];
-            snprintf(e, sizeof(e), "  [%d] %s%s<code>%s</code>\n",
+            snprintf(e, sizeof(e), "  [%d] %s%s<code>%.32s</code>%s\n",
                      i,
                      esc_name[0] ? esc_name : "",
                      esc_name[0] ? " - " : "",
-                     id);
+                     phone[0] ? phone : "Phone required",
+                     (phone[0] && id[0] == '\0') ? " (pending)" : "");
             size_t cur = strlen(list);
             size_t elen = strlen(e);
             if (cur + elen < sizeof(list) - 1) {
@@ -165,9 +168,9 @@ void tg_build_techs(char *buf, size_t sz)
     }
     if (count == 0) snprintf(list, sizeof(list), "  (none)\n");
     snprintf(buf, sz,
-        "<b>\xf0\x9f\x93\x8b Technician IDs</b>\n\n"
+        "<b>\xf0\x9f\x93\x8b Technicians</b>\n\n"
         "Registered (%u/%d):\n%s\n"
-        "<i>New technicians can sign in once with the shared admin name and password.</i>",
+        "<i>Display-added phone numbers become active after the technician shares their Telegram contact.</i>",
         count, CONFIG_TECH_MAX_COUNT, list);
 }
 
@@ -183,20 +186,24 @@ void tg_build_tech_remove(char *buf, size_t sz)
 {
     uint8_t count = config_get_tech_count();
     if (count == 0) {
-        snprintf(buf, sz, "<b>\xf0\x9f\x93\x8b Technician IDs</b>\n\nNo technicians registered.");
+        snprintf(buf, sz, "<b>\xf0\x9f\x93\x8b Technicians</b>\n\nNo technicians registered.");
         return;
     }
     char list[1024] = "";
     char id[64];
     for (int i = 0; i < count; i++) {
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+            char phone[24] = "";
             char name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
             char esc_name[96] = "";
+            config_get_tech_phone(i, phone, sizeof(phone));
             config_get_tech_name(i, name, sizeof(name));
             html_escape(esc_name, sizeof(esc_name), name);
             char e[256];
-            snprintf(e, sizeof(e), "  [%d] %s%s<code>%s</code>\n",
-                     i, esc_name[0] ? esc_name : "", esc_name[0] ? " - " : "", id);
+            snprintf(e, sizeof(e), "  [%d] %s%s<code>%s</code>%s\n",
+                     i, esc_name[0] ? esc_name : "", esc_name[0] ? " - " : "",
+                     phone[0] ? phone : "Phone required",
+                     (phone[0] && id[0] == '\0') ? " (pending)" : "");
             size_t cur = strlen(list);
             size_t elen = strlen(e);
             if (cur + elen < sizeof(list) - 1) {

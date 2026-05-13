@@ -94,6 +94,23 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
         if (cJSON_IsString(text)) {
             safe_strcpy(out->message_text, sizeof(out->message_text), text->valuestring);
         }
+        cJSON *contact = cJSON_GetObjectItem(msg, "contact");
+        if (cJSON_IsObject(contact)) {
+            cJSON *phone = cJSON_GetObjectItem(contact, "phone_number");
+            if (cJSON_IsString(phone)) {
+                out->has_contact = true;
+                safe_strcpy(out->contact_phone, sizeof(out->contact_phone), phone->valuestring);
+            }
+            cJSON *user_id = cJSON_GetObjectItem(contact, "user_id");
+            if (user_id) {
+                if (cJSON_IsString(user_id)) {
+                    safe_strcpy(out->contact_user_id, sizeof(out->contact_user_id), user_id->valuestring);
+                } else if (cJSON_IsNumber(user_id)) {
+                    snprintf(out->contact_user_id, sizeof(out->contact_user_id), "%lld",
+                             (long long)user_id->valuedouble);
+                }
+            }
+        }
         cJSON_Delete(root);
         return true;
     } else if (cb) {

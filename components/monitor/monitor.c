@@ -799,6 +799,13 @@ static void monitor_task(void *arg)
         }
 #endif
 
+        if (v_in) {
+            t_in += (float)config_get_tin_offset_x10() / 10.0f;
+        }
+        if (v_out) {
+            t_out += (float)config_get_tout_offset_x10() / 10.0f;
+        }
+
         float dt = 0.0f;
         bool v_dt = v_in && v_out;
         if (v_dt) {

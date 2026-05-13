@@ -26,11 +26,10 @@ esp_err_t idms_ui_topway_init(void);
 void idms_ui_topway_update(void);
 
 /**
- * @brief Send device information to Topway LCD display
+ * @brief Send Telegram page information to Topway LCD display
  * 
- * Sends NVS-backed device model, serial number, manufacture date,
- * support email, support phone, and QR code payload to the INFO page
- * VP addresses.
+ * Sends the Telegram bot QR payload, clears the technician-number input,
+ * and refreshes the authorized technician list.
  */
 void idms_ui_topway_send_device_info(void);
 
@@ -45,15 +44,16 @@ void idms_ui_topway_send_config(void);
 /**
  * @brief Read configuration parameters from Topway LCD display
  * 
- * Reads the configuration values from the LCD VP addresses.
+ * Reads the configuration values from the LCD VP addresses. Values use the
+ * same units as config_store: pure Celsius and Amperes, not x10 or mA.
  * Useful when user modifies settings on the LCD touchscreen.
  * 
- * @param min_tin     Pointer to store Min Temp IN (x10, 0.1C precision), or NULL
- * @param min_tout    Pointer to store Min Temp OUT (x10, 0.1C precision), or NULL
- * @param min_current Pointer to store Min Current (mA), or NULL
- * @param max_tin     Pointer to store Max Temp IN (x10, 0.1C precision), or NULL
- * @param max_tout    Pointer to store Max Temp OUT (x10, 0.1C precision), or NULL
- * @param max_current Pointer to store Max Current (mA), or NULL
+ * @param min_tin     Pointer to store Min Temp IN (C), or NULL
+ * @param min_tout    Pointer to store Min Temp OUT (C), or NULL
+ * @param min_current Pointer to store Min Current (A), or NULL
+ * @param max_tin     Pointer to store Max Temp IN (C), or NULL
+ * @param max_tout    Pointer to store Max Temp OUT (C), or NULL
+ * @param max_current Pointer to store Max Current (A), or NULL
  * @param dt_alert    Pointer to store Delta_T threshold (C), or NULL
  * @return esp_err_t ESP_OK on success, error code otherwise
  */

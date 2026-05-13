@@ -3,6 +3,7 @@
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 void tg_urlenc_append(char *dst, size_t sz, const char *src);
 
@@ -11,6 +12,8 @@ esp_err_t tg_send_text(const char *chat_id, const char *text);
 esp_err_t tg_send_text_ext(const char *chat_id, const char *text, bool disable_preview);
 
 esp_err_t tg_send_kb(const char *chat_id, const char *text, const char *kb_json);
+
+esp_err_t tg_send_contact_request(const char *chat_id, const char *text);
 
 esp_err_t tg_answer_cb(const char *cb_id);
 

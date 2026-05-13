@@ -8,10 +8,13 @@ typedef struct {
     int update_id;
     bool is_message;
     bool is_callback;
+    bool has_contact;
     char from_id[32];
     char chat_id[32];
     char chat_type[16];
     char message_text[512];
+    char contact_phone[32];
+    char contact_user_id[32];
     char callback_id[64];
     char callback_data[64];
 } tg_update_t;

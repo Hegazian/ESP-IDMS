@@ -13,6 +13,7 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "cJSON.h"
 #include "lwip/dns.h"
 #include "lwip/ip4_addr.h"
 #include "sdkconfig.h"
@@ -48,6 +49,7 @@ static char *s_resp_buf = NULL;
 static bool s_dns_ok = false;
 static int s_update_offset = -1;
 static bool s_commands_registered = false;
+static bool s_bot_qr_refreshed = false;
 static TaskHandle_t s_poll_task = NULL;
 
 typedef enum {
@@ -55,8 +57,10 @@ typedef enum {
     SESSION_SETUP_ADMIN_NAME,
     SESSION_SETUP_ADMIN_PASSWORD,
     SESSION_SETUP_ADMIN_CONFIRM,
+    SESSION_SETUP_CONTACT,
     SESSION_LOGIN_NAME,
     SESSION_LOGIN_PASSWORD,
+    SESSION_LOGIN_CONTACT,
 } session_state_t;
 
 typedef enum {
@@ -447,6 +451,93 @@ static void send_serial_login_change_notice(const char *chat)
         "<code>set_bot_password PASSWORD</code>");
 }
 
+static bool has_pending_phone_slots(void)
+{
+    uint8_t count = config_get_tech_count();
+    for (int i = 0; i < count; i++) {
+        char id[64] = "";
+        char phone[24] = "";
+        config_get_tech_id(i, id, sizeof(id));
+        config_get_tech_phone(i, phone, sizeof(phone));
+        if (id[0] == '\0' && phone[0] != '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool handle_contact_authorization(const tg_update_t *update)
+{
+    if (!update->has_contact) {
+        return false;
+    }
+
+    tg_session_t *session = find_session(update->from_id);
+    bool already_authorized = tg_is_authorized_id(update->from_id);
+    bool allow_new_binding = session &&
+        (session->state == SESSION_SETUP_CONTACT || session->state == SESSION_LOGIN_CONTACT);
+    allow_new_binding = allow_new_binding || already_authorized;
+
+    if (update->contact_user_id[0] != '\0' &&
+        strcmp(update->contact_user_id, update->from_id) != 0) {
+        tg_send_contact_request(update->chat_id,
+            "\xe2\x9d\x8c Please share <b>your own</b> Telegram contact using the button below.");
+        return true;
+    }
+
+    char phone[24] = "";
+    if (config_normalize_egypt_phone(update->contact_phone, phone, sizeof(phone)) != ESP_OK) {
+        tg_send_contact_request(update->chat_id,
+            "\xe2\x9d\x8c This phone number is not an Egyptian mobile number. "
+            "Ask the admin to add your local mobile number on the display, then share contact again.");
+        return true;
+    }
+
+    int idx = -1;
+    if (config_find_tech_phone(phone, &idx) != ESP_OK && !allow_new_binding) {
+        tg_send_text(update->chat_id,
+            "\xe2\x9d\x8c This phone number is not authorized on this device. "
+            "Ask an admin to add your local mobile number from the display.");
+        return true;
+    }
+
+    char existing_id[64] = "";
+    config_get_tech_id(idx, existing_id, sizeof(existing_id));
+    if (existing_id[0] != '\0' && strcmp(existing_id, update->from_id) != 0) {
+        tg_send_text(update->chat_id,
+            "\xe2\x9d\x8c This phone number is already linked to another Telegram account.");
+        return true;
+    }
+
+    const char *name = (session && session->name[0]) ? session->name : "Phone";
+    esp_err_t err = config_bind_tech_phone(phone, update->from_id, name);
+    if (err != ESP_OK) {
+        snprintf(s_resp_buf, RESP_BUF_SZ,
+            "\xe2\x9d\x8c Could not authorize this contact: %s", esp_err_to_name(err));
+        tg_send_text(update->chat_id, s_resp_buf);
+        return true;
+    }
+
+    snprintf(s_resp_buf, RESP_BUF_SZ,
+        "\xe2\x9c\x85 <b>Access Granted</b>\n\n"
+        "Phone <code>%s</code> is now linked to this Telegram account. "
+        "You will not be asked again.", phone);
+    if (session) {
+        login_throttle_reset_user(update->from_id);
+        clear_session(session);
+    }
+    tg_send_kb(update->chat_id, s_resp_buf, TG_KB_MAIN);
+    return true;
+}
+
+static void request_contact_authorization(const char *chat_id)
+{
+    tg_send_contact_request(chat_id,
+        "\xf0\x9f\x93\xb1 <b>Phone Verification</b>\n\n"
+        "Ask the admin to add your local mobile number on the display, then tap "
+        "<b>Share Phone Number</b> below. The device adds <code>+20</code> automatically.");
+}
+
 static bool begin_admin_setup(const char *chat_id, const char *from_id)
 {
     if (config_has_telegram_admin_credentials() ||
@@ -560,9 +651,11 @@ static void remove_tech_at(const char *chat, int idx)
     }
 
     char removed_id[64] = "";
+    char removed_phone[24] = "";
     char removed_name[CONFIG_TECH_NAME_MAX_LEN + 1] = "";
     char esc_name[96] = "";
     config_get_tech_id(idx, removed_id, sizeof(removed_id));
+    config_get_tech_phone(idx, removed_phone, sizeof(removed_phone));
     config_get_tech_name(idx, removed_name, sizeof(removed_name));
     html_escape(esc_name, sizeof(esc_name), removed_name);
 
@@ -570,7 +663,9 @@ static void remove_tech_at(const char *chat, int idx)
     if (err == ESP_OK) {
         snprintf(s_resp_buf, RESP_BUF_SZ,
             "\xe2\x9c\x85 Removed technician [%d]: %s<code>%s</code>\nRemaining: %u/%d",
-            idx, esc_name[0] ? esc_name : "", removed_id, count - 1, CONFIG_TECH_MAX_COUNT);
+            idx, esc_name[0] ? esc_name : "",
+            removed_phone[0] ? removed_phone : removed_id,
+            count - 1, CONFIG_TECH_MAX_COUNT);
     } else {
         snprintf(s_resp_buf, RESP_BUF_SZ,
             "\xe2\x9d\x8c Failed to remove technician: %s", esp_err_to_name(err));
@@ -682,9 +777,6 @@ static bool handle_session_message(const tg_update_t *update)
         if (err == ESP_OK) {
             err = config_set_telegram_admin_password(s->password);
         }
-        if (err == ESP_OK) {
-            err = config_add_tech(update->from_id, s->name);
-        }
         if (err != ESP_OK) {
             snprintf(s_resp_buf, RESP_BUF_SZ,
                 "\xe2\x9d\x8c Could not save Telegram login setup: %s", esp_err_to_name(err));
@@ -693,15 +785,11 @@ static bool handle_session_message(const tg_update_t *update)
             return true;
         }
 
-        char esc_name[96];
-        html_escape(esc_name, sizeof(esc_name), s->name);
-        snprintf(s_resp_buf, RESP_BUF_SZ,
+        s->state = SESSION_SETUP_CONTACT;
+        s->password[0] = '\0';
+        tg_send_contact_request(update->chat_id,
             "\xe2\x9c\x85 <b>Telegram Login Configured</b>\n\n"
-            "Saved shared admin name <b>%s</b> and registered this Telegram account. "
-            "You will not be asked for the admin name/password again.",
-            esc_name);
-        clear_session(s);
-        tg_send_kb(update->chat_id, s_resp_buf, TG_KB_MAIN);
+            "Now tap <b>Share Phone Number</b> to link this Telegram account to your phone.");
         return true;
     }
 
@@ -726,23 +814,10 @@ static bool handle_session_message(const tg_update_t *update)
                 clear_session(s);
                 return true;
             }
-            err = config_add_tech(update->from_id, s->name);
-            if (err != ESP_OK) {
-                snprintf(s_resp_buf, RESP_BUF_SZ,
-                    "\xe2\x9d\x8c Could not save technician credentials: %s", esp_err_to_name(err));
-                tg_send_text(update->chat_id, s_resp_buf);
-                clear_session(s);
-                return true;
-            }
-            login_throttle_reset_user(update->from_id);
-            char esc_name[96];
-            html_escape(esc_name, sizeof(esc_name), s->name);
-            snprintf(s_resp_buf, RESP_BUF_SZ,
-                "\xe2\x9c\x85 <b>Access Granted</b>\n\n"
-                "Saved this Telegram account for <b>%s</b>. You will not be asked for the admin name/password again.",
-                esc_name);
-            clear_session(s);
-            tg_send_kb(update->chat_id, s_resp_buf, TG_KB_MAIN);
+            s->state = SESSION_LOGIN_CONTACT;
+            tg_send_contact_request(update->chat_id,
+                "\xe2\x9c\x85 Admin name/password accepted.\n\n"
+                "Tap <b>Share Phone Number</b> to link this Telegram account to your phone.");
             return true;
         }
 
@@ -760,6 +835,9 @@ static bool handle_session_message(const tg_update_t *update)
     }
 
     case SESSION_NONE:
+    case SESSION_SETUP_CONTACT:
+    case SESSION_LOGIN_CONTACT:
+        return false;
     default:
         clear_session(s);
         return false;
@@ -916,6 +994,69 @@ static void register_cmds(void)
     }
 }
 
+static bool valid_bot_username(const char *username)
+{
+    if (!username || username[0] == '\0') {
+        return false;
+    }
+    for (const char *p = username; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void refresh_bot_qr_code(void)
+{
+    if (s_bot_qr_refreshed) {
+        return;
+    }
+
+    char resp[768] = {0};
+    int st = 0;
+    esp_err_t err = tg_http_get("/getMe", resp, sizeof(resp), &st);
+    if (err != ESP_OK || st < 200 || st >= 300) {
+        ESP_LOGW(TAG, "Could not refresh Telegram QR URL from getMe: err=%s st=%d",
+                 esp_err_to_name(err), st);
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) {
+        ESP_LOGW(TAG, "Could not refresh Telegram QR URL: invalid getMe JSON");
+        return;
+    }
+
+    const char *username = NULL;
+    cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    cJSON *user = result ? cJSON_GetObjectItem(result, "username") : NULL;
+    if (cJSON_IsTrue(ok) && cJSON_IsString(user) && valid_bot_username(user->valuestring)) {
+        username = user->valuestring;
+    }
+
+    if (username) {
+        char url[CONFIG_INFO_STRING_MAX_LEN + 1];
+        snprintf(url, sizeof(url), "https://t.me/%s", username);
+        char current[CONFIG_INFO_STRING_MAX_LEN + 1] = {0};
+        config_get_qr_code(current, sizeof(current));
+        if (strcmp(current, url) != 0) {
+            esp_err_t set_err = config_set_qr_code(url);
+            if (set_err == ESP_OK) {
+                ESP_LOGI(TAG, "Telegram QR URL refreshed from bot username");
+                s_bot_qr_refreshed = true;
+            } else {
+                ESP_LOGW(TAG, "Could not store Telegram QR URL: %s", esp_err_to_name(set_err));
+            }
+        } else {
+            s_bot_qr_refreshed = true;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -961,6 +1102,7 @@ static void poll_task(void *arg)
                 continue;
             }
             register_cmds();
+            refresh_bot_qr_code();
             if (!boot_notified) {
                 boot_notified = true;
                 char _bip[16] = {0};
@@ -1098,9 +1240,17 @@ static void poll_task(void *arg)
             continue;
         }
 
+        if (update.has_contact && handle_contact_authorization(&update)) {
+            continue;
+        }
+
         if (!tg_is_authorized_id(update.from_id)) {
             uint8_t tech_count = config_get_tech_count();
             if (update.is_message) {
+                if (has_pending_phone_slots()) {
+                    request_contact_authorization(update.chat_id);
+                    continue;
+                }
                 begin_shared_login(&update);
                 continue;
             }

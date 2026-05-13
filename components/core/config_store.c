@@ -17,6 +17,7 @@ static const char *NS = "idms";
 static const char *SECRETS_NS = "secrets";
 
 #define TECH_ID_MAX_LEN        63
+#define TECH_PHONE_MAX_LEN     15
 #define TECH_PASSWORD_MIN_LEN  6
 #define TECH_SALT_HEX_LEN      32
 #define TECH_HASH_HEX_LEN      64
@@ -124,6 +125,8 @@ static void erase_tech_slot(nvs_handle_t h, int idx)
     tech_key(key, sizeof(key), "tech_salt", idx);
     nvs_erase_key(h, key);
     tech_key(key, sizeof(key), "tech_pwd", idx);
+    nvs_erase_key(h, key);
+    tech_key(key, sizeof(key), "tech_phone", idx);
     nvs_erase_key(h, key);
 }
 
@@ -277,6 +280,16 @@ esp_err_t config_store_init(void)
         ESP_LOGI(TAG, "Initialized dt_high to default: %d C", CONFIG_IDMS_DT_HIGH_C);
     }
 
+    /* Temperature calibration offsets */
+    if (nvs_get_i16(h, "tin_off_x10", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "tin_off_x10", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+        ESP_LOGI(TAG, "Initialized tin_off_x10 to default: %d", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+    }
+    if (nvs_get_i16(h, "tout_off_x10", &val_i16) != ESP_OK) {
+        nvs_set_i16(h, "tout_off_x10", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+        ESP_LOGI(TAG, "Initialized tout_off_x10 to default: %d", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+    }
+
     err = seed_default_str(h, "dev_model", CONFIG_DEFAULT_DEVICE_MODEL, "device model");
     if (err != ESP_OK) {
         nvs_close(h);
@@ -300,7 +313,8 @@ esp_err_t config_store_init(void)
     char qr_value[CONFIG_INFO_STRING_MAX_LEN + 1] = {0};
     size_t qr_len = sizeof(qr_value);
     if (nvs_get_str(h, "qr_code", qr_value, &qr_len) == ESP_OK &&
-        strcmp(qr_value, "https://t.me/IDMS_UserBot") == 0) {
+        (strcmp(qr_value, "@IDMS_USERBOT") == 0 ||
+         strcmp(qr_value, "https://t.me/IDMS_UserBot") == 0)) {
         nvs_set_str(h, "qr_code", CONFIG_DEFAULT_QR_CODE);
         ESP_LOGI(TAG, "Migrated QR code default to %s", CONFIG_DEFAULT_QR_CODE);
     }
@@ -434,6 +448,254 @@ esp_err_t config_set_tech_name(int idx, const char *name)
     return err;
 }
 
+esp_err_t config_normalize_egypt_phone(const char *input, char *out, size_t out_len)
+{
+    if (!input || !out || out_len < TECH_PHONE_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char digits[24] = "";
+    size_t used = 0;
+    for (const char *p = input; *p && used + 1 < sizeof(digits); p++) {
+        if (isdigit((unsigned char)*p)) {
+            digits[used++] = *p;
+        } else if (*p == '+' || *p == ' ' || *p == '-' || *p == '(' || *p == ')') {
+            continue;
+        } else {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    digits[used] = '\0';
+
+    const char *local = NULL;
+    if (used == 11 && digits[0] == '0' && digits[1] == '1') {
+        local = digits + 1;
+    } else if (used == 10 && digits[0] == '1') {
+        local = digits;
+    } else if (used == 12 && strncmp(digits, "20", 2) == 0 && digits[2] == '1') {
+        local = digits + 2;
+    } else if (used == 13 && strncmp(digits, "200", 3) == 0 && digits[3] == '1') {
+        local = digits + 3;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strlen(local) != 10 ||
+        !(strncmp(local, "10", 2) == 0 ||
+          strncmp(local, "11", 2) == 0 ||
+          strncmp(local, "12", 2) == 0 ||
+          strncmp(local, "15", 2) == 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(out, out_len, "+20%s", local);
+    return ESP_OK;
+}
+
+esp_err_t config_get_tech_phone(int idx, char *out, size_t out_len)
+{
+    if (!out || out_len == 0 || idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_phone", idx);
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READONLY, &h), TAG, "open");
+
+    size_t required = out_len;
+    esp_err_t err = nvs_get_str(h, key, out, &required);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        out[0] = '\0';
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t config_set_tech_phone(int idx, const char *phone)
+{
+    if (idx < 0 || idx >= CONFIG_TECH_MAX_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char normalized[TECH_PHONE_MAX_LEN] = "";
+    if (phone && phone[0] != '\0') {
+        ESP_RETURN_ON_ERROR(config_normalize_egypt_phone(phone, normalized, sizeof(normalized)),
+                            TAG, "normalize phone");
+    }
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_phone", idx);
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+
+    esp_err_t err;
+    if (normalized[0] != '\0') {
+        err = nvs_set_str(h, key, normalized);
+    } else {
+        err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t config_find_tech_phone(const char *phone, int *idx_out)
+{
+    char normalized[TECH_PHONE_MAX_LEN] = "";
+    ESP_RETURN_ON_ERROR(config_normalize_egypt_phone(phone, normalized, sizeof(normalized)),
+                        TAG, "normalize phone");
+
+    uint8_t count = config_get_tech_count();
+    for (int i = 0; i < count; i++) {
+        char existing[TECH_PHONE_MAX_LEN] = "";
+        if (config_get_tech_phone(i, existing, sizeof(existing)) == ESP_OK &&
+            strcmp(existing, normalized) == 0) {
+            if (idx_out) {
+                *idx_out = i;
+            }
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t config_add_pending_tech_phone(const char *phone, const char *name)
+{
+    if (!valid_tech_name(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char normalized[TECH_PHONE_MAX_LEN] = "";
+    ESP_RETURN_ON_ERROR(config_normalize_egypt_phone(phone, normalized, sizeof(normalized)),
+                        TAG, "normalize phone");
+
+    int existing_idx = -1;
+    if (config_find_tech_phone(normalized, &existing_idx) == ESP_OK) {
+        if (name && name[0] != '\0') {
+            ESP_RETURN_ON_ERROR(config_set_tech_name(existing_idx, name), TAG, "set name");
+        }
+        return ESP_OK;
+    }
+
+    uint8_t count = config_get_tech_count();
+    if (count >= CONFIG_TECH_MAX_COUNT) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+
+    char key[20];
+    tech_key(key, sizeof(key), "tech_id", count);
+    esp_err_t err = nvs_set_str(h, key, "");
+    if (err == ESP_OK) {
+        tech_key(key, sizeof(key), "tech_phone", count);
+        err = nvs_set_str(h, key, normalized);
+    }
+    if (err == ESP_OK && name && name[0] != '\0') {
+        tech_key(key, sizeof(key), "tech_name", count);
+        err = nvs_set_str(h, key, name);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "tech_count", count + 1);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Added pending technician phone: %s (count: %u)", normalized, count + 1);
+    }
+    return err;
+}
+
+esp_err_t config_bind_tech_phone(const char *phone, const char *telegram_id, const char *name)
+{
+    if (!telegram_id || telegram_id[0] == '\0' || !valid_tech_name(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(telegram_id) < 3 || strlen(telegram_id) > TECH_ID_MAX_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char normalized[TECH_PHONE_MAX_LEN] = "";
+    ESP_RETURN_ON_ERROR(config_normalize_egypt_phone(phone, normalized, sizeof(normalized)),
+                        TAG, "normalize phone");
+
+    int phone_idx = -1;
+    bool phone_exists = (config_find_tech_phone(normalized, &phone_idx) == ESP_OK);
+
+    int id_idx = -1;
+    bool id_exists = (config_find_tech_id(telegram_id, &id_idx) == ESP_OK);
+
+    if (phone_exists && id_exists && phone_idx != id_idx) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int idx = phone_exists ? phone_idx : id_idx;
+    if (idx >= 0) {
+        char existing_id[64] = "";
+        char existing_phone[TECH_PHONE_MAX_LEN] = "";
+        config_get_tech_id(idx, existing_id, sizeof(existing_id));
+        config_get_tech_phone(idx, existing_phone, sizeof(existing_phone));
+        if (existing_id[0] != '\0' && strcmp(existing_id, telegram_id) != 0) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (existing_phone[0] != '\0' && strcmp(existing_phone, normalized) != 0) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        ESP_RETURN_ON_ERROR(config_set_tech_id(idx, telegram_id), TAG, "bind id");
+        ESP_RETURN_ON_ERROR(config_set_tech_phone(idx, normalized), TAG, "bind phone");
+    } else {
+        uint8_t count = config_get_tech_count();
+        if (count >= CONFIG_TECH_MAX_COUNT) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        nvs_handle_t h;
+        ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+
+        char key[20];
+        tech_key(key, sizeof(key), "tech_id", count);
+        esp_err_t err = nvs_set_str(h, key, telegram_id);
+        if (err == ESP_OK) {
+            tech_key(key, sizeof(key), "tech_phone", count);
+            err = nvs_set_str(h, key, normalized);
+        }
+        if (err == ESP_OK && name && name[0] != '\0') {
+            tech_key(key, sizeof(key), "tech_name", count);
+            err = nvs_set_str(h, key, name);
+        }
+        if (err == ESP_OK) {
+            err = nvs_set_u8(h, "tech_count", count + 1);
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+        if (err != ESP_OK) {
+            return err;
+        }
+        idx = count;
+    }
+
+    if (name && name[0] != '\0') {
+        ESP_RETURN_ON_ERROR(config_set_tech_name(idx, name), TAG, "set name");
+    }
+    ESP_LOGI(TAG, "Bound technician phone %s to Telegram ID %s", normalized, telegram_id);
+    return ESP_OK;
+}
+
 esp_err_t config_add_tech(const char *id, const char *name)
 {
     if (!id || id[0] == '\0' || !valid_tech_name(name)) {
@@ -507,6 +769,7 @@ esp_err_t config_remove_tech(int idx)
     for (int i = idx; i < count - 1; i++) {
         move_str_key(h, "tech_id", i, i + 1, TECH_ID_MAX_LEN + 1);
         move_str_key(h, "tech_name", i, i + 1, CONFIG_TECH_NAME_MAX_LEN + 1);
+        move_str_key(h, "tech_phone", i, i + 1, TECH_PHONE_MAX_LEN);
     }
     erase_tech_slot(h, count - 1);
     esp_err_t err = nvs_set_u8(h, "tech_count", count - 1);
@@ -743,7 +1006,7 @@ esp_err_t config_set_cloud_token(const char *token)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Device information stored in NVS "idms" namespace                  */
+/*  Device/Telegram display strings stored in NVS "idms" namespace     */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t store_get_str_or_default(const char *key, const char *fallback,
@@ -1079,4 +1342,30 @@ esp_err_t config_set_current_cal_x100(uint32_t value)
         return ESP_ERR_INVALID_ARG;
     }
     return store_set_u32("curr_cal", value);
+}
+
+int16_t config_get_tin_offset_x10(void)
+{
+    return nvs_get_i16_or_default("tin_off_x10", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+}
+
+esp_err_t config_set_tin_offset_x10(int16_t value)
+{
+    if (value < CONFIG_TEMP_OFFSET_X10_MIN || value > CONFIG_TEMP_OFFSET_X10_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("tin_off_x10", value);
+}
+
+int16_t config_get_tout_offset_x10(void)
+{
+    return nvs_get_i16_or_default("tout_off_x10", CONFIG_DEFAULT_TEMP_OFFSET_X10);
+}
+
+esp_err_t config_set_tout_offset_x10(int16_t value)
+{
+    if (value < CONFIG_TEMP_OFFSET_X10_MIN || value > CONFIG_TEMP_OFFSET_X10_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return store_set_i16("tout_off_x10", value);
 }

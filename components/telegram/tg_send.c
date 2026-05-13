@@ -116,6 +116,27 @@ esp_err_t tg_send_kb(const char *chat_id, const char *text, const char *kb)
     return tg_http_post_form("/sendMessage", body);
 }
 
+esp_err_t tg_send_contact_request(const char *chat_id, const char *text)
+{
+    if (!chat_id || !text) return ESP_ERR_INVALID_ARG;
+    char enc[2048]; enc[0] = '\0';
+    tg_urlenc_append(enc, sizeof(enc), text);
+    const char *reply_markup =
+        "{\"keyboard\":[[{\"text\":\"Share Phone Number\",\"request_contact\":true}]],"
+        "\"resize_keyboard\":true,\"one_time_keyboard\":true}";
+    char rm_enc[512]; rm_enc[0] = '\0';
+    tg_urlenc_append(rm_enc, sizeof(rm_enc), reply_markup);
+    char body[TG_BODY_BUF_SZ];
+    int needed = snprintf(body, sizeof(body),
+                          "chat_id=%s&parse_mode=HTML&text=%s&reply_markup=%s",
+                          chat_id, enc, rm_enc);
+    if (needed < 0 || needed >= (int)sizeof(body)) {
+        ESP_LOGW(TAG, "Telegram contact request message too large");
+        return ESP_ERR_NO_MEM;
+    }
+    return tg_http_post_form("/sendMessage", body);
+}
+
 esp_err_t tg_answer_cb(const char *cb_id)
 {
     char body[256];
@@ -130,7 +151,7 @@ esp_err_t tg_broadcast_text(const char *text)
     esp_err_t last = ESP_OK;
     for (int i = 0; i < n; i++) {
         char id[64];
-        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
             esp_err_t e = tg_send_text(id, text);
             if (e != ESP_OK) last = e;
         }
@@ -145,7 +166,7 @@ esp_err_t tg_broadcast_alert(const char *text)
     esp_err_t last = ESP_OK;
     for (int i = 0; i < n; i++) {
         char id[64];
-        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+        if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
             esp_err_t e = tg_send_text_ext(id, text, true);
             if (e != ESP_OK) last = e;
         }

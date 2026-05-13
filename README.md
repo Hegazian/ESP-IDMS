@@ -19,7 +19,7 @@ Last updated: 2026-05-10
 - Detects power loss when current stays below the power-loss threshold.
 - Detects cooling faults when Delta T is outside the configured allowed range.
 - Shows live readings and status on a Topway HKT070DTA-1C 800x480 smart LCD.
-- Lets operators edit Wi-Fi, threshold, and device info fields from Topway.
+- Lets operators edit Wi-Fi, thresholds, sensor calibration, and Telegram technician numbers from Topway.
 - Sends Telegram alerts, reminders, status, OTA links, and weekly reports.
 - Supports OTA firmware upload with HTTPS, auth, SHA256, and rollback health
   validation.
@@ -163,6 +163,7 @@ changed from Telegram. Use serial console commands `set_bot_admin` and
 | `show_secrets` | Show secret status with values hidden |
 | `topway_test` | Write test values to the Topway display |
 | `topway_str <hex_addr> <text>` | Write a string to a Topway VP |
+| `topway_usb_unlock <password>` | Send Topway `U_drv_unlock` (`0xE3`) to remove USB access lock |
 | `reboot` | Reboot the device |
 | `help` | Show commands |
 
@@ -176,48 +177,94 @@ topway_display/Display_Topway/Display_Topway
 
 ### Home Page
 
-| Field | VP |
-|-------|----|
-| Current_Value | `0x080000` |
-| Temp_In | `0x080002` |
-| Temp_Out | `0x080004` |
-| Device Status | `0x000700`, `0x000600`, `0x000380` |
-| Diagnostic info | `0x000500` |
+| Field | VP | Type/Units |
+|-------|----|------------|
+| Current value | `0x080000` | N16, A |
+| Temp In | `0x080002` | N16 signed, C |
+| Temp Out | `0x080004` | N16 signed, C |
+| ESP RTC datetime | `0x000800` | String, `YYYY-MM-DD HH:MM` Cairo local time |
+| Device status color | `0x080006` | N16 RGB565: green active, yellow warning, red error |
+| Device status text | `0x000380` | String |
+| Diagnostic info | `0x000500` | String |
 
 ### Settings Page
 
-| Field | VP |
-|-------|----|
-| Wi-Fi state | `0x000400` |
-| Wi-Fi SSID | `0x000900` |
-| Wi-Fi password | `0x000080` |
-| Wi-Fi connect button | `0x080020` |
+| Field | VP | Type/Units |
+|-------|----|------------|
+| Wi-Fi status message | `0x000400` | String |
+| Wi-Fi SSID | `0x000900` | String input |
+| Wi-Fi password | `0x000080` | String input |
+| Wi-Fi connect button | `0x080020` | N16 button, ESP clears after read |
+| Current calibration scale | `0x080050` | N16, A/V |
+| Temp In offset | `0x080052` | N16 signed, C |
+| Temp Out offset | `0x080054` | N16 signed, C |
+| Current zero button | `0x080056` | N16 button |
+| Calibration apply button | `0x080058` | N16 button |
+| Calibration save button | `0x08005A` | N16 button |
+| Calibration status message | `0x000700` | String |
+
+Calibration plus/minus buttons should be RGTools-local VP operations against
+`0x080050`, `0x080052`, and `0x080054`; the ESP only polls Zero/Apply/Save.
 
 ### Configuration Page
 
-| Field | VP |
-|-------|----|
-| Temp_In min | `0x080030` |
-| Temp_In max | `0x080036` |
-| Temp_Out min | `0x080032` |
-| Temp_Out max | `0x080038` |
-| Current min | `0x080034` |
-| Current max | `0x08003A` |
-| Delta_T | `0x080024` |
-| Apply button | `0x08003C` |
+| Field | VP | Type/Units |
+|-------|----|------------|
+| Temp In min | `0x080030` | N16 signed, C |
+| Temp In max | `0x080036` | N16 signed, C |
+| Temp Out min | `0x080032` | N16 signed, C |
+| Temp Out max | `0x080038` | N16 signed, C |
+| Current min | `0x080034` | N16, A |
+| Current max | `0x08003A` | N16, A |
+| Delta-T alert | `0x080024` | N16 signed, C |
+| Apply button | `0x08003C` | N16 button |
+| Validation message below Apply | `0x000600` | String |
 
-### Info Page
+Configuration plus/minus buttons should be RGTools-local VP operations against
+the numeric fields; the ESP only polls the Apply VP.
 
-| Field | VP |
-|-------|----|
-| Device Model | `0x000980` |
-| Serial Number | `0x000B00` |
-| Manufacture Date | `0x000B80` |
-| Support Email | `0x000100` |
-| Support Phone | `0x000180` |
-| QR Code | `0x000280` |
+The ESP also syncs the Topway panel RTC with its local system clock after SNTP
+time is available, then refreshes it about once per hour.
 
-Default QR payload: `@IDMS_USERBOT`.
+### Telegram Page
+
+| Field | VP | Type/Units |
+|-------|----|------------|
+| Telegram bot QR URL | `0x000280` | String |
+| Technician number input | `0x000000-BUFF` | String input |
+| Bot status message | `0x000C80` | String |
+| Authorized number row 1 | `0x000D00` | String |
+| Authorized number row 2 | `0x000D80` | String |
+| Authorized number row 3 | `0x000E00` | String |
+| Authorized number row 4 | `0x000E80` | String |
+| Authorized number row 5 | `0x000F00` | String |
+| Authorize button | `0x080060` | N16 button, ESP clears after read |
+| Delete row 1 | `0x080026` | N16 button, ESP clears after read |
+| Delete row 2 | `0x080028` | N16 button, ESP clears after read |
+| Delete row 3 | `0x08002A` | N16 button, ESP clears after read |
+| Delete row 4 | `0x08002C` | N16 button, ESP clears after read |
+| Delete row 5 | `0x08002E` | N16 button, ESP clears after read |
+
+The Telegram QR payload defaults to `https://t.me/IDMS_USERBOT`. When the bot
+can call Telegram `getMe`, it stores the real `https://t.me/<bot_username>` URL
+in NVS and the display refreshes the QR VP automatically.
+
+The Telegram keypad should be a screen-local numeric keypad that writes the
+local Egyptian mobile number into `0x000000-BUFF`. The technician should enter
+only the local number, for example `01024912688` or `1024912688`; firmware
+normalizes it to `+201024912688`. Backspace/Clear can be RGTools-local; only
+Authorize needs the ESP button VP.
+
+After the phone is added, the row is pending until the technician opens the
+Telegram bot and taps **Share Phone Number**. Telegram does not let bots message
+or identify people by phone directly, so the bot verifies the shared contact,
+then stores the real Telegram ID in the same technician slot for future alerts
+and commands.
+
+Each technician slot links one phone number to one Telegram ID. A phone number
+cannot be linked to two Telegram accounts, and a Telegram account cannot claim
+another slot's phone number. The display rows show phone numbers only; legacy
+chat-ID-only slots are shown as needing a phone link.
 
 ## Thresholds And Calibration
 
@@ -228,6 +275,8 @@ Default QR payload: `@IDMS_USERBOT`.
 | Power-loss threshold | 350 mA | NVS `power_ma` |
 | Machine-running threshold | 1 A | NVS `run_ma` |
 | Current scale | 30.00 A/V | NVS `curr_cal` |
+| Temp In offset | 0.0 C | NVS `tin_off_x10` |
+| Temp Out offset | 0.0 C | NVS `tout_off_x10` |
 | Auto-zero samples | 512 | Kconfig |
 | Auto-zero max RMS | 50 mV | Kconfig |
 | Delta T low threshold | 5 C | NVS `dt_alert` |
@@ -297,7 +346,7 @@ not hidden by Telegram clients.
 | New technician joins later | Bot asks for shared admin name and password once | Share the bot URL; technician sends `/start`, enters the shared credentials, then is saved |
 | Registered technician returns | Bot recognizes saved Telegram ID | Use menu commands directly; no admin name/password prompt |
 | Wrong shared credentials | Bot rejects login and allows up to 3 attempts | Send the admin name again, then the correct password |
-| Technician list is full | New technician login is rejected | Remove an old technician from Telegram Technician IDs or serial `remove <index>` |
+| Technician list is full | New technician login is rejected | Remove an old technician from Telegram Technicians or serial `remove <index>` |
 | Need to change shared admin name/password | Telegram has no credential-change command after first setup | Use serial `set_bot_admin` and `set_bot_password`; existing saved technicians stay authorized |
 | Technicians exist but shared login is missing | Telegram setup is blocked because it is no longer a blank device | Set the shared login from serial console |
 | `clear` removes all technicians | Shared login remains in NVS if already configured | Next user can register with the existing shared credentials; change credentials from serial if needed |
