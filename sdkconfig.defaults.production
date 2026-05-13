@@ -1,0 +1,26 @@
+# Production security defaults for release/manufacturing builds.
+#
+# Use these only for devices that are ready to enter the secure provisioning
+# flow. Secure boot and flash encryption can burn irreversible eFuses when
+# flashed according to the ESP-IDF production workflow.
+
+CONFIG_IDMS_PRODUCTION_BUILD=y
+
+# Core ESP-IDF security controls required by the production gate in app_main.c.
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_NVS_ENCRYPTION=y
+
+# Production behavior.
+CONFIG_IDMS_TELEGRAM_ALLOW_FIRST_USER_CLAIM=n
+CONFIG_IDMS_OTA_HTTPS_ENABLE=y
+CONFIG_IDMS_CLOUD_ALLOW_INSECURE_HTTP=n
+
+# Secrets must be provisioned through encrypted NVS/manufacturing tooling or
+# the serial provisioning flow, not compiled into firmware.
+CONFIG_IDMS_WIFI_SSID=""
+CONFIG_IDMS_WIFI_PASSWORD=""
+CONFIG_IDMS_TELEGRAM_BOT_TOKEN=""
+CONFIG_IDMS_OTA_HTTP_AUTH_USER=""
+CONFIG_IDMS_OTA_HTTP_AUTH_PASS=""
+CONFIG_IDMS_CLOUD_TOKEN=""

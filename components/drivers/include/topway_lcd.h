@@ -26,6 +26,8 @@ extern "C" {
 #define TOPWAY_CMD_READ_PG_ID       0x32
 #define TOPWAY_CMD_SET_SYS_CONFIG   0xE0
 #define TOPWAY_CMD_SEL_PROJECT      0xE1
+#define TOPWAY_CMD_U_DRV_FORMAT     0xE2
+#define TOPWAY_CMD_U_DRV_UNLOCK     0xE3
 #define TOPWAY_CMD_TOUCH_CALIB      0xE4
 #define TOPWAY_CMD_SCREEN_SAVER     0x5E
 #define TOPWAY_CMD_BACKLIGHT_CTRL   0x5F
@@ -103,40 +105,64 @@ extern "C" {
 #define VP_G16_BASE      0x060000
 #define VP_N16_BASE      0x080000
 
-#define VP_STR_CURRENT   0x000000
-#define VP_STR_TIN       0x000080
-#define VP_STR_TOUT      0x000100
-#define VP_STR_DT        0x000180
-#define VP_STR_WIFI      0x000200
-#define VP_STR_VERSION   0x000280
-#define VP_STR_OTA       0x000300
-#define VP_STR_STATUS    0x000380
-#define VP_STR_STATUS_ERR 0x000600
-#define VP_STR_STATUS_WARN 0x000700
-#define VP_STR_DIAG      0x000500
+#define VP_STR_STATUS    0x000380  /* HOME: central device status text */
+#define VP_STR_DIAG      0x000500  /* HOME: compact diagnostic message */
+#define VP_STR_RTC_DATETIME 0x000800 /* ESP RTC date/time, local display string */
+#define VP_N16_STATUS_COLOR 0x080006 /* HOME: device status text color, RGB565 */
 
-#define VP_N16_CUR_X10      0x080000
-#define VP_N16_TIN_X10      0x080002
-#define VP_N16_TOUT_X10     0x080004
-#define VP_N16_DT_X10       0x080006
+/* WiFi configuration VP addresses */
+#define VP_STR_WIFI_SSID         0x000900  /* WiFi SSID (string) - INPUT ONLY */
+#define VP_STR_WIFI_PASSWORD     0x000080  /* WiFi Password (string) - INPUT ONLY */
+#define VP_N16_WIFI_CONNECT_BTN  0x080020  /* WiFi Connect button - triggers reconnect */
+#define VP_STR_WIFI_STATUS_MSG   0x000400  /* WiFi status message (string) - OUTPUT */
 
-/* Valid flags and extra status variables - placed after the 4 main display vars */
-#define VP_N16_CUR_VALID    0x080010
-#define VP_N16_TIN_VALID    0x080012
-#define VP_N16_TOUT_VALID   0x080014
-#define VP_N16_DT_VALID     0x080016
-#define VP_N16_WIFI_STATUS  0x080018
-#define VP_N16_OTA_STATUS   0x08001A
-#define VP_N16_TECH_COUNT   0x08001C
-#define VP_N16_POWER_FAULT  0x08001E
-#define VP_N16_COOL_FAULT   0x080020
+/* TELEGRAM page VP addresses */
+#define VP_STR_TELEGRAM_QR_URL       0x000280  /* Telegram bot URL for QR widget */
+#define VP_STR_TELEGRAM_TECH_INPUT   0x000000  /* 0x000000-BUFF: Technician number input */
+#define VP_STR_TELEGRAM_STATUS_MSG   0x000C80  /* Authorization/status message */
+#define VP_STR_TELEGRAM_AUTH_ROW0    0x000D00  /* Authorized technician row 0 */
+#define VP_STR_TELEGRAM_AUTH_ROW1    0x000D80  /* Authorized technician row 1 */
+#define VP_STR_TELEGRAM_AUTH_ROW2    0x000E00  /* Authorized technician row 2 */
+#define VP_STR_TELEGRAM_AUTH_ROW3    0x000E80  /* Authorized technician row 3 */
+#define VP_STR_TELEGRAM_AUTH_ROW4    0x000F00  /* Authorized technician row 4 */
+#define VP_N16_TELEGRAM_AUTHORIZE_BTN 0x080060 /* Authorize button - set to 1 when pressed */
+#define VP_N16_TELEGRAM_DELETE_ROW0   0x080026 /* Delete technician row 0 */
+#define VP_N16_TELEGRAM_DELETE_ROW1   0x080028 /* Delete technician row 1 */
+#define VP_N16_TELEGRAM_DELETE_ROW2   0x08002A /* Delete technician row 2 */
+#define VP_N16_TELEGRAM_DELETE_ROW3   0x08002C /* Delete technician row 3 */
+#define VP_N16_TELEGRAM_DELETE_ROW4   0x08002E /* Delete technician row 4 */
+
+#define VP_N16_CUR_VALUE    0x080000  /* Current value, A */
+#define VP_N16_TIN_VALUE    0x080002  /* Temp In, C */
+#define VP_N16_TOUT_VALUE   0x080004  /* Temp Out, C */
+
+/* CONFIGURATION page VP addresses (pure Celsius and Amperes) */
+#define VP_N16_CFG_MIN_TIN      0x080030  /* Min Temp IN threshold (C) */
+#define VP_N16_CFG_MIN_TOUT     0x080032  /* Min Temp OUT threshold (C) */
+#define VP_N16_CFG_MIN_CURRENT  0x080034  /* Min Current threshold (A) */
+#define VP_N16_CFG_MAX_TIN      0x080036  /* Max Temp IN threshold (C) */
+#define VP_N16_CFG_MAX_TOUT     0x080038  /* Max Temp OUT threshold (C) */
+#define VP_N16_CFG_MAX_CURRENT  0x08003A  /* Max Current threshold (A) */
+#define VP_N16_CFG_DT_ALERT     0x080024  /* Delta temperature threshold (C) */
+#define VP_N16_CFG_APPLY_BTN    0x08003C  /* Apply button - set to 1 when pressed */
+#define VP_STR_CFG_STATUS_MSG   0x000600  /* Validation message under Apply */
+
+/* SETTINGS page calibration VP addresses (absolute values, no x10 multiplier) */
+#define VP_N16_CAL_CURRENT_SCALE     0x080050 /* Current scale in A/V */
+#define VP_N16_CAL_TIN_OFFSET        0x080052 /* Temp In offset in C, signed */
+#define VP_N16_CAL_TOUT_OFFSET       0x080054 /* Temp Out offset in C, signed */
+#define VP_N16_CAL_ZERO_BTN          0x080056 /* Current zero button */
+#define VP_N16_CAL_APPLY_BTN         0x080058 /* Apply calibration values */
+#define VP_N16_CAL_SAVE_BTN          0x08005A /* Save calibration values */
+#define VP_STR_CAL_STATUS_MSG        0x000700 /* Calibration status message */
 
 #define WIFI_STATUS_OFFLINE   0
 #define WIFI_STATUS_CONNECTED 1
 
-#define OTA_STATUS_READY    0
-#define OTA_STATUS_UPDATING 1
-#define OTA_STATUS_ERROR    2
+#define DEVICE_STATE_ACTIVE   0
+#define DEVICE_STATE_INACTIVE 1
+#define DEVICE_STATE_WARNING  2
+#define DEVICE_STATE_ERROR    3
 
 #define TOPWAY_SYS_TIMER_CTRL0  0xFFFF00
 
@@ -160,6 +186,7 @@ esp_err_t topway_select_project(uint8_t prj_id);
 esp_err_t topway_set_backlight(uint8_t level);
 esp_err_t topway_screen_saver(uint16_t timeout_s, uint8_t dim_level);
 esp_err_t topway_buzzer_ctrl(uint8_t loops, uint8_t t1, uint8_t t2, uint8_t freq1, uint8_t freq2);
+esp_err_t topway_usb_unlock(const char *password);
 
 esp_err_t topway_disp_page(uint16_t page_id);
 esp_err_t topway_set_element_fg(uint8_t element, uint16_t page_id, uint8_t element_id, uint16_t color);
@@ -168,10 +195,12 @@ esp_err_t topway_set_codepage(uint8_t country, uint8_t codepage);
 esp_err_t topway_suspend_refresh(bool suspend);
 
 esp_err_t topway_n16_write(uint32_t addr, uint16_t value);
+esp_err_t topway_n16_read(uint32_t addr, uint16_t *value);
 esp_err_t topway_n16_fill(uint32_t addr, uint16_t length, uint16_t value);
 esp_err_t topway_n32_write(uint32_t addr, uint32_t value);
 esp_err_t topway_n64_write(uint32_t addr, uint64_t value);
 esp_err_t topway_str_write(uint32_t addr, const char *str);
+esp_err_t topway_str_read(uint32_t addr, char *out, size_t out_sz);
 esp_err_t topway_str_fill(uint32_t addr, uint16_t length, const char *str);
 esp_err_t topway_successive_write(uint32_t addr, uint8_t length, const uint8_t *data, size_t data_len);
 esp_err_t topway_g16_write(uint32_t addr, uint16_t size, const uint16_t *values);
@@ -180,6 +209,12 @@ esp_err_t topway_g16_write_rotate(uint32_t addr, uint16_t size, uint16_t value);
 esp_err_t topway_sys_reg_write(uint32_t addr, uint8_t value);
 
 esp_err_t topway_rtc_set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec);
+
+/* Touch event callback */
+typedef void (*topway_touch_callback_t)(uint8_t page_id, uint8_t key_id);
+
+void topway_register_touch_callback(topway_touch_callback_t callback);
+void topway_process_touch_events(void);
 
 #ifdef __cplusplus
 }

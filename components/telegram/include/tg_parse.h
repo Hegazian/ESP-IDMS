@@ -8,14 +8,20 @@ typedef struct {
     int update_id;
     bool is_message;
     bool is_callback;
+    bool has_contact;
     char from_id[32];
     char chat_id[32];
+    char chat_type[16];
     char message_text[512];
+    char contact_phone[32];
+    char contact_user_id[32];
     char callback_id[64];
     char callback_data[64];
 } tg_update_t;
 
 bool tg_parse_update(const char *json_response, tg_update_t *out);
+
+bool tg_parse_first_update_id(const char *json_response, int *update_id);
 
 bool tg_is_authorized_id(const char *from_id);
 

@@ -14,6 +14,10 @@ const char *ota_get_partition(void);
 
 void ota_mark_app_valid(void);
 
+void ota_mark_app_invalid_and_reboot(void);
+
+bool ota_is_pending_validation(void);
+
 void ota_schedule_valid_mark(uint32_t delay_ms);
 
 bool ota_generate_token(char *out, size_t out_sz);

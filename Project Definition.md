@@ -1,114 +1,166 @@
-# Project Definition — ESP32 Industrial Device Monitoring System (ESP-IDMS)
+﻿# Project Definition - ESP-IDMS
 
-**Document Version:** 1.0  
-**Date:** April 2026  
-**Status:** Approved
+Document version: 3.0
+Last updated: 2026-05-10
+Status: Feature-complete firmware, entering production hardening and field validation
 
----
+## 1. Project Summary
 
-## 1. Executive Summary
+ESP-IDMS is an ESP32-S3 based industrial monitoring device. It monitors machine
+power state through a current transformer, monitors cooling performance through
+two temperature probes, shows live values on a Topway smart LCD, sends Telegram
+alerts, supports OTA firmware updates, and stores/uploads telemetry for later
+analysis.
 
-The **ESP32 Industrial Device Monitoring System (ESP-IDMS)** is a low-cost, professional-grade IoT monitoring appliance designed for deployment inside industrial facilities. The system continuously monitors a target machine's **operational status** and **cooling circuit efficiency**, and delivers instant push notifications to designated maintenance technicians via **Telegram** whenever a fault condition is detected.
+The project is now ready to start a new phase:
 
-The project is purpose-built to minimize total cost of ownership: there are no recurring SIM or data subscription fees, and the entire connectivity stack runs over the facility's existing Wi-Fi infrastructure.
+- Pilot deployment
+- Cloud dashboard/export work
+- Production security provisioning
+- PCB/enclosure finalization
+- Manufacturing test process
 
----
+## 2. Primary Goals
 
-## 2. Project Objectives
+1. Detect machine power loss from AC current.
+2. Detect cooling problems from `Delta T = T_out - T_in`.
+3. Show status locally on a 7-inch Topway LCD.
+4. Alert technicians through Telegram.
+5. Allow safe OTA updates with rollback.
+6. Persist configuration, credentials, calibration, and device info in NVS.
+7. Record telemetry locally and upload it to a cloud endpoint.
+8. Support production hardening with secure boot, flash encryption, and NVS
+   encryption.
 
-| # | Objective |
-|---|---|
-| 1 | Provide **24/7 unattended monitoring** of machine power state and cooling performance. |
-| 2 | Deliver **instant, remote fault alerts** to maintenance technicians worldwide, without requiring an on-site presence. |
-| 3 | Maintain a **total BOM cost under $35 USD** per unit to allow economical fleet deployment. |
-| 4 | Eliminate recurring costs by replacing GSM/SIM-based connectivity with **Wi-Fi + cloud push notifications**. |
-| 5 | Ensure **personnel safety** through galvanic isolation between mains AC and all low-voltage electronics. |
+## 3. Current Implemented Features
 
----
+| Area | Current implementation |
+|------|------------------------|
+| Current sensing | SCT-013 ADC RMS sampling, auto-zero guard, runtime calibration |
+| Temperature | DS18B20 T_in and T_out on separate 1-Wire buses |
+| Fault detection | Power-loss and cooling-fault state machines with debounce |
+| Sensor health | Startup preflight plus runtime recovery for current/temp faults |
+| Display | Topway Home, Settings, Configuration, and Info pages |
+| Config persistence | NVS storage for thresholds, device info, secrets, technicians |
+| Wi-Fi | STA mode, reconnect, SNTP |
+| Telegram | Bot menu, status, alerts, reminders, weekly report, OTA link |
+| OTA | HTTPS upload, Basic Auth/token, SHA256, rollback health validation |
+| Telemetry | SPIFFS CSV, weekly stats, cloud upload batching |
+| Cloud | Generic HTTPS POST with Bearer token |
+| Console | Runtime provisioning, diagnostics, calibration commands |
 
-## 3. Design Philosophy & Technology Selection
+## 4. Key Architecture
 
-### 3.1 Connectivity: Wi-Fi over GSM
+```text
+Sensors -> monitor task -> metrics/state
+                    |-> Topway UI task
+                    |-> Telegram alerts
+                    |-> telemetry CSV
+                    |-> cloud sync task
 
-The system was initially conceived with a GSM module for cellular connectivity. After evaluation, Wi-Fi was selected as the final approach for the following reasons:
+Serial console -> config_store -> NVS
+Topway settings -> config_store -> NVS
+OTA server -> new firmware -> health validation -> rollback or accept
+```
 
-| Criterion | GSM/SIM | Wi-Fi (Selected) |
-|---|---|---|
-| Recurring cost | Monthly SIM fees | None |
-| Network reliability | Dependent on 2G/EDGE infrastructure (declining) | Facility LAN (always on) |
-| Data latency | Higher | Lower |
-| Hardware complexity | Higher (AT commands, SIM management) | Lower (native ESP32 stack) |
+## 5. Source Modules
 
-### 3.2 Alert Delivery: Telegram Bot API
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| App orchestration | `main/app_main.c` | Init order and OTA health validation |
+| Config store | `components/core/config_store.c` | NVS config, secrets, thresholds, device info |
+| Monitor | `components/monitor/monitor.c` | Sensor sampling, calibration, faults, metrics |
+| Topway driver | `components/drivers/topway_lcd.c` | UART protocol for smart LCD |
+| Topway UI | `components/ui/ui_topway.c` | Display updates, Wi-Fi/config/info page handling |
+| Wi-Fi | `components/wifi/wifi_manager.c` | STA connection and SNTP |
+| Telegram | `components/telegram/*` | Bot polling, HTTP, parsing, sending, menus |
+| OTA | `components/ota/ota.c` | Firmware upload server and rollback helpers |
+| Telemetry | `components/telemetry/telemetry.c` | CSV history and weekly statistics |
+| Cloud sync | `components/cloud_sync/cloud_sync.c` | HTTPS upload of pending CSV rows |
+| Console | `components/cli/serial_console.c` | Serial commands for provisioning and tests |
 
-Telegram was selected for alert delivery due to its free tier, robust HTTPS API, multi-device delivery, and instant notification capability. Technician IDs can be managed directly on the device without requiring a laptop or web interface.
+## 6. Operational Behavior
 
----
+### Power Loss
 
-## 4. Core Functional Modules
+Power loss is detected when valid current stays below the NVS-backed
+`power_ma` threshold for at least 5 seconds. This threshold is separate from the
+display's min/max current limits.
 
-### 4.1 Machine State Monitoring
+### Cooling Fault
 
-The system uses a **non-invasive AC Current Transformer (SCT-013-000)** that clips around a single live or neutral wire. This approach requires no physical connection to copper conductors and does not interrupt machine operation during installation.
+Cooling fault is checked only when the machine is considered running. The
+machine-running gate uses the NVS-backed `run_ma` threshold. Cooling is faulty
+when valid Delta T is below `dt_alert` or above `dt_high` for at least 5
+seconds.
 
-A **custom DC offset bias circuit** (dual 10 kΩ voltage divider + 10 µF decoupling capacitor) centres the AC waveform at 1.65 V (half of 3.3 V), making it readable by the ESP32's ADC on GPIO 34.
+### Sensor Faults
 
-**Fault Trigger:** If the measured RMS current drops below the configured threshold (0.2 A – 0.5 A) for more than 5 consecutive seconds, a **"Power Loss"** alert is dispatched to all registered technicians.
+Sensor preflight and runtime checks report current ADC/bias faults, T_in faults,
+T_out faults, and Delta T invalid state. Faults can recover automatically once
+readings become valid again.
 
-### 4.2 Cooling Efficiency Monitoring
+### Alerts
 
-Two **waterproof DS18B20** digital temperature sensors are deployed on a shared **1-Wire bus** (GPIO 4):
+Critical alerts are sent through Telegram. Ringing alerts are queued through a
+Telegram worker, reminders are protected by a mutex, and offline messages are
+kept for later flush when Wi-Fi returns.
 
-- **Sensor 1 (T_in):** Measures coolant/air temperature at the machine's cooling inlet.
-- **Sensor 2 (T_out):** Measures coolant/air temperature at the machine's cooling outlet.
+## 7. Production Security Model
 
-The system continuously computes the **temperature differential (ΔT = T_out − T_in)** and compares it against configurable thresholds.
+Development builds keep hardware security features off for convenience.
+Production builds must use:
 
-**Fault Trigger:** If ΔT falls below 5 °C (insufficient heat transfer) or rises above 15 °C (excessive heat load, indicating coolant blockage or pump failure), a **"Cooling Failure"** alert is dispatched.
+- `CONFIG_IDMS_PRODUCTION_BUILD=y`
+- `CONFIG_SECURE_BOOT=y`
+- `CONFIG_SECURE_FLASH_ENC_ENABLED=y`
+- `CONFIG_NVS_ENCRYPTION=y`
 
-### 4.3 Remote Alert & Notification System
+The repository includes `sdkconfig.defaults.production` as the production
+baseline. Enabling these settings is part of manufacturing because secure boot
+and flash encryption can involve irreversible eFuse operations.
 
-- **Transport:** Wi-Fi 2.4 GHz (802.11 b/g/n) with automatic reconnect logic.
-- **Protocol:** HTTPS POST to the Telegram Bot API (`api.telegram.org`) with SSL/TLS validation.
-- **Heartbeat:** A cloud connectivity check runs every 60 seconds.
-- **Storage:** Up to **5 technician Telegram Chat IDs** are stored persistently in ESP32 Non-Volatile Storage (NVS).
+## 8. Cloud Strategy
 
-### 4.4 On-Device User Interface
+The firmware uploads telemetry to a generic HTTPS endpoint. The recommended
+first cloud implementation is Cloudflare Worker + KV because it accepts the
+firmware's Bearer token flow without putting database credentials on the ESP32.
 
-A **2.8" SPI TFT touch display** (ILI9341 controller) provides:
+Firebase is a useful next layer for dashboards, but direct Firebase REST writes
+from the device should be avoided unless a safe token issuing mechanism is
+designed.
 
-- A real-time dashboard showing current machine state, T_in, T_out, ΔT, and network status.
-- An interactive menu system for adding or removing technician Telegram Chat IDs without any external tools.
+See [CLOUD_SETUP.md](./CLOUD_SETUP.md).
 
-### 4.5 Data Persistence
+## 9. Out Of Scope For This Phase
 
-Technician IDs are written to the ESP32's **Non-Volatile Storage (NVS)** using the `Preferences.h` library. This ensures that all configuration survives power outages and device reboots without requiring re-commissioning.
+- Full mobile app
+- Web dashboard charts
+- Factory provisioning GUI
+- Final certified PCB design
+- Modbus/SCADA integration
+- Cellular/GSM fallback
+- Multi-device fleet management UI
 
-### 4.6 Power Supply & Safety
+These are good candidates for the next phase.
 
-The unit is powered by a **Hi-Link HLK-PM01** isolated AC-DC module (100–240 V AC → 5 V DC). This module provides:
+## 10. Exit Criteria For Current Phase
 
-- **Galvanic isolation** between the mains AC supply and all low-voltage logic circuitry.
-- A wide input voltage range suitable for global deployment.
+The current firmware phase is considered complete when:
 
-**Recommended Enhancement:** A small **18650 Li-ion cell** (with a suitable charge/protection module) is recommended as a backup power source. This allows the ESP32 to transmit a final "Power Loss" alert during a total facility power outage before shutting down.
+- Full firmware build passes.
+- Topway VP contract matches the HMI project.
+- Sensor preflight/recovery behavior is stable on real hardware.
+- OTA health validation works on a real OTA update.
+- Telegram alerts and technician setup work after NVS provisioning.
+- Cloud endpoint receives telemetry rows.
+- Documentation reflects the current state.
 
----
+## 11. Next Phase Entry Points
 
-## 5. Out of Scope
+For a new chat/session, start with:
 
-- Local area network (LAN) dashboard or web server interface.
-- Integration with SCADA or PLC systems.
-- Data logging / time-series database integration.
-- OTA (Over-the-Air) firmware update mechanism *(recommended for future revision)*.
-
----
-
-## 6. Related Documents
-
-| Document | Description |
-|---|---|
-| [`Specifications.md`](./Specifications.md) | Technical specifications, sampling rates, and fault thresholds |
-| [`BOM.md`](./BOM.md) | Bill of Materials with part numbers and cost estimates |
-| [`PCB_Layout.md`](./PCB_Layout.md) | PCB design guidelines, layer usage, and GPIO pin mapping |
-| [`README.md`](./README.md) | Project overview and quick-start guide |
+1. [PROJECT_HANDOFF.md](./PROJECT_HANDOFF.md)
+2. [README.md](./README.md)
+3. [Specifications.md](./Specifications.md)
+4. [CLOUD_SETUP.md](./CLOUD_SETUP.md)

@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "telegram.h"
 #include "config_store.h"
+#include "telemetry.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -10,12 +11,14 @@
 #include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static const char *TAG = "ota";
 
@@ -36,7 +39,6 @@ static volatile bool s_update_in_progress = false;
 
 static char s_cached_user[64] = {0};
 static char s_cached_pass[64] = {0};
-static bool s_creds_cached = false;
 
 static struct {
     char token[17];
@@ -50,30 +52,24 @@ static struct {
 
 static void load_cached_creds(void)
 {
-    if (s_creds_cached) return;
     config_get_ota_user(s_cached_user, sizeof(s_cached_user));
     config_get_ota_pass(s_cached_pass, sizeof(s_cached_pass));
-    s_creds_cached = true;
 }
-
-static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static int b64_encode(char *out, size_t out_sz, const uint8_t *in, size_t in_len)
 {
-    if (out_sz < 4 * ((in_len + 2) / 3) + 1) return -1;
-    size_t i = 0, j = 0;
-    while (i < in_len) {
-        uint32_t octet_a = i < in_len ? in[i++] : 0;
-        uint32_t octet_b = i < in_len ? in[i++] : 0;
-        uint32_t octet_c = i < in_len ? in[i++] : 0;
-        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
-        out[j++] = b64_table[(triple >> 18) & 0x3F];
-        out[j++] = b64_table[(triple >> 12) & 0x3F];
-        out[j++] = (i - 1 < in_len) ? b64_table[(triple >> 6) & 0x3F] : '=';
-        out[j++] = (i - 2 < in_len) ? b64_table[triple & 0x3F] : '=';
+    if (!out || out_sz == 0) {
+        return -1;
     }
-    out[j] = '\0';
-    return (int)j;
+
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode((unsigned char *)out, out_sz, &olen, in, in_len);
+    if (ret != 0 || olen >= out_sz) {
+        return -1;
+    }
+
+    out[olen] = '\0';
+    return (int)olen;
 }
 
 static bool ct_memcmp(const void *a, const void *b, size_t len)
@@ -138,11 +134,23 @@ bool ota_check_token(const char *token)
         s_ota_token.token[0] = '\0';
         return false;
     }
-    if (ct_memcmp(token, s_ota_token.token, strlen(s_ota_token.token))) {
-        s_ota_token.token[0] = '\0';
+
+    const size_t expected_len = strlen(s_ota_token.token);
+    const size_t token_len = strlen(token);
+    char supplied[sizeof(s_ota_token.token)] = {0};
+    size_t copy_len = token_len < expected_len ? token_len : expected_len;
+    memcpy(supplied, token, copy_len);
+
+    if (token_len == expected_len && ct_memcmp(supplied, s_ota_token.token, expected_len)) {
         return true;
     }
     return false;
+}
+
+static void ota_clear_token(void)
+{
+    s_ota_token.token[0] = '\0';
+    s_ota_token.created_tick = 0;
 }
 
 static bool extract_token_from_uri(httpd_req_t *req, char *token, size_t token_sz)
@@ -191,7 +199,10 @@ static bool check_basic_auth(httpd_req_t *req)
     if (n < 0) return false;
 
     if (creds_len != (size_t)n) {
-        ct_memcmp(creds, expected_b64, (creds_len > (size_t)n) ? creds_len : (size_t)n);
+        size_t cmp_len = creds_len < (size_t)n ? creds_len : (size_t)n;
+        if (cmp_len > 0) {
+            ct_memcmp(creds, expected_b64, cmp_len);
+        }
         return false;
     }
     return ct_memcmp(creds, expected_b64, (size_t)n);
@@ -235,6 +246,101 @@ static bool is_end_boundary(const char *line, const char *boundary)
     if (strncmp(line, boundary, strlen(boundary)) != 0) return false;
     const char *after = line + strlen(boundary);
     return (strncmp(after, "--", 2) == 0);
+}
+
+static const char *find_bytes(const char *buf, size_t buf_len,
+                              const char *needle, size_t needle_len)
+{
+    if (!buf || !needle || needle_len == 0 || buf_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i <= buf_len - needle_len; i++) {
+        if (memcmp(buf + i, needle, needle_len) == 0) {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+static esp_err_t ota_write_verified(esp_ota_handle_t ota_h,
+                                    mbedtls_sha256_context *sha256_ctx,
+                                    const char *data, size_t len,
+                                    size_t *total, uint32_t max_size)
+{
+    if (len == 0) {
+        return ESP_OK;
+    }
+    if (*total + len > max_size) {
+        ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)",
+                 *total + len, (unsigned long)max_size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t err = esp_ota_write(ota_h, data, len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    mbedtls_sha256_update(sha256_ctx, (const unsigned char *)data, len);
+    *total += len;
+    return ESP_OK;
+}
+
+static esp_err_t ota_process_file_bytes(const char *data, size_t data_len,
+                                        char *scan_buf,
+                                        char *tail, size_t *tail_len,
+                                        size_t tail_cap,
+                                        const char *boundary,
+                                        size_t boundary_len,
+                                        esp_ota_handle_t ota_h,
+                                        mbedtls_sha256_context *sha256_ctx,
+                                        size_t *total, uint32_t max_size,
+                                        bool *found_boundary)
+{
+    *found_boundary = false;
+
+    size_t scan_len = *tail_len + data_len;
+    memcpy(scan_buf, tail, *tail_len);
+    memcpy(scan_buf + *tail_len, data, data_len);
+
+    char delimiter[160];
+    int delim_len_i = snprintf(delimiter, sizeof(delimiter), "\r\n%s", boundary);
+    if (delim_len_i <= 0 || delim_len_i >= (int)sizeof(delimiter)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t delimiter_len = (size_t)delim_len_i;
+
+    const char *found = find_bytes(scan_buf, scan_len, delimiter, delimiter_len);
+    size_t write_len = 0;
+    if (found) {
+        write_len = (size_t)(found - scan_buf);
+        *found_boundary = true;
+    } else if (scan_len >= boundary_len && memcmp(scan_buf, boundary, boundary_len) == 0) {
+        write_len = 0;
+        *found_boundary = true;
+    } else {
+        size_t keep_len = (boundary_len + 4 < tail_cap) ? boundary_len + 4 : tail_cap;
+        if (scan_len <= keep_len) {
+            memcpy(tail, scan_buf, scan_len);
+            *tail_len = scan_len;
+            return ESP_OK;
+        }
+        write_len = scan_len - keep_len;
+    }
+
+    esp_err_t err = ota_write_verified(ota_h, sha256_ctx, scan_buf, write_len,
+                                       total, max_size);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (*found_boundary) {
+        *tail_len = 0;
+        return ESP_OK;
+    }
+
+    *tail_len = scan_len - write_len;
+    memcpy(tail, scan_buf + write_len, *tail_len);
+    return ESP_OK;
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
@@ -321,13 +427,30 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    size_t tail_cap = strlen(boundary) + 4;
+    char *tail = malloc(tail_cap);
+    char *scan_buf = malloc(OTA_RECV_BUFSZ + tail_cap);
+    if (!tail || !scan_buf) {
+        free(scan_buf);
+        free(tail);
+        free(buf);
+        mbedtls_sha256_free(&sha256_ctx);
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
+        s_update_in_progress = false;
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
     size_t total = 0;
+    size_t tail_len = 0;
     int recv_len;
     bool in_file_data = false;
     bool skip_headers = true;
     char line_buf[256];
     size_t line_pos = 0;
     bool upload_ok = true;
+    bool saw_final_boundary = false;
     esp_ota_handle_t ota_h = s_ota_handle;
 
     while ((recv_len = httpd_req_recv(req, buf, OTA_RECV_BUFSZ)) > 0) {
@@ -357,40 +480,27 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
                         }
                     }
                 }
+                if (!in_file_data && line_pos >= sizeof(line_buf) - 1) {
+                    ESP_LOGE(TAG, "Multipart header line too long");
+                    upload_ok = false;
+                    goto upload_complete;
+                }
             } else {
-                int write_start = buf_offset;
                 size_t remaining = recv_len - buf_offset;
-
-                char *found = memmem(buf + buf_offset, remaining, boundary, strlen(boundary));
-                if (found) {
-                    size_t before = (size_t)(found - buf);
-                    if (before > (size_t)write_start) {
-                        size_t chunk = before - write_start;
-                        if (total + chunk > max_size) {
-                            ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + chunk, (unsigned long)max_size);
-                            upload_ok = false;
-                            goto upload_complete;
-                        }
-                        err = esp_ota_write(ota_h, buf + write_start, chunk);
-                        if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
-                        mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), chunk);
-                        total += chunk;
-                    }
-                    in_file_data = false;
-                    skip_headers = true;
-                    line_pos = 0;
-                    buf_offset = (int)before;
-                } else {
-                    if (total + remaining > max_size) {
-                        ESP_LOGE(TAG, "Upload exceeds partition size (%zu > %lu)", total + remaining, (unsigned long)max_size);
-                        upload_ok = false;
-                        goto upload_complete;
-                    }
-                    err = esp_ota_write(ota_h, buf + write_start, remaining);
-                    if (err != ESP_OK) { upload_ok = false; goto upload_complete; }
-                    mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)(buf + write_start), remaining);
-                    total += remaining;
-                    buf_offset = recv_len;
+                bool found_boundary = false;
+                err = ota_process_file_bytes(buf + buf_offset, remaining,
+                                             scan_buf, tail, &tail_len, tail_cap,
+                                             boundary, strlen(boundary),
+                                             ota_h, &sha256_ctx,
+                                             &total, max_size, &found_boundary);
+                if (err != ESP_OK) {
+                    upload_ok = false;
+                    goto upload_complete;
+                }
+                buf_offset = recv_len;
+                if (found_boundary) {
+                    saw_final_boundary = true;
+                    goto upload_complete;
                 }
             }
         }
@@ -398,6 +508,10 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 upload_complete:
     if (recv_len < 0 && upload_ok) {
+        upload_ok = false;
+    }
+    if (!saw_final_boundary && upload_ok) {
+        ESP_LOGE(TAG, "Multipart upload ended before final firmware boundary");
         upload_ok = false;
     }
 
@@ -415,6 +529,8 @@ upload_complete:
         esp_ota_abort(ota_h);
         s_ota_handle = 0;
         s_update_in_progress = false;
+        free(scan_buf);
+        free(tail);
         free(buf);
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
@@ -430,6 +546,8 @@ upload_complete:
             esp_ota_abort(ota_h);
             s_ota_handle = 0;
             s_update_in_progress = false;
+            free(scan_buf);
+            free(tail);
             free(buf);
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "text/plain");
@@ -448,6 +566,8 @@ upload_complete:
     err = esp_ota_end(ota_h);
     s_ota_handle = 0;
     s_update_in_progress = false;
+    free(scan_buf);
+    free(tail);
     free(buf);
 
     if (err != ESP_OK) {
@@ -469,6 +589,7 @@ upload_complete:
     }
 
     ESP_LOGI(TAG, "OTA complete: %zu bytes written, rebooting...", total);
+    ota_clear_token();
 
     httpd_resp_set_type(req, "application/json");
     char msg[256];
@@ -535,6 +656,41 @@ static esp_err_t ota_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t ota_export_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+
+    FILE *f = fopen(telemetry_csv_path(), "r");
+    if (!f) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "No telemetry CSV has been collected yet");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"esp-idms-telemetry.csv\"");
+
+    char buf[1024];
+    size_t n;
+    esp_err_t err = ESP_OK;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        err = httpd_resp_send_chunk(req, buf, n);
+        if (err != ESP_OK) {
+            break;
+        }
+    }
+    fclose(f);
+
+    if (err == ESP_OK) {
+        httpd_resp_send_chunk(req, NULL, 0);
+    }
+    return err;
+}
+
 static esp_err_t ota_page_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) {
@@ -547,6 +703,12 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
 #else
     const char *proto_note = "<p>Connection is <b>unencrypted</b> HTTP. Credentials are sent in plaintext.</p>";
 #endif
+
+    char token[32] = {0};
+    char form_action[64] = "/";
+    if (extract_token_from_uri(req, token, sizeof(token)) && ota_check_token(token)) {
+        snprintf(form_action, sizeof(form_action), "/?token=%s", token);
+    }
 
     const char *page =
         "<!DOCTYPE html>"
@@ -562,7 +724,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         "<h1>ESP-IDMS Firmware Update</h1>"
         "<p>Current version: <strong>" PROJECT_VER "</strong></p>"
         "<div class=\"info\">" "%s" "</div>"
-        "<form method=\"POST\" enctype=\"multipart/form-data\">"
+        "<form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\">"
         "<label>Firmware binary (.bin):</label><br>"
         "<input type=\"file\" name=\"firmware\" accept=\".bin\" required><br>"
         "<input type=\"submit\" value=\"Upload &amp; Update\">"
@@ -575,7 +737,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    snprintf(html, 2048, page, proto_note);
+    snprintf(html, 2048, page, proto_note, form_action);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, html);
     free(html);
@@ -592,6 +754,9 @@ static void register_uri_handlers(httpd_handle_t server)
 
     httpd_uri_t info_uri = { .uri = "/info", .method = HTTP_GET, .handler = ota_info_handler };
     httpd_register_uri_handler(server, &info_uri);
+
+    httpd_uri_t export_uri = { .uri = "/export.csv", .method = HTTP_GET, .handler = ota_export_handler };
+    httpd_register_uri_handler(server, &export_uri);
 }
 
 #if CONFIG_IDMS_OTA_HTTPS_ENABLE
@@ -609,7 +774,7 @@ static esp_err_t start_ota_http_server(uint16_t port)
     httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.servercert = ota_server_cert_pem_start;
     ssl_cfg.servercert_len = (ota_server_cert_pem_end - ota_server_cert_pem_start);
-    ssl_cfg.prvtkey = ota_server_key_pem_start;
+    ssl_cfg.prvtkey_pem = ota_server_key_pem_start;
     ssl_cfg.prvtkey_len = (ota_server_key_pem_end - ota_server_key_pem_start);
     ssl_cfg.httpd.server_port = port;
     ssl_cfg.httpd.max_uri_handlers = 8;
@@ -698,14 +863,6 @@ static void build_version_string(void)
     }
 }
 
-static void valid_mark_timer_cb(TimerHandle_t timer)
-{
-    (void)timer;
-    esp_ota_mark_app_valid_cancel_rollback();
-    ESP_LOGI(TAG, "App marked valid after delay — rollback cancelled");
-    strncpy(s_status, "ready", sizeof(s_status) - 1);
-}
-
 esp_err_t ota_init(void)
 {
     memset(&s_ota_token, 0, sizeof(s_ota_token));
@@ -745,23 +902,35 @@ void ota_mark_app_valid(void)
     strncpy(s_status, "ready", sizeof(s_status) - 1);
 }
 
-void ota_schedule_valid_mark(uint32_t delay_ms)
+void ota_mark_app_invalid_and_reboot(void)
+{
+    ESP_LOGE(TAG, "App health validation failed — marking invalid and rebooting for rollback");
+    strncpy(s_status, "rollback", sizeof(s_status) - 1);
+    s_status[sizeof(s_status) - 1] = '\0';
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
+bool ota_is_pending_validation(void)
 {
     esp_ota_img_states_t state;
     const esp_partition_t *running = esp_ota_get_running_partition();
-    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
-        state == ESP_OTA_IMG_PENDING_VERIFY) {
-        TimerHandle_t timer = xTimerCreate("ota_valid", pdMS_TO_TICKS(delay_ms),
-                                           pdFALSE, NULL, valid_mark_timer_cb);
-        if (timer) {
-            xTimerStart(timer, 0);
-            ESP_LOGI(TAG, "OTA valid mark scheduled in %lu ms", (unsigned long)delay_ms);
-        } else {
-            ESP_LOGE(TAG, "Failed to create OTA valid mark timer");
-            ota_mark_app_valid();
-        }
+    return esp_ota_get_state_partition(running, &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+void ota_schedule_valid_mark(uint32_t delay_ms)
+{
+    if (ota_is_pending_validation()) {
+        strncpy(s_status, "pending-health", sizeof(s_status) - 1);
+        s_status[sizeof(s_status) - 1] = '\0';
+        ESP_LOGI(TAG,
+                 "OTA image pending health validation; not marking valid by time alone "
+                 "(legacy delay=%lu ms ignored)",
+                 (unsigned long)delay_ms);
     } else {
-        ota_mark_app_valid();
+        strncpy(s_status, "ready", sizeof(s_status) - 1);
+        s_status[sizeof(s_status) - 1] = '\0';
+        ESP_LOGI(TAG, "No pending OTA validation for current partition");
     }
 }
 

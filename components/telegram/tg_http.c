@@ -9,6 +9,8 @@
 
 static const char *TAG = "tg_http";
 
+#define TG_HTTP_TIMEOUT_MS 10000
+
 /* ------------------------------------------------------------------ */
 /*  URL-encoding                                                       */
 /* ------------------------------------------------------------------ */
@@ -80,6 +82,7 @@ static esp_http_client_handle_t http_new(const char *path, int method,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .buffer_size = 2048,
+        .timeout_ms = TG_HTTP_TIMEOUT_MS,
         .event_handler = r ? http_event : NULL,
         .user_data = r,
     };

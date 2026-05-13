@@ -4,6 +4,8 @@
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 static const char *TAG = "tg_parse";
 
@@ -83,10 +85,31 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
                     snprintf(out->chat_id, sizeof(out->chat_id), "%lld", (long long)cid->valuedouble);
                 }
             }
+            cJSON *ctype = cJSON_GetObjectItem(chat, "type");
+            if (cJSON_IsString(ctype)) {
+                safe_strcpy(out->chat_type, sizeof(out->chat_type), ctype->valuestring);
+            }
         }
         cJSON *text = cJSON_GetObjectItem(msg, "text");
         if (cJSON_IsString(text)) {
             safe_strcpy(out->message_text, sizeof(out->message_text), text->valuestring);
+        }
+        cJSON *contact = cJSON_GetObjectItem(msg, "contact");
+        if (cJSON_IsObject(contact)) {
+            cJSON *phone = cJSON_GetObjectItem(contact, "phone_number");
+            if (cJSON_IsString(phone)) {
+                out->has_contact = true;
+                safe_strcpy(out->contact_phone, sizeof(out->contact_phone), phone->valuestring);
+            }
+            cJSON *user_id = cJSON_GetObjectItem(contact, "user_id");
+            if (user_id) {
+                if (cJSON_IsString(user_id)) {
+                    safe_strcpy(out->contact_user_id, sizeof(out->contact_user_id), user_id->valuestring);
+                } else if (cJSON_IsNumber(user_id)) {
+                    snprintf(out->contact_user_id, sizeof(out->contact_user_id), "%lld",
+                             (long long)user_id->valuedouble);
+                }
+            }
         }
         cJSON_Delete(root);
         return true;
@@ -115,6 +138,10 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
                         snprintf(out->chat_id, sizeof(out->chat_id), "%lld", (long long)cid->valuedouble);
                     }
                 }
+                cJSON *ctype = cJSON_GetObjectItem(chat, "type");
+                if (cJSON_IsString(ctype)) {
+                    safe_strcpy(out->chat_type, sizeof(out->chat_type), ctype->valuestring);
+                }
             }
         }
         cJSON *cbid = cJSON_GetObjectItem(cb, "id");
@@ -132,6 +159,41 @@ bool tg_parse_update(const char *json_response, tg_update_t *out)
     ESP_LOGW(TAG, "Update %d has no message or callback_query", out->update_id);
     cJSON_Delete(root);
     return false;
+}
+
+bool tg_parse_first_update_id(const char *json_response, int *update_id)
+{
+    if (!json_response || !update_id) return false;
+
+    cJSON *root = cJSON_Parse(json_response);
+    if (!root) {
+        const char *p = strstr(json_response, "\"update_id\"");
+        if (!p) return false;
+        p = strchr(p, ':');
+        if (!p) return false;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = NULL;
+        long id = strtol(p, &end, 10);
+        if (end == p || id <= 0 || id > INT32_MAX) return false;
+        *update_id = (int)id;
+        return true;
+    }
+
+    bool found = false;
+    cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (cJSON_IsTrue(ok) && cJSON_IsArray(result) && cJSON_GetArraySize(result) > 0) {
+        cJSON *update = cJSON_GetArrayItem(result, 0);
+        cJSON *uid = update ? cJSON_GetObjectItem(update, "update_id") : NULL;
+        if (cJSON_IsNumber(uid)) {
+            *update_id = uid->valueint;
+            found = true;
+        }
+    }
+
+    cJSON_Delete(root);
+    return found;
 }
 
 bool tg_is_authorized_id(const char *from_id)

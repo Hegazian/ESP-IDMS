@@ -1,5 +1,13 @@
 menu "ESP-IDMS Configuration"
 
+    config IDMS_PRODUCTION_BUILD
+        bool "Production security gate"
+        default n
+        help
+            Enable for release builds. The firmware will refuse to compile
+            unless secure boot, flash encryption, and NVS encryption are
+            enabled in the ESP-IDF security configuration.
+
     config IDMS_WIFI_SSID
         string "Wi-Fi SSID"
         default ""
@@ -12,11 +20,63 @@ menu "ESP-IDMS Configuration"
         string "Telegram bot token (empty disables outbound messages)"
         default ""
 
+    menu "Cloud Telemetry"
+
+        config IDMS_CLOUD_URL
+            string "Cloud telemetry HTTP/HTTPS endpoint"
+            default ""
+            help
+                Optional endpoint for telemetry uploads. When empty, cloud sync
+                stays disabled. Configure at runtime with:
+                > set_cloud_url https://example.com/ingest
+
+        config IDMS_CLOUD_TOKEN
+            string "Cloud telemetry bearer token"
+            default ""
+            help
+                Optional bearer token used as Authorization: Bearer <token>
+                for cloud telemetry uploads. Configure at runtime with:
+                > set_cloud_token <token>
+
+        config IDMS_CLOUD_ALLOW_INSECURE_HTTP
+            bool "Allow insecure HTTP cloud uploads"
+            default n
+            help
+                Development/local-network option only. Production telemetry
+                uploads should use HTTPS because bearer tokens are sent in the
+                Authorization header.
+
+        config IDMS_CLOUD_UPLOAD_INTERVAL_S
+            int "Cloud upload interval (seconds)"
+            range 30 3600
+            default 300
+            help
+                How often the cloud sync task attempts to upload pending CSV
+                telemetry rows. Failed uploads are retried later from the same
+                NVS-saved file offset.
+
+        config IDMS_CLOUD_UPLOAD_MAX_ROWS
+            int "Cloud upload maximum rows per request"
+            range 1 64
+            default 16
+            help
+                Maximum telemetry CSV rows sent in a single cloud POST request.
+
+    endmenu
+
     config IDMS_DEFAULT_TECH_CHAT_ID
         string "Default technician Telegram chat_id (copied to NVS on first boot if empty)"
         default ""
         help
             Optional default technician chat ID. If empty, add technicians via serial console or Telegram.
+
+    config IDMS_TELEGRAM_ALLOW_FIRST_USER_CLAIM
+        bool "Deprecated: allow first Telegram user to self-register"
+        default n
+        help
+            Deprecated and ignored. Telegram onboarding now uses the shared
+            admin name/password stored in NVS; successful logins are saved as
+            technician IDs.
 
     config IDMS_CURRENT_THRESHOLD_MA
         int "RMS current below this = machine off (milliamps)"
@@ -45,6 +105,17 @@ menu "ESP-IDMS Configuration"
         help
             Number of ADC samples to collect for auto-zero calibration.
             More samples = better accuracy but longer startup time.
+
+    config IDMS_SCT_AUTOZERO_MAX_RMS_MV
+        int "Maximum no-load RMS for current auto-zero (mV)"
+        range 1 500
+        default 50
+        depends on IDMS_SCT_AUTOZERO_ENABLE
+        help
+            Auto-zero only subtracts the measured RMS noise floor when the
+            sample is below this value. If the RMS is higher, the firmware
+            assumes the load may already be running and skips subtraction to
+            avoid under-reporting current.
 
     config IDMS_DT_LOW_C
         int "Cooling fault: delta-T below (°C)"
@@ -101,17 +172,17 @@ menu "ESP-IDMS Configuration"
     config IDMS_PIN_ONEWIRE
         int "DS18B20 1-Wire GPIO for T_in sensor"
         range 0 48
-        default 5 if IDF_TARGET_ESP32S3
+        default 4 if IDF_TARGET_ESP32S3
         default 4 if IDF_TARGET_ESP32
-        default 5
+        default 4
         depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
 
     config IDMS_PIN_ONEWIRE2
         int "DS18B20 1-Wire GPIO for T_out sensor"
         range 0 48
-        default 7 if IDF_TARGET_ESP32S3
+        default 15 if IDF_TARGET_ESP32S3
         default 17 if IDF_TARGET_ESP32
-        default 7
+        default 15
         depends on IDMS_TEMP_SENSOR_DS18B20 || IDMS_TEMP_SENSOR_DS18B20_PT100
         help
             Dedicated GPIO for the second DS18B20 sensor (T_out).
@@ -575,11 +646,12 @@ choice IDMS_DISPLAY_CONTROLLER
             range 1024 65535
             default 8080
             help
-                Port for the built-in OTA HTTP server. Access via http://<device-ip>:<port>/
+                Port for the built-in OTA server. Use https://<device-ip>:<port>/
+                when HTTPS is enabled.
 
         config IDMS_OTA_HTTPS_ENABLE
             bool "Enable HTTPS for OTA server (self-signed certificate)"
-            default n
+            default y
             help
                 When enabled, the OTA HTTP server uses TLS with an embedded self-signed
                 certificate.

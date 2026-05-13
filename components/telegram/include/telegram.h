@@ -34,7 +34,7 @@ esp_err_t telegram_heartbeat(void);
 /**
  * Start the interactive bot poll task with inline keyboard menus.
  */
-void telegram_command_poll_start(void);
+esp_err_t telegram_command_poll_start(void);
 
 void telegram_flush_offline_queue(void);
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "esp_err.h"
 #include <stdbool.h>
 
 /**
@@ -19,7 +20,7 @@
  * Start the bot poll task.
  * Call once after Wi-Fi is connected.
  */
-void tg_bot_start(void);
+esp_err_t tg_bot_start(void);
 
 /**
  * Check if DNS is reachable (called internally, exposed for diagnostics).

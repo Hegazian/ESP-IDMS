@@ -25,7 +25,7 @@ esp_err_t telegram_broadcast_alert(const char *text)
 
 esp_err_t telegram_send_ringing_alert(const char *chat_id, const char *alert_text)
 {
-    return tg_send_ring_alert(chat_id, alert_text);
+    return tg_enqueue_ring_alert(chat_id, alert_text);
 }
 
 esp_err_t telegram_heartbeat(void)
@@ -54,10 +54,10 @@ esp_err_t telegram_heartbeat(void)
     return err;
 }
 
-void telegram_command_poll_start(void)
+esp_err_t telegram_command_poll_start(void)
 {
     tg_send_init();
-    tg_bot_start();
+    return tg_bot_start();
 }
 
 void telegram_flush_offline_queue(void)
