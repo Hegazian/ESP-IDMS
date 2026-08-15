@@ -78,6 +78,16 @@ menu "ESP-IDMS Configuration"
             admin name/password stored in NVS; successful logins are saved as
             technician IDs.
 
+    config IDMS_TELEGRAM_ALLOW_TECH_SENSITIVE_ACTIONS
+        bool "Allow authorized technicians to run sensitive Telegram actions"
+        default y if !IDMS_PRODUCTION_BUILD
+        default n
+        help
+            Development/service-phase option. When enabled, any registered
+            technician can use sensitive Telegram actions such as OTA without
+            entering the shared admin password again. Keep disabled for locked
+            production builds.
+
     config IDMS_CURRENT_THRESHOLD_MA
         int "RMS current below this = machine off (milliamps)"
         range 50 5000
@@ -87,6 +97,17 @@ menu "ESP-IDMS Configuration"
         int "Calibration: RMS amps per volt at ADC, fixed-point x100 (3000 = 30.00 A/V)"
         range 10 500000
         default 3000
+
+    config IDMS_SCT_SOFTWARE_GAIN_PERCENT
+        int "Current software gain correction percent"
+        range 1 200
+        default 30
+        help
+            Board-level correction applied after the sensor A/V calibration.
+            Use 100 for an ideal 30A/1V front-end. This hardware revision
+            reads about 3-4x high, so 30 keeps the display calibration at
+            30 A/V while reducing the effective current reading to the measured
+            load.
 
     config IDMS_SCT_AUTOZERO_ENABLE
         bool "Enable SCT-013 auto-zero calibration"
@@ -107,15 +128,24 @@ menu "ESP-IDMS Configuration"
             More samples = better accuracy but longer startup time.
 
     config IDMS_SCT_AUTOZERO_MAX_RMS_MV
-        int "Maximum no-load RMS for current auto-zero (mV)"
+        int "Clean no-load RMS target for current auto-zero warnings (mV)"
         range 1 500
-        default 50
+        default 150
         depends on IDMS_SCT_AUTOZERO_ENABLE
         help
-            Auto-zero only subtracts the measured RMS noise floor when the
-            sample is below this value. If the RMS is higher, the firmware
-            assumes the load may already be running and skips subtraction to
-            avoid under-reporting current.
+            Boot/recovery auto-zero accepts a no-load sample only below this
+            target so a running load is not accidentally zeroed. Manual display
+            Current Zero can still save a higher prototype noise floor.
+
+    config IDMS_SCT_NOISE_GATE_MV
+        int "Current ADC noise gate after zero calibration (mV RMS)"
+        range 0 500
+        default 80
+        depends on IDMS_SCT_AUTOZERO_ENABLE
+        help
+            After subtracting the learned no-load RMS noise floor, remaining
+            RMS below this value is forced to zero. This suppresses small
+            no-load drift while allowing the 7-9 A test load to pass.
 
     config IDMS_DT_LOW_C
         int "Cooling fault: delta-T below (°C)"
@@ -301,18 +331,28 @@ menu "ESP-IDMS Configuration"
     #  Display — controller choice applies to both targets
     # ------------------------------------------------------------------
 
+    config IDMS_ENABLE_LEGACY_LVGL_DISPLAYS
+        bool "Enable legacy LVGL LCD controller choices"
+        default n
+        help
+            Keep this disabled for the production Topway build. Enabling it
+            exposes older SPI/I80 LCD targets and requires restoring the
+            matching managed LVGL/esp_lcd dependencies in idf_component.yml.
+
 choice IDMS_DISPLAY_CONTROLLER
         prompt "LCD display controller"
-        default IDMS_DISPLAY_ST7796S
+        default IDMS_DISPLAY_TOPWAY
 
         config IDMS_DISPLAY_ILI9341
             bool "ILI9341 (2.8\" 320x240)"
+            depends on IDMS_ENABLE_LEGACY_LVGL_DISPLAYS
             help
                 Original 2.8" 320x240 ILI9341 SPI TFT display with XPT2046 resistive touch.
                 Uses managed component espressim/esp_lcd_ili9341.
 
         config IDMS_DISPLAY_ST7796S
             bool "ST7796/S (3.5\" 320x480)"
+            depends on IDMS_ENABLE_LEGACY_LVGL_DISPLAYS
             help
                 3.5" 320x480 ST7796/ST7796S TFT display.
                 Uses built-in driver in components/drivers/esp_lcd_st7796s.
@@ -320,6 +360,7 @@ choice IDMS_DISPLAY_CONTROLLER
 
         config IDMS_DISPLAY_ILI9488
             bool "ILI9488 (3.5\" 320x480)"
+            depends on IDMS_ENABLE_LEGACY_LVGL_DISPLAYS
             help
                 3.5" 320x480 ILI9488 TFT display.
                 Alternative controller found on some 3.5" modules.
@@ -335,252 +376,54 @@ choice IDMS_DISPLAY_CONTROLLER
     endchoice
 
     # ------------------------------------------------------------------
-    #  Display bus interface — SPI (4-wire) or I80 (8080 parallel)
-    #  Use I80 if your 3.5" module has an 8080 FPC connector and
-    #  SPI produces a white screen (IM pins may not be set for SPI).
+    #  Ethernet Configuration (ENC28J60)
+    #  Uses SPI3_HOST. Must use different pins from MAX31865 (SPI2_HOST)
     # ------------------------------------------------------------------
 
-    choice IDMS_LCD_BUS
-        prompt "LCD bus interface"
-        default IDMS_LCD_BUS_SPI if IDF_TARGET_ESP32
-        default IDMS_LCD_BUS_I80 if IDF_TARGET_ESP32S3
-
-        config IDMS_LCD_BUS_SPI
-            bool "SPI (4-wire serial)"
+    menu "Ethernet Configuration (ENC28J60)"
+        config IDMS_ENABLE_ETHERNET
+            bool "Enable Ethernet (ENC28J60)"
+            default y
             help
-                Use SPI with SCLK, MOSI, CS, DC pins. Requires IM[2:0]=111
-                on the display module for 4-wire SPI mode.
+                Enable Ethernet networking as the primary interface.
+                Wi-Fi will act as a fallback if the cable is unplugged.
 
-        config IDMS_LCD_BUS_I80
-            bool "I80 (8080 8-bit parallel)"
-            help
-                Use Intel 8080 8-bit parallel interface with D0-D7, WR, RD pins.
-                Recommended for 3.5" TFT modules with 8080 FPC connector.
-                Uses ESP32-S3 LCD_CAM peripheral for high-speed DMA transfers.
-    endchoice
+        config IDMS_ETH_SPI_SCLK
+            int "ENC28J60 SPI SCLK GPIO"
+            range 0 48
+            default 12
+            depends on IDMS_ENABLE_ETHERNET
 
-    # ------------------------------------------------------------------
-    #  LCD SPI bus — dedicated to LCD only (not shared with anything).
-    #  Uses SPI3_HOST. Only needed when LCD bus is SPI and not Topway.
-    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
-    #  ESP32-S3 avoid: 0/3/45/46 (strapping), 19/20 (USB), 26-32 (flash/PSRAM)
-    # ------------------------------------------------------------------
+        config IDMS_ETH_SPI_MOSI
+            int "ENC28J60 SPI MOSI GPIO"
+            range 0 48
+            default 13
+            depends on IDMS_ENABLE_ETHERNET
 
-    config IDMS_PIN_LCD_SCLK
-        int "LCD SPI SCLK GPIO"
-        range 0 48
-        default 18 if IDF_TARGET_ESP32
-        default 5 if IDF_TARGET_ESP32S3
-        default 18
-        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
+        config IDMS_ETH_SPI_MISO
+            int "ENC28J60 SPI MISO GPIO"
+            range 0 48
+            default 16
+            depends on IDMS_ENABLE_ETHERNET
 
-    config IDMS_PIN_LCD_MOSI
-        int "LCD SPI MOSI GPIO"
-        range 0 48
-        default 23 if IDF_TARGET_ESP32
-        default 17 if IDF_TARGET_ESP32S3
-        default 23
-        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
+        config IDMS_ETH_SPI_CS
+            int "ENC28J60 SPI CS GPIO"
+            range 0 48
+            default 11
+            depends on IDMS_ENABLE_ETHERNET
 
-    config IDMS_PIN_LCD_MISO
-        int "LCD SPI MISO GPIO (-1 if unused)"
-        range -1 48
-        default -1
-        depends on IDMS_LCD_BUS_SPI && !IDMS_DISPLAY_TOPWAY
+        config IDMS_ETH_INT
+            int "ENC28J60 Interrupt GPIO"
+            range 0 48
+            default 14
+            depends on IDMS_ENABLE_ETHERNET
+    endmenu
 
-    # ------------------------------------------------------------------
-    #  I80 LCD pins (only when IDMS_LCD_BUS_I80)
-    #  ESP32-S3: avoid GPIO 19/20 (USB D+/D-), 26-32 (flash/PSRAM),
-    #  0/3/45/46 (strapping). Safe range: 1-18, 21-25, 33-42, 47-48.
-    # ------------------------------------------------------------------
-
-    config IDMS_PIN_LCD_I80_D0
-        int "LCD I80 D0 GPIO"
-        range 0 48
-        default 33
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D1
-        int "LCD I80 D1 GPIO"
-        range 0 48
-        default 34
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D2
-        int "LCD I80 D2 GPIO"
-        range 0 48
-        default 35
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D3
-        int "LCD I80 D3 GPIO"
-        range 0 48
-        default 36
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D4
-        int "LCD I80 D4 GPIO"
-        range 0 48
-        default 37
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D5
-        int "LCD I80 D5 GPIO"
-        range 0 48
-        default 39
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D6
-        int "LCD I80 D6 GPIO"
-        range 0 48
-        default 40
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_D7
-        int "LCD I80 D7 GPIO"
-        range 0 48
-        default 41
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_WR
-        int "LCD I80 WR (write strobe) GPIO"
-        range 0 48
-        default 5
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_RD
-        int "LCD I80 RD (read strobe) GPIO (-1 if tied to VCC)"
-        range -1 48
-        default 21
-        depends on IDMS_LCD_BUS_I80
-
-    config IDMS_PIN_LCD_I80_PCLK_HZ
-        int "LCD I80 pixel clock speed (Hz)"
-        default 10000000
-        depends on IDMS_LCD_BUS_I80
-        help
-            I80 bus clock in Hz. 10 MHz is safe; increase to 20 MHz for
-            faster refresh if the display supports it.
-
-    # ------------------------------------------------------------------
-    #  Common LCD pins (shared by SPI and I80)
-    # ------------------------------------------------------------------
-
-    config IDMS_PIN_LCD_DC
-        int "LCD D/C (SPI) or RS (I80) GPIO"
-        range 0 48
-        default 2 if IDF_TARGET_ESP32
-        default 4 if IDF_TARGET_ESP32S3
-        default 2
-
-    config IDMS_PIN_LCD_CS
-        int "LCD chip select GPIO"
-        range 0 48
-        default 15 if IDF_TARGET_ESP32
-        default 10 if IDF_TARGET_ESP32S3
-        default 15
-
-    config IDMS_PIN_LCD_BL
-        int "LCD backlight GPIO (-1 to skip)"
-        range -1 48
-        default 21 if IDF_TARGET_ESP32
-        default 38 if IDF_TARGET_ESP32S3
-        default 21
-
-    config IDMS_PIN_LCD_RST
-        int "LCD reset GPIO (-1 to tie to EN)"
-        range -1 48
-        default -1 if IDF_TARGET_ESP32
-        default 12 if IDF_TARGET_ESP32S3
-        default -1
-
-    # ------------------------------------------------------------------
-    #  MAX31865 SPI bus — dedicated to RTD temperature sensors only.
-    #  Uses SPI2_HOST. Shares bus with XPT2046 touch if enabled.
-    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
-    # ------------------------------------------------------------------
-
-    config IDMS_PIN_MAX31865_SCLK
-        int "MAX31865 SPI SCLK GPIO"
-        range 0 48
-        default 18
-        depends on IDMS_TEMP_SENSOR_MAX31865
-
-    config IDMS_PIN_MAX31865_MOSI
-        int "MAX31865 SPI MOSI GPIO"
-        range 0 48
-        default 9 if IDF_TARGET_ESP32S3
-        default 23 if IDF_TARGET_ESP32
-        default 9
-        depends on IDMS_TEMP_SENSOR_MAX31865
-
-    config IDMS_PIN_MAX31865_MISO
-        int "MAX31865 SPI MISO GPIO"
-        range 0 48
-        default 8 if IDF_TARGET_ESP32S3
-        default 19 if IDF_TARGET_ESP32
-        default 8
-        depends on IDMS_TEMP_SENSOR_MAX31865
-
-    # ------------------------------------------------------------------
-    #  XPT2046 touch controller — dedicated SPI bus (SPI3_HOST)
-    #  Must use different SCLK/MOSI/MISO pins from MAX31865 (SPI2_HOST)
-    #  ESP32-S3 safe GPIOs: 1-18, 21-25, 33-42, 47-48
-    # ------------------------------------------------------------------
-
-    config IDMS_PIN_TOUCH_CS
-        int "XPT2046 chip select GPIO (-1 to disable touch)"
-        range -1 48
-        default 33 if IDF_TARGET_ESP32
-        default 11 if IDF_TARGET_ESP32S3
-        default 33
-
-    config IDMS_PIN_TOUCH_IRQ
-        int "XPT2046 IRQ GPIO (-1 if unused)"
-        range -1 48
-        default 36 if IDF_TARGET_ESP32
-        default 14 if IDF_TARGET_ESP32S3
-        default 36
-
-    config IDMS_PIN_TOUCH_SCLK
-        int "XPT2046 SPI SCLK GPIO"
-        range 0 48
-        default 12 if IDF_TARGET_ESP32S3
-        default 15 if IDF_TARGET_ESP32
-        default 12
-        depends on IDMS_PIN_TOUCH_CS >= 0
-
-    config IDMS_PIN_TOUCH_MOSI
-        int "XPT2046 SPI MOSI GPIO"
-        range 0 48
-        default 13 if IDF_TARGET_ESP32S3
-        default 2 if IDF_TARGET_ESP32
-        default 13
-        depends on IDMS_PIN_TOUCH_CS >= 0
-
-    config IDMS_PIN_TOUCH_MISO
-        int "XPT2046 SPI MISO GPIO"
-        range 0 48
-        default 16 if IDF_TARGET_ESP32S3
-        default 4 if IDF_TARGET_ESP32
-        default 16
-        depends on IDMS_PIN_TOUCH_CS >= 0
-
-    config IDMS_LCD_SWAP_XY
-        bool "Swap X/Y for landscape orientation"
-        default y
-
-    config IDMS_LCD_MIRROR_X
-        bool "Mirror X"
-        default n
-
-    config IDMS_LCD_MIRROR_Y
-        bool "Mirror Y"
-        default n
 
     # ------------------------------------------------------------------
     #  UART pins for Topway Smart LCD — dedicated, not shared with SPI
-    #  ESP32-S3: GPIO 1 and 3 are safe and NOT used by any SPI bus
+    #  ESP32-S3 note: GPIO19/20 are native USB D-/D+. Using GPIO20 for
+    #  Topway RX means native USB Serial/JTAG/OTG must not be used.
     # ------------------------------------------------------------------
 
     config IDMS_PIN_UART_TX
@@ -592,7 +435,8 @@ choice IDMS_DISPLAY_CONTROLLER
         depends on IDMS_DISPLAY_TOPWAY
         help
             TX pin for UART communication with Topway Smart LCD.
-            Must NOT overlap with any SPI pin.
+            Must NOT overlap with any SPI pin. If paired with GPIO20 RX,
+            use UART0 GPIO43/44 or an external USB-UART for flashing/monitoring.
 
     config IDMS_PIN_UART_RX
         int "UART RX GPIO for Topway Smart LCD"
@@ -603,7 +447,9 @@ choice IDMS_DISPLAY_CONTROLLER
         depends on IDMS_DISPLAY_TOPWAY
         help
             RX pin for UART communication with Topway Smart LCD.
-            Must NOT overlap with any SPI pin.
+            Must NOT overlap with any SPI pin. On ESP32-S3, GPIO20 is USB D+.
+            It can be used as UART RX only if native USB Serial/JTAG/OTG is not
+            connected or enabled for runtime console/debug use.
 
     config IDMS_PIN_UART_RTS
         int "UART RTS/BUSY GPIO for Topway Smart LCD (-1 if unused)"
@@ -679,6 +525,52 @@ choice IDMS_DISPLAY_CONTROLLER
                 When enabled, sending /ota_update to the bot triggers an OTA check.
                 The actual firmware upload still happens via HTTP POST.
 
+        config IDMS_OTA_VALIDATE_SENSORS
+            bool "Require valid sensors before accepting an OTA image"
+            default n
+            help
+                When enabled, pending OTA images are only marked valid after the
+                telemetry, UI, Telegram, and live sensor checks all pass. Leave
+                disabled for service/production updates where sensors or display
+                wiring may be disconnected while verifying firmware boot health.
+
+    endmenu
+
+    menu "MQTT Configuration"
+        config IDMS_MQTT_ENABLE
+            bool "Enable MQTT telemetry client"
+            default y
+            help
+                Enables MQTT client for streaming real-time telemetry metrics.
+
+        config IDMS_MQTT_URI_DEFAULT
+            string "Default MQTT Broker URI"
+            default "mqtt://broker.hivemq.com:1883"
+            help
+                Default broker URI if not configured in NVS.
+
+        config IDMS_MQTT_PUB_INTERVAL_SEC
+            int "MQTT Publish Interval (seconds)"
+            range 1 3600
+            default 5
+            help
+                Telemetry publish interval in seconds over MQTT.
+    endmenu
+
+    menu "Modbus RTU / TCP Configuration"
+        config IDMS_MODBUS_ENABLE
+            bool "Enable Modbus slave service"
+            default y
+            help
+                Enables Modbus RTU / TCP slave interface for industrial integration.
+
+        config IDMS_MODBUS_SLAVE_ID_DEFAULT
+            int "Modbus Slave ID (Address)"
+            range 1 247
+            default 1
+            help
+                Default Modbus Slave Address (1-247).
     endmenu
 
 endmenu
+

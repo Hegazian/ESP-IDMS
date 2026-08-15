@@ -3,5 +3,5 @@ idf_component_register(
   INCLUDE_DIRS "include"
   PRIV_REQUIRES
     esp_http_client mbedtls nvs_flash freertos lwip json
-    core wifi monitor telemetry ota
+    core network monitor telemetry ota
 )

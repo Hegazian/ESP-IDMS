@@ -13,11 +13,6 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
-# LVGL (managed component)
-CONFIG_LV_COLOR_DEPTH_16=y
-CONFIG_LV_FONT_MONTSERRAT_14=y
-CONFIG_LV_FONT_MONTSERRAT_16=y
-
 # NVS encryption for secrets — RECOMMENDED for production deployment.
 # When enabled, the "secrets" and "idms" NVS namespaces are encrypted at rest,
 # protecting Wi-Fi credentials, Telegram tokens, and technician IDs from flash extraction.

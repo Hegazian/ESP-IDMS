@@ -2,7 +2,7 @@
 #include "config_store.h"
 #include "ota.h"
 #include "monitor.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -138,9 +138,9 @@ static void handle_cmd(const char *cmd)
         if (tlen == 0) {
             ESP_LOGI(TAG, "Telegram token: (not set)");
         } else if (tlen < 20) {
-            ESP_LOGW(TAG, "Telegram token: %s (%zu chars — TOO SHORT, expected ~45)", tok, tlen);
+            ESP_LOGW(TAG, "Telegram token configured (%zu chars) - TOO SHORT, expected ~45", tlen);
         } else {
-            ESP_LOGI(TAG, "Telegram token: %.5s...%s (%zu chars)", tok, &tok[tlen-3], tlen);
+            ESP_LOGI(TAG, "Telegram token configured (%zu chars)", tlen);
         }
     } else if (strncmp(cmd, "set_bot_admin ", 14) == 0) {
         const char *val = cmd + 14;
@@ -240,15 +240,100 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "Cloud token:    %s", cloud_token[0] ? "****" : "(not set)");
     } else if (strcmp(cmd, "topway_test") == 0) {
 #if CONFIG_IDMS_DISPLAY_TOPWAY
-        ESP_LOGI(TAG, "Writing test values to Topway screen...");
-        topway_n16_write(0x080000, 123);
+        ESP_LOGI(TAG, "Writing visible test values to Topway screen...");
+        esp_err_t first_err = ESP_OK;
+        esp_err_t err = topway_disp_page(0);
+        ESP_LOGI(TAG, "  page 0: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
         vTaskDelay(pdMS_TO_TICKS(50));
-        topway_n16_write(0x080002, 456);
+        err = topway_str_write(VP_STR_STATUS, "ACTIVE");
+        ESP_LOGI(TAG, "  status text: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
         vTaskDelay(pdMS_TO_TICKS(50));
-        topway_n16_write(0x080004, 789);
+        err = topway_str_write(VP_STR_DIAG, "UART TEST");
+        ESP_LOGI(TAG, "  diagnostic text: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
         vTaskDelay(pdMS_TO_TICKS(50));
-        topway_n16_write(0x080006, 999);
-        ESP_LOGI(TAG, "Test values sent: 123, 456, 789, 999");
+        err = topway_n16_write(VP_N16_STATUS_COLOR, TOPWAY_COLOR_GREEN);
+        ESP_LOGI(TAG, "  status color: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        err = topway_n16_write(VP_N16_TIN_VALUE, 12);
+        ESP_LOGI(TAG, "  temp in: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        err = topway_n16_write(VP_N16_TOUT_VALUE, 34);
+        ESP_LOGI(TAG, "  temp out: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        err = topway_n16_write(VP_N16_CUR_VALUE, 5);
+        ESP_LOGI(TAG, "  current: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+        ESP_LOGI(TAG, "Topway test result: %s", esp_err_to_name(first_err));
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strcmp(cmd, "topway_handshake") == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        esp_err_t err = topway_handshake();
+        ESP_LOGI(TAG, "Topway handshake result: %s", esp_err_to_name(err));
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strncmp(cmd, "topway_rx_dump", 14) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        uint32_t duration_ms = 1000;
+        const char *arg = cmd + 14;
+        while (*arg && isspace((unsigned char)*arg)) {
+            arg++;
+        }
+        if (*arg) {
+            duration_ms = (uint32_t)strtoul(arg, NULL, 10);
+        }
+        esp_err_t err = topway_dump_rx(duration_ms);
+        ESP_LOGI(TAG, "Topway RX dump result: %s", esp_err_to_name(err));
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strncmp(cmd, "topway_tx_burst", 15) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        uint32_t duration_ms = 1000;
+        const char *arg = cmd + 15;
+        while (*arg && isspace((unsigned char)*arg)) {
+            arg++;
+        }
+        if (*arg) {
+            duration_ms = (uint32_t)strtoul(arg, NULL, 10);
+        }
+        esp_err_t err = topway_tx_burst(duration_ms);
+        ESP_LOGI(TAG, "Topway TX burst result: %s", esp_err_to_name(err));
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strncmp(cmd, "topway_read ", 12) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        unsigned long addr = 0;
+        if (sscanf(cmd + 12, "%lx", &addr) != 1) {
+            ESP_LOGW(TAG, "Usage: topway_read <hex_n16_addr>");
+        } else {
+            uint16_t value = 0;
+            esp_err_t err = topway_n16_read((uint32_t)addr, &value);
+            ESP_LOGI(TAG, "Topway N16 read 0x%06lX: %s value=%u signed=%d",
+                     addr, esp_err_to_name(err), value, (int16_t)value);
+        }
+#else
+        ESP_LOGW(TAG, "Topway display not enabled in config");
+#endif
+    } else if (strncmp(cmd, "topway_pins ", 12) == 0) {
+#if CONFIG_IDMS_DISPLAY_TOPWAY
+        int tx_pin = -1;
+        int rx_pin = -1;
+        if (sscanf(cmd + 12, "%d %d", &tx_pin, &rx_pin) != 2) {
+            ESP_LOGW(TAG, "Usage: topway_pins <tx_gpio> <rx_gpio>");
+        } else {
+            esp_err_t err = topway_set_pins(tx_pin, rx_pin);
+            ESP_LOGI(TAG, "Topway pin remap result: %s", esp_err_to_name(err));
+        }
 #else
         ESP_LOGW(TAG, "Topway display not enabled in config");
 #endif
@@ -304,7 +389,7 @@ static void handle_cmd(const char *cmd)
     } else if (strcmp(cmd, "cal_zero") == 0) {
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
         ESP_LOGI(TAG, "Current zero calibration requested. Keep the CT connected and the load OFF.");
-        esp_err_t err = monitor_calibrate_zero();
+        esp_err_t err = monitor_calibrate_zero_manual();
         monitor_reset_current_filter();
         ESP_LOGI(TAG, "Current zero calibration result: %s", esp_err_to_name(err));
 #else
@@ -319,6 +404,24 @@ static void handle_cmd(const char *cmd)
         int value = atoi(cmd + 12);
         esp_err_t err = config_set_dt_high_threshold((int16_t)value);
         ESP_LOGI(TAG, "Set Delta-T high threshold: %d C (%s)", value, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_mqtt_uri ", 13) == 0) {
+        const char *val = cmd + 13;
+        esp_err_t err = config_set_mqtt_uri(val);
+        ESP_LOGI(TAG, "Set MQTT URI: %s (%s)", val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_mqtt_user ", 14) == 0) {
+        const char *val = cmd + 14;
+        esp_err_t err = config_set_mqtt_user(val);
+        ESP_LOGI(TAG, "Set MQTT user: %s (%s)", val, esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_mqtt_pass ", 14) == 0) {
+        const char *val = cmd + 14;
+        esp_err_t err = config_set_mqtt_pass(val);
+        ESP_LOGI(TAG, "Set MQTT password: **** (%s)", esp_err_to_name(err));
+    } else if (strncmp(cmd, "set_mb_id ", 10) == 0) {
+        int val = atoi(cmd + 10);
+        esp_err_t err = config_set_mb_slave_id((uint8_t)val);
+        ESP_LOGI(TAG, "Set Modbus Slave ID: %d (%s)", val, esp_err_to_name(err));
+    } else if (strcmp(cmd, "reboot") == 0) {
+        esp_restart();
     } else if (strncmp(cmd, "topway_str ", 11) == 0) {
 #if CONFIG_IDMS_DISPLAY_TOPWAY
         const char *arg = cmd + 11;
@@ -356,6 +459,11 @@ static void handle_cmd(const char *cmd)
 #endif
     } else if (strcmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
+        ESP_LOGI(TAG, "  topway_handshake - Send Topway handshake and wait for reply");
+        ESP_LOGI(TAG, "  topway_rx_dump [ms] - Dump raw Topway RX bytes");
+        ESP_LOGI(TAG, "  topway_tx_burst [ms] - Send raw 0x55 bytes on Topway TX for wiring tests");
+        ESP_LOGI(TAG, "  topway_read <hex_addr> - Read Topway N16 VP value");
+        ESP_LOGI(TAG, "  topway_pins <tx> <rx> - Remap Topway UART pins until reboot");
         ESP_LOGI(TAG, "  add <chat_id> [name] - Add authorized technician ID");
         ESP_LOGI(TAG, "  list             - List registered IDs");
         ESP_LOGI(TAG, "  remove <index>   - Remove ID by index (0-%d)", CONFIG_TECH_MAX_COUNT - 1);
@@ -364,7 +472,7 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  set_ssid <ssid>  — Set Wi-Fi SSID (NVS)");
         ESP_LOGI(TAG, "  set_pass <pass>  — Set Wi-Fi password (NVS)");
         ESP_LOGI(TAG, "  set_token <tok>  — Set Telegram bot token (format: 1234567890:AAHxxxxx)");
-        ESP_LOGI(TAG, "  show_token       — Show current token (first/last chars only)");
+        ESP_LOGI(TAG, "  show_token       — Show whether Telegram token is configured");
         ESP_LOGI(TAG, "  set_bot_admin <name> - Set shared Telegram login admin name");
         ESP_LOGI(TAG, "  set_bot_password <p> - Set shared Telegram login password");
         ESP_LOGI(TAG, "  set_ota_user <u> — Set OTA HTTP username (NVS)");
@@ -383,6 +491,10 @@ static void handle_cmd(const char *cmd)
         ESP_LOGI(TAG, "  set_power_threshold <A> - Current below this means power loss");
         ESP_LOGI(TAG, "  set_running_threshold <A> - Current above this enables cooling alerts");
         ESP_LOGI(TAG, "  set_dt_high <C>  - Set Delta-T high threshold");
+        ESP_LOGI(TAG, "  set_mqtt_uri <u> - Set MQTT Broker URI");
+        ESP_LOGI(TAG, "  set_mqtt_user <u>- Set MQTT Username");
+        ESP_LOGI(TAG, "  set_mqtt_pass <p>- Set MQTT Password");
+        ESP_LOGI(TAG, "  set_mb_id <id>   - Set Modbus Slave ID");
         ESP_LOGI(TAG, "  reboot           - Reboot device");
         ESP_LOGI(TAG, "  help             — Show this help");
     } else {

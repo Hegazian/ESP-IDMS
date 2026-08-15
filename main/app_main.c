@@ -1,29 +1,22 @@
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "config_store.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include "monitor.h"
 #include "telemetry.h"
 #include "cloud_sync.h"
-
-#if CONFIG_IDMS_DISPLAY_TOPWAY
+#include "mqtt_service.h"
+#include "modbus_service.h"
 #include "ui_topway.h"
-#else
-#include "ui_lvgl.h"
-#endif
-
 #include "telegram.h"
 #include "ota.h"
 #include "serial_console.h"
 #include "pins.h"
-
-#if !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_SPI
-#include "lcd_diag.h"
-#endif
 
 #if CONFIG_IDMS_TEMP_SENSOR_MAX31865
 #include "max31865.h"
@@ -55,20 +48,52 @@ static bool s_telemetry_ready;
 static bool s_ui_ready;
 static bool s_telegram_ready;
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#define IDMS_GPIO17_GND GPIO_NUM_17
+
+static void init_gpio17_as_gnd(void)
+{
+    gpio_hold_dis(IDMS_GPIO17_GND);
+    gpio_set_level(IDMS_GPIO17_GND, 0);
+
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << IDMS_GPIO17_GND,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io));
+    ESP_ERROR_CHECK(gpio_set_level(IDMS_GPIO17_GND, 0));
+
+    esp_err_t err = gpio_hold_en(IDMS_GPIO17_GND);
+    if (err == ESP_OK) {
+        gpio_deep_sleep_hold_en();
+    } else {
+        ESP_LOGW(TAG, "GPIO17 forced LOW, but pad hold was not enabled: %s", esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "GPIO17 reserved as GND output (LOW)");
+}
+#endif
+
 static bool app_health_ok_for_ota(void)
 {
-    idms_metrics_t m;
-    monitor_get_metrics(&m);
-
     if (!s_telemetry_ready || !s_ui_ready || !s_telegram_ready) {
         return false;
     }
+
+#if CONFIG_IDMS_OTA_VALIDATE_SENSORS
+    idms_metrics_t m;
+    monitor_get_metrics(&m);
     if (!m.sensor_preflight_done || !m.sensor_preflight_ok || m.sensor_error_flags != 0) {
         return false;
     }
     if (!m.current_valid || !m.t_in_valid || !m.t_out_valid || !m.delta_valid) {
         return false;
     }
+#endif
     return true;
 }
 
@@ -115,36 +140,6 @@ static void ota_health_validation_task(void *arg)
     vTaskDelete(NULL);
 }
 
-#if !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_SPI
-static void init_lcd_spi_bus(void)
-{
-    spi_bus_config_t buscfg = {
-        .sclk_io_num = CONFIG_IDMS_PIN_LCD_SCLK,
-        .mosi_io_num = CONFIG_IDMS_PIN_LCD_MOSI,
-#if CONFIG_IDMS_PIN_LCD_MISO >= 0
-        .miso_io_num = CONFIG_IDMS_PIN_LCD_MISO,
-#else
-        .miso_io_num = -1,
-#endif
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-#if CONFIG_IDMS_DISPLAY_ST7796S
-        .max_transfer_sz = 480 * 20 * sizeof(uint16_t),
-#elif CONFIG_IDMS_DISPLAY_ILI9488
-        .max_transfer_sz = 480 * 60 * sizeof(uint16_t),
-#elif CONFIG_IDMS_DISPLAY_ILI9341
-        .max_transfer_sz = 320 * 40 * sizeof(uint16_t),
-#else
-        .max_transfer_sz = 4096,
-#endif
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(IDMS_LCD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ESP_LOGI(TAG, "LCD SPI bus initialized (host=%d, SCLK=%d, MOSI=%d)",
-             (int)IDMS_LCD_SPI_HOST, (int)CONFIG_IDMS_PIN_LCD_SCLK,
-             (int)CONFIG_IDMS_PIN_LCD_MOSI);
-}
-#endif
-
 #if CONFIG_IDMS_TEMP_SENSOR_MAX31865
 static void init_max31865_spi_bus(void)
 {
@@ -165,66 +160,19 @@ static void init_max31865_spi_bus(void)
 }
 #endif
 
-#if CONFIG_IDMS_PIN_TOUCH_CS >= 0
-#if !defined(IDMS_LCD_SPI_HOST)
-/* Touch gets its own SPI3 bus (no SPI LCD sharing it) */
-static void init_touch_spi_bus(void)
-{
-    spi_bus_config_t buscfg = {
-        .sclk_io_num = CONFIG_IDMS_PIN_TOUCH_SCLK,
-        .mosi_io_num = CONFIG_IDMS_PIN_TOUCH_MOSI,
-        .miso_io_num = CONFIG_IDMS_PIN_TOUCH_MISO,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(IDMS_TOUCH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ESP_LOGI(TAG, "Touch SPI bus initialized (host=%d, SCLK=%d, MOSI=%d, MISO=%d)",
-             (int)IDMS_TOUCH_SPI_HOST,
-             (int)CONFIG_IDMS_PIN_TOUCH_SCLK,
-             (int)CONFIG_IDMS_PIN_TOUCH_MOSI,
-             (int)CONFIG_IDMS_PIN_TOUCH_MISO);
-}
-#else
-/* Touch shares SPI bus with LCD — no separate init needed */
-static void init_touch_spi_bus(void) { }
-#endif
-#endif
-
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP-IDMS firmware boot");
 
+#if CONFIG_IDF_TARGET_ESP32S3
+    init_gpio17_as_gnd();
+#endif
+
     ESP_ERROR_CHECK(config_store_init());
-    ESP_ERROR_CHECK(wifi_manager_init());
-
-#if !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_SPI
-    uint32_t lcd_id = lcd_diag_read_rddi(
-        CONFIG_IDMS_PIN_LCD_SCLK,
-        CONFIG_IDMS_PIN_LCD_MOSI,
-#if CONFIG_IDMS_PIN_LCD_MISO >= 0
-        CONFIG_IDMS_PIN_LCD_MISO,
-#else
-        -1,
-#endif
-        CONFIG_IDMS_PIN_LCD_CS,
-        CONFIG_IDMS_PIN_LCD_DC,
-        CONFIG_IDMS_PIN_LCD_RST);
-    lcd_diag_print_rddi(lcd_id);
-#elif !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_I80
-    ESP_LOGI(TAG, "I80 mode: skipping RDDID diagnostic");
-#endif
-
-#if !CONFIG_IDMS_DISPLAY_TOPWAY && CONFIG_IDMS_LCD_BUS_SPI
-    init_lcd_spi_bus();
-#endif
+    ESP_ERROR_CHECK(network_manager_init());
 
 #if CONFIG_IDMS_TEMP_SENSOR_MAX31865
     init_max31865_spi_bus();
-#endif
-
-#if CONFIG_IDMS_PIN_TOUCH_CS >= 0
-    init_touch_spi_bus();
 #endif
 
     esp_err_t monitor_err = monitor_init();
@@ -245,7 +193,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Cloud sync init failed: %s", esp_err_to_name(cloud_err));
     }
 
-#if CONFIG_IDMS_DISPLAY_TOPWAY
     esp_err_t ui_err = idms_ui_topway_init();
     if (ui_err != ESP_OK) {
         ESP_LOGE(TAG, "Topway UI init failed: %s", esp_err_to_name(ui_err));
@@ -253,10 +200,6 @@ void app_main(void)
     } else {
         s_ui_ready = true;
     }
-#else
-    idms_ui_init();
-    s_ui_ready = true;
-#endif
 
     esp_err_t telegram_err = telegram_command_poll_start();
     if (telegram_err != ESP_OK) {
@@ -265,6 +208,17 @@ void app_main(void)
     } else {
         s_telegram_ready = true;
     }
+
+    esp_err_t mqtt_err = mqtt_service_init();
+    if (mqtt_err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT init failed: %s", esp_err_to_name(mqtt_err));
+    }
+
+    esp_err_t modbus_err = modbus_service_init();
+    if (modbus_err != ESP_OK) {
+        ESP_LOGE(TAG, "Modbus init failed: %s", esp_err_to_name(modbus_err));
+    }
+
     serial_console_start();
 
     ESP_ERROR_CHECK(ota_init());

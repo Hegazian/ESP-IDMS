@@ -29,7 +29,7 @@
 #endif
 
 #if CONFIG_IDMS_UI_ENABLE
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include "telegram.h"
 #endif
 
@@ -62,6 +62,10 @@ static float s_last_t_in_c;
 static float s_last_t_out_c;
 static bool s_last_t_in_valid;
 static bool s_last_t_out_valid;
+static uint32_t s_last_t_in_valid_ms;
+static uint32_t s_last_t_out_valid_ms;
+static uint8_t s_t_in_fail_count;
+static uint8_t s_t_out_fail_count;
 static uint32_t s_heartbeat_ticks;
 
 enum power_state_t { POWER_OK = 0, POWER_LOW_PENDING, POWER_FAULT };
@@ -86,9 +90,14 @@ static bool s_sensor_preflight_alert_pending;
 static float s_adc_offset_volts = 0.0f;
 #endif
 
+#ifndef CONFIG_IDMS_SCT_SOFTWARE_GAIN_PERCENT
+#define CONFIG_IDMS_SCT_SOFTWARE_GAIN_PERCENT 30
+#endif
+
 static float estimate_current_a_from_adc_rms(float v_rms)
 {
     float scale = (float)config_get_current_cal_x100() / 100.0f;
+    scale *= (float)CONFIG_IDMS_SCT_SOFTWARE_GAIN_PERCENT / 100.0f;
     return v_rms * scale;
 }
 
@@ -114,9 +123,21 @@ static uint8_t s_current_recovery_good_count;
 #define CURRENT_ADC_BIAS_MAX_RAW 3200.0f
 #define CURRENT_ADC_WARMUP_SAMPLES 32
 #define CURRENT_RECOVERY_REQUIRED_GOOD_READS 3
-#define CURRENT_AUTOZERO_MAX_RMS_MV ((float)CONFIG_IDMS_SCT_AUTOZERO_MAX_RMS_MV)
+#ifndef CONFIG_IDMS_SCT_NOISE_GATE_MV
+#define CONFIG_IDMS_SCT_NOISE_GATE_MV 80
+#endif
+#define CURRENT_NOISE_GATE_MAX_MV 100
+#define CURRENT_AUTOZERO_MIN_ACCEPT_MV 150
+#define CURRENT_AUTOZERO_MAX_RMS_MV \
+    ((float)(CONFIG_IDMS_SCT_AUTOZERO_MAX_RMS_MV < CURRENT_AUTOZERO_MIN_ACCEPT_MV ? \
+             CURRENT_AUTOZERO_MIN_ACCEPT_MV : CONFIG_IDMS_SCT_AUTOZERO_MAX_RMS_MV))
+#define CURRENT_NOISE_GATE_MV \
+    ((float)(CONFIG_IDMS_SCT_NOISE_GATE_MV > CURRENT_NOISE_GATE_MAX_MV ? \
+             CURRENT_NOISE_GATE_MAX_MV : CONFIG_IDMS_SCT_NOISE_GATE_MV))
 #define DS18B20_CONVERSION_MS 800
 #define DS18B20_RESCAN_MS 10000
+#define TEMP_LAST_GOOD_HOLD_MS 30000
+#define TEMP_INVALID_AFTER_FAILS 5
 
 static bool current_adc_bias_ok(float mean_raw)
 {
@@ -219,21 +240,28 @@ static float sample_current_rms_volts(void)
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
     zero_ok = s_current_zero_valid;
 #endif
-    s_adc_sensor_connected = stats.connected && stats.read_errors == 0 && zero_ok;
-    float vrms = stats.rms_mv / 1000.0f;
+    s_adc_sensor_connected = stats.connected && stats.read_errors == 0;
+    float vrms_mv = stats.rms_mv;
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
-    vrms -= s_adc_offset_volts;
-    if (vrms < 0.0f) {
-        vrms = 0.0f;
+    if (zero_ok) {
+        float offset_mv = s_adc_offset_volts * 1000.0f;
+        vrms_mv -= offset_mv;
+        if (vrms_mv < 0.0f) {
+            vrms_mv = 0.0f;
+        }
     }
 #endif
 
-    return vrms;
+    if (vrms_mv < CURRENT_NOISE_GATE_MV) {
+        vrms_mv = 0.0f;
+    }
+
+    return vrms_mv / 1000.0f;
 }
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
-esp_err_t monitor_calibrate_zero(void)
+static esp_err_t monitor_calibrate_zero_internal(bool allow_noisy_floor)
 {
     const int n = CONFIG_IDMS_SCT_AUTOZERO_SAMPLES;
     current_sample_stats_t stats;
@@ -259,22 +287,38 @@ esp_err_t monitor_calibrate_zero(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (stats.rms_mv > CURRENT_AUTOZERO_MAX_RMS_MV) {
-        s_adc_offset_volts = 0.0f;
-        s_current_zero_valid = true;
+        if (!allow_noisy_floor) {
+            s_current_zero_valid = false;
+            s_adc_sensor_connected = true;
+            ESP_LOGW(TAG,
+                     "Auto-zero skipped: RMS %.2f mV is above clean no-load target %.2f mV. "
+                     "Using raw RMS current until display Current Zero is run with the load OFF.",
+                     (double)stats.rms_mv, (double)CURRENT_AUTOZERO_MAX_RMS_MV);
+            return ESP_ERR_INVALID_STATE;
+        }
         ESP_LOGW(TAG,
-                 "Auto-zero skipped: RMS %.2f mV is above no-load limit %.2f mV. "
-                 "Load may be running; current readings will use raw calibrated RMS.",
+                 "Manual auto-zero warning: RMS %.2f mV is above clean target %.2f mV; "
+                 "saving as prototype noise floor.",
                  (double)stats.rms_mv, (double)CURRENT_AUTOZERO_MAX_RMS_MV);
-        ESP_LOGW(TAG, "Run 'cal_zero' only with the CT connected and the load OFF.");
-        return ESP_OK;
     }
 
     s_adc_offset_volts = stats.rms_mv / 1000.0f;
     s_current_zero_valid = true;
+    s_adc_sensor_connected = true;
 
     ESP_LOGI(TAG, "Auto-zero complete: offset = %.4f V (%.1f ADC counts), mean = %.1f",
              s_adc_offset_volts, (double)stats.rms_raw, (double)stats.mean_raw);
     return ESP_OK;
+}
+
+esp_err_t monitor_calibrate_zero(void)
+{
+    return monitor_calibrate_zero_internal(false);
+}
+
+esp_err_t monitor_calibrate_zero_manual(void)
+{
+    return monitor_calibrate_zero_internal(true);
 }
 #endif
 
@@ -400,6 +444,66 @@ static bool temp_in_range(float temp_c, float min_c, float max_c)
     return isfinite(temp_c) && temp_c >= min_c && temp_c <= max_c;
 }
 
+static bool hold_last_temperature(bool last_valid, uint32_t last_valid_ms,
+                                  uint8_t fail_count, uint32_t now_ms)
+{
+    if (!last_valid) {
+        return false;
+    }
+    if (fail_count < TEMP_INVALID_AFTER_FAILS) {
+        return true;
+    }
+    return last_valid_ms == 0 || (now_ms - last_valid_ms) <= TEMP_LAST_GOOD_HOLD_MS;
+}
+
+static void note_t_in_success(float temp_c, uint32_t now_ms)
+{
+    s_last_t_in_c = temp_c;
+    s_last_t_in_valid = true;
+    s_last_t_in_valid_ms = now_ms;
+    s_t_in_fail_count = 0;
+}
+
+static void note_t_out_success(float temp_c, uint32_t now_ms)
+{
+    s_last_t_out_c = temp_c;
+    s_last_t_out_valid = true;
+    s_last_t_out_valid_ms = now_ms;
+    s_t_out_fail_count = 0;
+}
+
+static bool note_t_in_failure(uint32_t now_ms, float *temp_c)
+{
+    if (s_t_in_fail_count < UINT8_MAX) {
+        s_t_in_fail_count++;
+    }
+    if (hold_last_temperature(s_last_t_in_valid, s_last_t_in_valid_ms,
+                              s_t_in_fail_count, now_ms)) {
+        if (temp_c) {
+            *temp_c = s_last_t_in_c;
+        }
+        return true;
+    }
+    s_last_t_in_valid = false;
+    return false;
+}
+
+static bool note_t_out_failure(uint32_t now_ms, float *temp_c)
+{
+    if (s_t_out_fail_count < UINT8_MAX) {
+        s_t_out_fail_count++;
+    }
+    if (hold_last_temperature(s_last_t_out_valid, s_last_t_out_valid_ms,
+                              s_t_out_fail_count, now_ms)) {
+        if (temp_c) {
+            *temp_c = s_last_t_out_c;
+        }
+        return true;
+    }
+    s_last_t_out_valid = false;
+    return false;
+}
+
 static bool init_current_adc_calibration(adc_unit_t unit_id, adc_channel_t channel,
                                          adc_atten_t atten, adc_bitwidth_t bitwidth)
 {
@@ -474,7 +578,7 @@ static void recover_current_sensor_if_ready(void)
         return;
     }
 
-    if (s_adc_sensor_connected && s_current_zero_valid) {
+    if (s_adc_sensor_connected) {
         return;
     }
 
@@ -501,9 +605,12 @@ static void recover_current_sensor_if_ready(void)
     ESP_LOGI(TAG, "Current ADC bias recovered: mean=%.1f raw rms=%.1f. Re-running zero calibration.",
              (double)stats.mean_raw, (double)stats.rms_raw);
     if (monitor_calibrate_zero() != ESP_OK) {
-        s_adc_sensor_connected = false;
+        ESP_LOGW(TAG, "Current zero not clean after recovery; keeping current sensor online in raw RMS mode");
+        s_adc_sensor_connected = true;
         s_current_zero_valid = false;
         s_current_recovery_good_count = 0;
+        s_current_ema = 0.0f;
+        s_current_ema_initialized = false;
         return;
     }
 #else
@@ -519,6 +626,7 @@ static void recover_current_sensor_if_ready(void)
 static uint32_t preflight_temperature_sensors(void)
 {
     uint32_t flags = 0;
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
 #if CONFIG_IDMS_TEMP_SENSOR_DS18B20
     bool tin_present = ds18b20_sensor_present(0);
@@ -542,8 +650,7 @@ static uint32_t preflight_temperature_sensors(void)
             flags |= IDMS_SENSOR_ERR_TEMP_IN | IDMS_SENSOR_ERR_TEMP_DELTA;
             s_last_t_in_valid = false;
         } else {
-            s_last_t_in_c = t_in;
-            s_last_t_in_valid = true;
+            note_t_in_success(t_in, now_ms);
         }
         float t_out = 0.0f;
         if (!tout_present ||
@@ -552,8 +659,7 @@ static uint32_t preflight_temperature_sensors(void)
             flags |= IDMS_SENSOR_ERR_TEMP_OUT | IDMS_SENSOR_ERR_TEMP_DELTA;
             s_last_t_out_valid = false;
         } else {
-            s_last_t_out_c = t_out;
-            s_last_t_out_valid = true;
+            note_t_out_success(t_out, now_ms);
         }
     }
 #elif CONFIG_IDMS_TEMP_SENSOR_MAX31865
@@ -638,8 +744,8 @@ static void send_power_alert(bool loss, float a)
         if (written > 0 && written < (int)sizeof(msg)) {
             uint8_t n = config_get_tech_count();
             for (int i = 0; i < n; i++) {
-                char id[64];
-                if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                char id[64] = "";
+                if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
                     telegram_send_ringing_alert(id, msg);
                 }
             }
@@ -661,8 +767,8 @@ static void send_cool_alert(bool low_side, float dt)
     if (written > 0 && written < (int)sizeof(msg)) {
         uint8_t n = config_get_tech_count();
         for (int i = 0; i < n; i++) {
-            char id[64];
-            if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+            char id[64] = "";
+            if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
                 telegram_send_ringing_alert(id, msg);
             }
         }
@@ -713,8 +819,12 @@ static void monitor_task(void *arg)
             ds18b20_init();
             s_ds18b20_last_rescan_ms = now_ms;
             s_conv_pending_read = false;
-            s_last_t_in_valid = ds18b20_sensor_present(0) ? s_last_t_in_valid : false;
-            s_last_t_out_valid = ds18b20_sensor_present(1) ? s_last_t_out_valid : false;
+            if (!ds18b20_sensor_present(0)) {
+                (void)note_t_in_failure(now_ms, NULL);
+            }
+            if (!ds18b20_sensor_present(1)) {
+                (void)note_t_out_failure(now_ms, NULL);
+            }
         }
 
         t_in = s_last_t_in_c;
@@ -724,25 +834,32 @@ static void monitor_task(void *arg)
         bool ds_ready = s_conv_pending_read &&
                         ((now_ms - s_ds18b20_request_ms) >= DS18B20_CONVERSION_MS);
         if (ds_ready) {
+            float sample = 0.0f;
             if (ds18b20_sensor_present(0)) {
-                v_in = ds18b20_read_temperature_c(0, &t_in);
-                if (v_in) {
-                    s_last_t_in_c = t_in;
+                bool read_ok = ds18b20_read_temperature_c(0, &sample) &&
+                               temp_in_range(sample, -55.0f, 125.0f);
+                if (read_ok) {
+                    t_in = sample;
+                    v_in = true;
+                    note_t_in_success(t_in, now_ms);
+                } else {
+                    v_in = note_t_in_failure(now_ms, &t_in);
                 }
-                s_last_t_in_valid = v_in;
             } else {
-                v_in = false;
-                s_last_t_in_valid = false;
+                v_in = note_t_in_failure(now_ms, &t_in);
             }
             if (ds18b20_sensor_present(1)) {
-                v_out = ds18b20_read_temperature_c(1, &t_out);
-                if (v_out) {
-                    s_last_t_out_c = t_out;
+                bool read_ok = ds18b20_read_temperature_c(1, &sample) &&
+                               temp_in_range(sample, -55.0f, 125.0f);
+                if (read_ok) {
+                    t_out = sample;
+                    v_out = true;
+                    note_t_out_success(t_out, now_ms);
+                } else {
+                    v_out = note_t_out_failure(now_ms, &t_out);
                 }
-                s_last_t_out_valid = v_out;
             } else {
-                v_out = false;
-                s_last_t_out_valid = false;
+                v_out = note_t_out_failure(now_ms, &t_out);
             }
             s_conv_pending_read = false;
         }
@@ -860,7 +977,9 @@ static void monitor_task(void *arg)
         set_sensor_status_flags(runtime_sensor_flags);
 
 #if CONFIG_IDMS_UI_ENABLE
-        bool wifi_up = wifi_manager_is_connected();
+        bool wifi_up = network_manager_is_connected();
+        char wifi_ip[16] = {0};
+        network_manager_get_ip(wifi_ip, sizeof(wifi_ip));
 #endif
 #if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
         bool time_synced = (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
@@ -878,7 +997,8 @@ static void monitor_task(void *arg)
         s_metrics.delta_valid = v_dt;
 #if CONFIG_IDMS_UI_ENABLE
         s_metrics.wifi_connected = wifi_up;
-        wifi_manager_get_ip(s_metrics.wifi_ip, sizeof(s_metrics.wifi_ip));
+        strncpy(s_metrics.wifi_ip, wifi_ip, sizeof(s_metrics.wifi_ip) - 1);
+        s_metrics.wifi_ip[sizeof(s_metrics.wifi_ip) - 1] = '\0';
 #endif
 #if CONFIG_LWIP_SNTP_MAX_SERVERS > 0
         s_metrics.time_synced = time_synced;
@@ -1033,6 +1153,10 @@ esp_err_t monitor_init(void)
     s_sensor_last_logged_flags = UINT32_MAX;
     s_last_t_in_valid = false;
     s_last_t_out_valid = false;
+    s_last_t_in_valid_ms = 0;
+    s_last_t_out_valid_ms = 0;
+    s_t_in_fail_count = 0;
+    s_t_out_fail_count = 0;
     s_adc_sensor_connected = false;
     s_current_zero_valid = false;
     s_current_recovery_good_count = 0;

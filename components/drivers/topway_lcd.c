@@ -13,6 +13,17 @@ static const char *TAG = "topway";
 static uart_port_t s_uart;
 static int s_rts_pin = -1;
 static SemaphoreHandle_t s_tx_mux;
+static uint32_t s_last_malformed_log_ms;
+
+#define TOPWAY_TOUCH_QUEUE_LEN 16
+
+typedef struct {
+    uint32_t vp;
+    uint16_t value;
+} topway_touch_event_t;
+
+static topway_touch_event_t s_touch_queue[TOPWAY_TOUCH_QUEUE_LEN];
+static size_t s_touch_queue_len;
 
 static const uint8_t s_tail[4] = {
     TOPWAY_PKT_TAIL0, TOPWAY_PKT_TAIL1, TOPWAY_PKT_TAIL2, TOPWAY_PKT_TAIL3
@@ -40,11 +51,29 @@ static esp_err_t tx_packet_locked(const uint8_t *payload, size_t len)
     if (err != ESP_OK) return err;
 
     uint8_t hdr = TOPWAY_PKT_HEADER;
-    uart_write_bytes(s_uart, &hdr, 1);
-    uart_write_bytes(s_uart, payload, len);
-    uart_write_bytes(s_uart, s_tail, sizeof(s_tail));
+    int written = uart_write_bytes(s_uart, &hdr, 1);
+    if (written != 1) {
+        ESP_LOGW(TAG, "UART TX failed while writing packet header (%d)", written);
+        return ESP_FAIL;
+    }
+    written = uart_write_bytes(s_uart, payload, len);
+    if (written != (int)len) {
+        ESP_LOGW(TAG, "UART TX failed while writing packet payload (%d/%u)",
+                 written, (unsigned)len);
+        return ESP_FAIL;
+    }
+    written = uart_write_bytes(s_uart, s_tail, sizeof(s_tail));
+    if (written != (int)sizeof(s_tail)) {
+        ESP_LOGW(TAG, "UART TX failed while writing packet tail (%d/%u)",
+                 written, (unsigned)sizeof(s_tail));
+        return ESP_FAIL;
+    }
 
-    uart_wait_tx_done(s_uart, pdMS_TO_TICKS(200));
+    err = uart_wait_tx_done(s_uart, pdMS_TO_TICKS(200));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "UART TX wait failed: %s", esp_err_to_name(err));
+        return err;
+    }
     vTaskDelay(pdMS_TO_TICKS(30));
     return ESP_OK;
 }
@@ -69,6 +98,80 @@ static bool ends_with_tail(const uint8_t *buf, size_t len)
            memcmp(buf + len - sizeof(s_tail), s_tail, sizeof(s_tail)) == 0;
 }
 
+static bool parse_touch_vp_frame(const uint8_t *buf, size_t len, uint32_t *vp, uint16_t *value)
+{
+    if (!buf || len < 12 || buf[0] != TOPWAY_PKT_HEADER || !ends_with_tail(buf, len)) {
+        return false;
+    }
+    if (buf[1] != TOPWAY_TOUCH_KEY_VP) {
+        return false;
+    }
+
+    uint32_t parsed_vp = ((uint32_t)buf[2] << 24) |
+                         ((uint32_t)buf[3] << 16) |
+                         ((uint32_t)buf[4] << 8) |
+                         (uint32_t)buf[5];
+    uint16_t parsed_value = ((uint16_t)buf[6] << 8) | (uint16_t)buf[7];
+
+    if (vp) *vp = parsed_vp;
+    if (value) *value = parsed_value;
+    return true;
+}
+
+static void queue_touch_event_locked(uint32_t vp, uint16_t value)
+{
+    if (vp == 0) {
+        return;
+    }
+
+    if (s_touch_queue_len >= TOPWAY_TOUCH_QUEUE_LEN) {
+        memmove(&s_touch_queue[0], &s_touch_queue[1],
+                sizeof(s_touch_queue[0]) * (TOPWAY_TOUCH_QUEUE_LEN - 1));
+        s_touch_queue_len = TOPWAY_TOUCH_QUEUE_LEN - 1;
+    }
+
+    s_touch_queue[s_touch_queue_len].vp = vp;
+    s_touch_queue[s_touch_queue_len].value = value;
+    s_touch_queue_len++;
+}
+
+static bool take_touch_event_locked(uint32_t vp, uint16_t *value)
+{
+    if (!value) {
+        return false;
+    }
+
+    for (size_t i = 0; i < s_touch_queue_len; i++) {
+        if (s_touch_queue[i].vp == vp) {
+            *value = s_touch_queue[i].value;
+            if (i + 1 < s_touch_queue_len) {
+                memmove(&s_touch_queue[i], &s_touch_queue[i + 1],
+                        sizeof(s_touch_queue[0]) * (s_touch_queue_len - i - 1));
+            }
+            s_touch_queue_len--;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void log_malformed_frame(const char *reason, const uint8_t *buf, size_t len)
+{
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((now_ms - s_last_malformed_log_ms) < 5000) {
+        return;
+    }
+    s_last_malformed_log_ms = now_ms;
+
+    char hex[3 * 16 + 1] = {0};
+    size_t show = len < 16 ? len : 16;
+    for (size_t i = 0; i < show; i++) {
+        snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", buf[i]);
+    }
+    ESP_LOGW(TAG, "Malformed RX frame (%s), len=%u, first bytes: %s%s",
+             reason, (unsigned)len, hex, len > show ? "..." : "");
+}
+
 static esp_err_t read_frame_locked(uint8_t expected_cmd, uint8_t *resp, size_t resp_sz,
                                    size_t *out_len, uint32_t timeout_ms)
 {
@@ -79,12 +182,17 @@ static esp_err_t read_frame_locked(uint8_t expected_cmd, uint8_t *resp, size_t r
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
     bool in_frame = false;
+    uint32_t bytes_seen = 0;
 
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
         uint8_t b = 0;
         int got = uart_read_bytes(s_uart, &b, 1, pdMS_TO_TICKS(20));
         if (got <= 0) {
             continue;
+        }
+        bytes_seen++;
+        if ((bytes_seen % 32) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
         if (!in_frame) {
@@ -98,7 +206,14 @@ static esp_err_t read_frame_locked(uint8_t expected_cmd, uint8_t *resp, size_t r
         }
 
         if (len >= resp_sz) {
-            return ESP_ERR_INVALID_SIZE;
+            log_malformed_frame("oversize/no tail", resp, len);
+            in_frame = false;
+            len = 0;
+            if (b == TOPWAY_PKT_HEADER) {
+                in_frame = true;
+                resp[len++] = b;
+            }
+            continue;
         }
         resp[len++] = b;
 
@@ -107,11 +222,23 @@ static esp_err_t read_frame_locked(uint8_t expected_cmd, uint8_t *resp, size_t r
                 *out_len = len;
                 return ESP_OK;
             }
+            uint32_t vp = 0;
+            uint16_t value = 0;
+            if (parse_touch_vp_frame(resp, len, &vp, &value)) {
+                queue_touch_event_locked(vp, value);
+                in_frame = false;
+                len = 0;
+                continue;
+            }
+            log_malformed_frame("unexpected command", resp, len);
             in_frame = false;
             len = 0;
         }
     }
 
+    if (in_frame && len > 0) {
+        log_malformed_frame("partial timeout", resp, len);
+    }
     return ESP_ERR_TIMEOUT;
 }
 
@@ -126,26 +253,13 @@ static esp_err_t transact_packet(const uint8_t *payload, size_t payload_len, uin
         return ESP_ERR_TIMEOUT;
     }
 
+    drain_rx();
     esp_err_t err = tx_packet_locked(payload, payload_len);
     if (err == ESP_OK) {
         err = read_frame_locked(expected_cmd, resp, resp_sz, out_len, timeout_ms);
     }
     xSemaphoreGive(s_tx_mux);
     return err;
-}
-
-static bool parse_touch_frame(const uint8_t *buf, size_t len, uint8_t *page_id, uint8_t *key_id)
-{
-    if (!buf || len < 6 || buf[0] != TOPWAY_PKT_HEADER || !ends_with_tail(buf, len)) {
-        return false;
-    }
-    if (buf[1] != TOPWAY_TOUCH_KEY_VP && buf[1] != TOPWAY_TOUCH_DOWN_KEY &&
-        buf[1] != TOPWAY_TOUCH_RELEASE_KEY) {
-        return false;
-    }
-    if (page_id) *page_id = buf[2];
-    if (key_id) *key_id = buf[3];
-    return true;
 }
 
 static esp_err_t read_any_frame_locked(uint8_t *resp, size_t resp_sz, size_t *out_len)
@@ -155,8 +269,22 @@ static esp_err_t read_any_frame_locked(uint8_t *resp, size_t resp_sz, size_t *ou
 
 static void drain_rx(void)
 {
-    uint8_t tmp[64];
-    while (uart_read_bytes(s_uart, tmp, sizeof(tmp), pdMS_TO_TICKS(10)) > 0) {
+    uint8_t frame[32];
+    size_t len = 0;
+
+    for (int i = 0; i < 8; i++) {
+        size_t buffered = 0;
+        if (uart_get_buffered_data_len(s_uart, &buffered) != ESP_OK || buffered == 0) {
+            break;
+        }
+        if (read_any_frame_locked(frame, sizeof(frame), &len) != ESP_OK) {
+            break;
+        }
+        uint32_t vp = 0;
+        uint16_t value = 0;
+        if (parse_touch_vp_frame(frame, len, &vp, &value)) {
+            queue_touch_event_locked(vp, value);
+        }
     }
 }
 
@@ -167,6 +295,7 @@ esp_err_t topway_init(const topway_config_t *config)
 
     s_uart = config->uart_port;
     s_rts_pin = config->rts_pin;
+    s_touch_queue_len = 0;
 
     uart_config_t uart_config = {
         .baud_rate = config->baud_rate ? config->baud_rate : 115200,
@@ -181,6 +310,9 @@ esp_err_t topway_init(const topway_config_t *config)
     ESP_ERROR_CHECK(uart_driver_install(s_uart, 512, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_set_pin(s_uart, config->tx_pin, config->rx_pin,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    if (config->rx_pin >= 0) {
+        gpio_set_pull_mode(config->rx_pin, GPIO_PULLUP_ONLY);
+    }
 
     if (s_rts_pin >= 0) {
         gpio_config_t io = {
@@ -205,11 +337,11 @@ esp_err_t topway_init(const topway_config_t *config)
     drain_rx();
 
     esp_err_t err = ESP_FAIL;
-    for (int attempt = 1; attempt <= 5; attempt++) {
-        ESP_LOGI(TAG, "Handshake attempt %d/5...", attempt);
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        ESP_LOGI(TAG, "Handshake attempt %d/3...", attempt);
         err = topway_handshake();
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Handshake OK — display ready");
+            ESP_LOGI(TAG, "Handshake OK - display ready");
             break;
         }
         ESP_LOGW(TAG, "Handshake attempt %d failed, retrying in 1s...", attempt);
@@ -217,12 +349,13 @@ esp_err_t topway_init(const topway_config_t *config)
         drain_rx();
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Handshake failed after 5 attempts");
-        ESP_LOGE(TAG, "  Check: RS232-TTL wiring (TX<->RX cross), baud rate, VCC");
-        ESP_LOGE(TAG, "  Display needs 12V on VDD pin, RS232 converter needs 3.3-5V");
-        ESP_LOGE(TAG, "  Try 9600 baud if jumpers changed (JP1,JP8 close; JP2,JP7 open)");
-        topway_deinit();
-        return err;
+        ESP_LOGW(TAG, "Handshake not ready yet; UART stays active for UI retry");
+        ESP_LOGW(TAG, "  Check: ESP TX GPIO -> Topway RX, Topway TX -> ESP RX GPIO");
+        ESP_LOGW(TAG, "  Current config: ESP GPIO%d TX -> display RX, display TX -> ESP GPIO%d RX",
+                 config->tx_pin, config->rx_pin);
+        if (config->rx_pin == 20 || config->tx_pin == 20) {
+            ESP_LOGW(TAG, "  GPIO20 is ESP32-S3 USB D+; do not connect native USB while using it as UART RX/TX");
+        }
     }
 
     return ESP_OK;
@@ -234,7 +367,31 @@ esp_err_t topway_deinit(void)
         vSemaphoreDelete(s_tx_mux);
         s_tx_mux = NULL;
     }
+    s_touch_queue_len = 0;
     return uart_driver_delete(s_uart);
+}
+
+esp_err_t topway_set_pins(int tx_pin, int rx_pin)
+{
+    if (!s_tx_mux) return ESP_ERR_INVALID_STATE;
+    if (tx_pin < 0 || rx_pin < 0) return ESP_ERR_INVALID_ARG;
+
+    if (xSemaphoreTake(s_tx_mux, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uart_wait_tx_done(s_uart, pdMS_TO_TICKS(200));
+    uart_flush_input(s_uart);
+    esp_err_t err = uart_set_pin(s_uart, tx_pin, rx_pin,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err == ESP_OK) {
+        gpio_set_pull_mode(rx_pin, GPIO_PULLUP_ONLY);
+        ESP_LOGI(TAG, "Topway UART pins changed: ESP GPIO%d TX -> display RX, display TX -> ESP GPIO%d RX",
+                 tx_pin, rx_pin);
+    }
+
+    xSemaphoreGive(s_tx_mux);
+    return err;
 }
 
 esp_err_t topway_handshake(void)
@@ -264,6 +421,88 @@ esp_err_t topway_handshake(void)
     }
 
     return ESP_OK;
+}
+
+esp_err_t topway_dump_rx(uint32_t duration_ms)
+{
+    if (!s_tx_mux) return ESP_ERR_INVALID_STATE;
+    if (duration_ms == 0) duration_ms = 1000;
+    if (duration_ms > 5000) duration_ms = 5000;
+
+    if (xSemaphoreTake(s_tx_mux, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint8_t buf[32];
+    size_t total = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t duration = pdMS_TO_TICKS(duration_ms);
+
+    ESP_LOGI(TAG, "Topway RX dump started for %lu ms", (unsigned long)duration_ms);
+    while ((xTaskGetTickCount() - start) < duration) {
+        int got = uart_read_bytes(s_uart, buf, sizeof(buf), pdMS_TO_TICKS(50));
+        if (got <= 0) {
+            continue;
+        }
+        total += (size_t)got;
+
+        char hex[3 * 32 + 1] = {0};
+        for (int i = 0; i < got; i++) {
+            snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", buf[i]);
+        }
+        ESP_LOGI(TAG, "RX[%d]: %s", got, hex);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    xSemaphoreGive(s_tx_mux);
+    ESP_LOGI(TAG, "Topway RX dump complete: %u byte(s)", (unsigned)total);
+    return total > 0 ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t topway_tx_burst(uint32_t duration_ms)
+{
+    if (!s_tx_mux) return ESP_ERR_INVALID_STATE;
+    if (duration_ms == 0) duration_ms = 1000;
+    if (duration_ms > 10000) duration_ms = 10000;
+
+    if (xSemaphoreTake(s_tx_mux, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = wait_busy(200);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_tx_mux);
+        return err;
+    }
+
+    uint8_t pattern[64];
+    memset(pattern, 0x55, sizeof(pattern));
+
+    size_t total = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t duration = pdMS_TO_TICKS(duration_ms);
+
+    ESP_LOGI(TAG, "Topway TX burst started for %lu ms", (unsigned long)duration_ms);
+    while ((xTaskGetTickCount() - start) < duration) {
+        int written = uart_write_bytes(s_uart, pattern, sizeof(pattern));
+        if (written != (int)sizeof(pattern)) {
+            ESP_LOGW(TAG, "UART TX burst write failed (%d/%u)",
+                     written, (unsigned)sizeof(pattern));
+            err = ESP_FAIL;
+            break;
+        }
+        total += (size_t)written;
+        err = uart_wait_tx_done(s_uart, pdMS_TO_TICKS(100));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "UART TX burst wait failed: %s", esp_err_to_name(err));
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    xSemaphoreGive(s_tx_mux);
+    ESP_LOGI(TAG, "Topway TX burst complete: %u byte(s)", (unsigned)total);
+    return err == ESP_OK && total > 0 ? ESP_OK : err;
 }
 
 esp_err_t topway_read_version(char *out, size_t out_sz)
@@ -436,11 +675,16 @@ esp_err_t topway_n16_read(uint32_t addr, uint16_t *value)
 
     uint8_t resp[16] = {0};
     size_t len = 0;
-    esp_err_t err = transact_packet(pkt, sizeof(pkt), TOPWAY_CMD_N16_READ,
-                                    resp, sizeof(resp), &len, 500);
-    if (err != ESP_OK) {
-        return err;
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        err = transact_packet(pkt, sizeof(pkt), TOPWAY_CMD_N16_READ,
+                              resp, sizeof(resp), &len, 800);
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
+    if (err != ESP_OK) return err;
     if (len < 8) return ESP_ERR_INVALID_RESPONSE;
     *value = ((uint16_t)resp[2] << 8) | resp[3];
     return ESP_OK;
@@ -621,6 +865,19 @@ void topway_register_touch_callback(topway_touch_callback_t callback)
     s_touch_callback = callback;
 }
 
+bool topway_take_touch_event(uint32_t vp, uint16_t *value)
+{
+    if (!value || !s_tx_mux) {
+        return false;
+    }
+    if (xSemaphoreTake(s_tx_mux, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+    bool found = take_touch_event_locked(vp, value);
+    xSemaphoreGive(s_tx_mux);
+    return found;
+}
+
 void topway_process_touch_events(void)
 {
     if (!s_touch_callback) return;
@@ -630,19 +887,20 @@ void topway_process_touch_events(void)
         return;
     }
 
-    uint8_t pages[8];
-    uint8_t keys[8];
+    uint32_t vps[8];
+    uint16_t values[8];
     size_t event_count = 0;
     uint8_t frame[32];
     size_t len = 0;
 
-    while (event_count < (sizeof(keys) / sizeof(keys[0])) &&
+    while (event_count < (sizeof(vps) / sizeof(vps[0])) &&
            read_any_frame_locked(frame, sizeof(frame), &len) == ESP_OK) {
-        uint8_t page_id = 0;
-        uint8_t key_id = 0;
-        if (parse_touch_frame(frame, len, &page_id, &key_id)) {
-            pages[event_count] = page_id;
-            keys[event_count] = key_id;
+        uint32_t vp = 0;
+        uint16_t value = 0;
+        if (parse_touch_vp_frame(frame, len, &vp, &value)) {
+            queue_touch_event_locked(vp, value);
+            vps[event_count] = vp;
+            values[event_count] = value;
             event_count++;
         }
     }
@@ -650,6 +908,6 @@ void topway_process_touch_events(void)
     xSemaphoreGive(s_tx_mux);
 
     for (size_t i = 0; i < event_count && s_touch_callback; i++) {
-        s_touch_callback(pages[i], keys[i]);
+        s_touch_callback(vps[i], values[i]);
     }
 }

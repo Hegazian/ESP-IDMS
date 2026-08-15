@@ -132,9 +132,9 @@ extern "C" {
 #define VP_N16_TELEGRAM_DELETE_ROW3   0x08002C /* Delete technician row 3 */
 #define VP_N16_TELEGRAM_DELETE_ROW4   0x08002E /* Delete technician row 4 */
 
-#define VP_N16_CUR_VALUE    0x080000  /* Current value, A */
-#define VP_N16_TIN_VALUE    0x080002  /* Temp In, C */
-#define VP_N16_TOUT_VALUE   0x080004  /* Temp Out, C */
+#define VP_N16_CUR_VALUE    0x080000  /* Current value, A; invalid is written as -999 */
+#define VP_N16_TIN_VALUE    0x080002  /* Temp In, C; invalid is written as -999 */
+#define VP_N16_TOUT_VALUE   0x080004  /* Temp Out, C; invalid is written as -999 */
 
 /* CONFIGURATION page VP addresses (pure Celsius and Amperes) */
 #define VP_N16_CFG_MIN_TIN      0x080030  /* Min Temp IN threshold (C) */
@@ -176,8 +176,11 @@ typedef struct {
 
 esp_err_t topway_init(const topway_config_t *config);
 esp_err_t topway_deinit(void);
+esp_err_t topway_set_pins(int tx_pin, int rx_pin);
 
 esp_err_t topway_handshake(void);
+esp_err_t topway_dump_rx(uint32_t duration_ms);
+esp_err_t topway_tx_burst(uint32_t duration_ms);
 esp_err_t topway_read_version(char *out, size_t out_sz);
 esp_err_t topway_read_page_id(uint16_t *page_id);
 
@@ -210,11 +213,12 @@ esp_err_t topway_sys_reg_write(uint32_t addr, uint8_t value);
 
 esp_err_t topway_rtc_set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec);
 
-/* Touch event callback */
-typedef void (*topway_touch_callback_t)(uint8_t page_id, uint8_t key_id);
+/* Touch/VP event callback. The panel reports touched VP address and value. */
+typedef void (*topway_touch_callback_t)(uint32_t vp, uint16_t value);
 
 void topway_register_touch_callback(topway_touch_callback_t callback);
 void topway_process_touch_events(void);
+bool topway_take_touch_event(uint32_t vp, uint16_t *value);
 
 #ifdef __cplusplus
 }
