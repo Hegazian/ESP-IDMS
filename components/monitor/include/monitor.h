@@ -44,4 +44,5 @@ esp_err_t monitor_calibrate_all(void);
 
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
 esp_err_t monitor_calibrate_zero(void);
+esp_err_t monitor_calibrate_zero_manual(void);
 #endif

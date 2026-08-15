@@ -14,17 +14,17 @@ Last updated: 2026-05-10
 ## What The Device Does
 
 - Measures AC current with an SCT-013 current transformer on ESP32-S3 ADC.
-- Measures T_in and T_out with DS18B20 probes on two separate 1-Wire buses.
+- Measures T_in and T_out with DS18B20 probes or MAX31865 RTD sensors.
 - Calculates Delta T as `T_out - T_in`.
 - Detects power loss when current stays below the power-loss threshold.
 - Detects cooling faults when Delta T is outside the configured allowed range.
+- Dual Network Architecture: Primary ENC28J60 SPI Ethernet with automatic Wi-Fi fallback.
+- Industrial Integration: Stream JSON telemetry via MQTT; slave interface via Modbus RTU/TCP.
 - Shows live readings and status on a Topway HKT070DTA-1C 800x480 smart LCD.
-- Lets operators edit Wi-Fi, thresholds, sensor calibration, and Telegram technician numbers from Topway.
+- Lets operators edit network, thresholds, sensor calibration, and Telegram technician numbers from Topway.
 - Sends Telegram alerts, reminders, status, OTA links, and weekly reports.
-- Supports OTA firmware upload with HTTPS, auth, SHA256, and rollback health
-  validation.
-- Stores telemetry locally as CSV and can upload pending rows to a cloud HTTPS
-  endpoint.
+- Supports OTA firmware upload with HTTPS, auth, SHA256, and rollback health validation.
+- Stores telemetry locally as CSV and can upload pending rows to a cloud HTTPS endpoint.
 
 ## Current Production Notes
 
@@ -38,7 +38,7 @@ Production must enable:
 - Flash encryption
 - NVS encryption
 - Empty compiled-in secrets
-- Runtime provisioning for Wi-Fi, Telegram, OTA credentials, and cloud token
+- Runtime provisioning for network, Telegram, OTA credentials, and cloud token
 - Strong OTA credentials or one-time token flow
 
 Do not ship devices with secrets compiled into `sdkconfig`.
@@ -50,9 +50,10 @@ Do not ship devices with secrets compiled into `sdkconfig`.
 | MCU | ESP32-S3 N16R8, 16 MB flash, 8 MB PSRAM |
 | Display | Topway HKT070DTA-1C smart LCD |
 | Current sensor | SCT-013 voltage-output CT, default calibration 30.00 A/V |
-| Temperature sensors | Two DS18B20 waterproof probes |
-| Network | Wi-Fi STA mode |
-| Alert channel | Telegram Bot API over HTTPS |
+| Temperature sensors | DS18B20 waterproof probes or MAX31865 PT100 RTDs |
+| Primary Network | ENC28J60 SPI Ethernet |
+| Fallback Network | Wi-Fi STA mode |
+| Protocols | MQTT (JSON telemetry), Modbus RTU / TCP (Slave), Telegram Bot API over HTTPS |
 | OTA | HTTPS server on port 8080 |
 | Telemetry | Local SPIFFS CSV plus optional HTTPS cloud upload |
 
@@ -67,13 +68,22 @@ Do not ship devices with secrets compiled into `sdkconfig`.
 | T_in DS18B20 | GPIO4 | 4.7 kOhm pull-up to 3.3 V |
 | T_out DS18B20 | GPIO15 | 4.7 kOhm pull-up to 3.3 V |
 | SCT-013 ADC | GPIO6 | ADC unit 0, channel 5, biased near mid-scale |
-| Touch SPI SCLK | GPIO12 | Optional/legacy Topway touch breakout |
-| Touch SPI MOSI | GPIO13 | Optional/legacy |
-| Touch SPI MISO | GPIO16 | Optional/legacy |
-| Touch CS | GPIO11 | Optional/legacy |
-| Touch IRQ | GPIO14 | Optional/legacy |
+| Ethernet SPI SCLK | GPIO12 | ENC28J60 SPI3 Host |
+| Ethernet SPI MOSI | GPIO13 | ENC28J60 SPI3 Host |
+| Ethernet SPI MISO | GPIO16 | ENC28J60 SPI3 Host |
+| Ethernet SPI CS | GPIO11 | ENC28J60 SPI3 Host |
+| Ethernet INT | GPIO14 | ENC28J60 Interrupt line |
+| Modbus RS485 TX | GPIO17 | Modbus RTU UART2 |
+| Modbus RS485 RX | GPIO18 | Modbus RTU UART2 |
 
 ## Build
+
+GPIO20 handling: on ESP32-S3, GPIO20 is also USB D+. The project can use it as
+Topway UART RX, but then the native USB connector on GPIO19/20 must not be used
+for console/debug/USB-OTG while the display is connected. Use the normal UART0
+console on GPIO43/44, or an external USB-UART adapter, for monitor/flashing.
+If your dev board has GPIO20 hard-wired to a USB connector, avoid plugging that
+native USB port into a PC while the Topway UART is connected.
 
 Development environment used:
 

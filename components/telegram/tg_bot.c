@@ -6,7 +6,7 @@
 #include "tg_token.h"
 #include "config_store.h"
 #include "ota.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include "telegram.h"
 #include "telemetry.h"
 #include "nvs_flash.h"
@@ -44,6 +44,10 @@ static const char *TAG = "tg_bot";
 #define LOGIN_GLOBAL_FAIL_LIMIT 12
 #define RECENT_CALLBACK_MAX     8
 #define CALLBACK_DEDUPE_MS      (12 * 1000)
+#define SENSITIVE_AUTH_WINDOW_MS (5 * 60 * 1000)
+#ifndef CONFIG_IDMS_TELEGRAM_ALLOW_TECH_SENSITIVE_ACTIONS
+#define CONFIG_IDMS_TELEGRAM_ALLOW_TECH_SENSITIVE_ACTIONS 1
+#endif
 
 static char *s_resp_buf = NULL;
 static bool s_dns_ok = false;
@@ -61,6 +65,7 @@ typedef enum {
     SESSION_LOGIN_NAME,
     SESSION_LOGIN_PASSWORD,
     SESSION_LOGIN_CONTACT,
+    SESSION_SENSITIVE_PASSWORD,
 } session_state_t;
 
 typedef enum {
@@ -101,12 +106,40 @@ typedef struct {
     int64_t seen_ms;
 } recent_callback_t;
 
+typedef struct {
+    bool active;
+    char from_id[32];
+    int64_t until_ms;
+} sensitive_auth_t;
+
 static tg_session_t s_sessions[SESSION_MAX];
 static login_throttle_t s_login_throttle[LOGIN_THROTTLE_MAX];
 static recent_callback_t s_recent_callbacks[RECENT_CALLBACK_MAX];
+static sensitive_auth_t s_sensitive_auth[SESSION_MAX];
 static int s_global_login_failures = 0;
 static int64_t s_global_login_window_ms = 0;
 static int64_t s_global_login_lock_until_ms = 0;
+
+static esp_err_t validate_configured_token(bool log_success)
+{
+    char token[128];
+    tg_get_token(token, sizeof(token));
+    if (token[0] == '\0') {
+        ESP_LOGW(TAG, "Bot token not set - bot disabled");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t tlen = strlen(token);
+    if (tlen < 20) {
+        ESP_LOGE(TAG, "Token too short (%zu chars) - expected ~45 chars. Set via serial: set_token <your_token>", tlen);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (log_success) {
+        ESP_LOGI(TAG, "Bot token configured (%zu chars)", tlen);
+    }
+    return ESP_OK;
+}
 
 static void load_state(void)
 {
@@ -287,7 +320,61 @@ static bool session_waits_for_secret(const char *from_id)
     }
     return s->state == SESSION_LOGIN_PASSWORD ||
            s->state == SESSION_SETUP_ADMIN_PASSWORD ||
-           s->state == SESSION_SETUP_ADMIN_CONFIRM;
+           s->state == SESSION_SETUP_ADMIN_CONFIRM ||
+           s->state == SESSION_SENSITIVE_PASSWORD;
+}
+
+static bool sensitive_auth_valid(const char *from_id)
+{
+    int64_t now = now_ms();
+    for (int i = 0; i < SESSION_MAX; i++) {
+        sensitive_auth_t *auth = &s_sensitive_auth[i];
+        if (auth->active && auth->until_ms <= now) {
+            memset(auth, 0, sizeof(*auth));
+        }
+        if (auth->active && strcmp(auth->from_id, from_id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sensitive_auth_grant(const char *from_id)
+{
+    int slot = -1;
+    int64_t oldest = INT64_MAX;
+    for (int i = 0; i < SESSION_MAX; i++) {
+        sensitive_auth_t *auth = &s_sensitive_auth[i];
+        if (auth->active && strcmp(auth->from_id, from_id) == 0) {
+            slot = i;
+            break;
+        }
+        if (!auth->active && slot < 0) {
+            slot = i;
+        } else if (auth->active && auth->until_ms < oldest) {
+            oldest = auth->until_ms;
+            slot = i;
+        }
+    }
+
+    sensitive_auth_t *auth = &s_sensitive_auth[slot];
+    memset(auth, 0, sizeof(*auth));
+    auth->active = true;
+    safe_copy(auth->from_id, sizeof(auth->from_id), from_id);
+    auth->until_ms = now_ms() + SENSITIVE_AUTH_WINDOW_MS;
+}
+
+static bool check_shared_admin_password(const char *password, bool *match)
+{
+    if (match) {
+        *match = false;
+    }
+    char admin_name[CONFIG_TECH_NAME_MAX_LEN + 1] = {0};
+    esp_err_t err = config_get_telegram_admin_name(admin_name, sizeof(admin_name));
+    if (err != ESP_OK || admin_name[0] == '\0') {
+        return false;
+    }
+    return config_check_telegram_admin_credentials(admin_name, password, match) == ESP_OK;
 }
 
 static bool is_private_chat(const tg_update_t *update)
@@ -478,7 +565,7 @@ static bool handle_contact_authorization(const tg_update_t *update)
         (session->state == SESSION_SETUP_CONTACT || session->state == SESSION_LOGIN_CONTACT);
     allow_new_binding = allow_new_binding || already_authorized;
 
-    if (update->contact_user_id[0] != '\0' &&
+    if (update->contact_user_id[0] == '\0' ||
         strcmp(update->contact_user_id, update->from_id) != 0) {
         tg_send_contact_request(update->chat_id,
             "\xe2\x9d\x8c Please share <b>your own</b> Telegram contact using the button below.");
@@ -676,7 +763,46 @@ static void remove_tech_at(const char *chat, int idx)
 static void require_sensitive_action(const char *chat, const char *from_id,
                                      sensitive_action_t action, int action_index)
 {
+#if CONFIG_IDMS_TELEGRAM_ALLOW_TECH_SENSITIVE_ACTIONS
+    ESP_LOGI(TAG, "Sensitive Telegram action allowed for authorized technician %s", from_id);
     execute_sensitive_action(chat, from_id, action, action_index);
+    return;
+#endif
+
+    if (sensitive_auth_valid(from_id)) {
+        execute_sensitive_action(chat, from_id, action, action_index);
+        return;
+    }
+
+    if (login_throttle_blocked(from_id, chat)) {
+        return;
+    }
+
+    if (!config_has_telegram_admin_credentials()) {
+        tg_send_text(chat,
+            "\xe2\x9d\x8c Sensitive actions are locked because the shared Telegram login is not configured.");
+        return;
+    }
+
+    tg_session_t *s = get_session(from_id, chat, true);
+    if (!s) {
+        tg_send_text(chat, "\xe2\x9d\x8c Could not start confirmation session.");
+        return;
+    }
+
+    memset(s, 0, sizeof(*s));
+    s->active = true;
+    safe_copy(s->from_id, sizeof(s->from_id), from_id);
+    safe_copy(s->chat_id, sizeof(s->chat_id), chat);
+    s->state = SESSION_SENSITIVE_PASSWORD;
+    s->action = action;
+    s->action_index = action_index;
+    s->expires_ms = now_ms() + SESSION_TTL_MS;
+
+    tg_send_text(chat,
+        "\xf0\x9f\x94\x90 <b>Confirm Sensitive Action</b>\n\n"
+        "Send the shared admin password to continue. Authorization lasts 5 minutes.\n"
+        "Send /cancel to stop.");
 }
 
 static void execute_sensitive_action(const char *chat, const char *from_id,
@@ -830,6 +956,37 @@ static bool handle_session_message(const tg_update_t *update)
             tg_send_text(update->chat_id, "\xe2\x9d\x8c Wrong admin name or password. Send the admin name again.");
             s->state = SESSION_LOGIN_NAME;
             s->name[0] = '\0';
+        }
+        return true;
+    }
+
+    case SESSION_SENSITIVE_PASSWORD: {
+        if (!tg_is_authorized_id(update->from_id)) {
+            tg_send_text(update->chat_id, "\xe2\x9d\x8c Access revoked. Sensitive action cancelled.");
+            clear_session(s);
+            return true;
+        }
+
+        bool match = false;
+        if (check_shared_admin_password(value, &match) && match) {
+            sensitive_auth_grant(update->from_id);
+            login_throttle_reset_user(update->from_id);
+            sensitive_action_t action = s->action;
+            int action_index = s->action_index;
+            clear_session(s);
+            execute_sensitive_action(update->chat_id, update->from_id, action, action_index);
+            return true;
+        }
+
+        login_throttle_record_failure(update->from_id);
+        s->attempts++;
+        if (s->attempts >= 3) {
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Too many wrong confirmation attempts. Sensitive action cancelled.");
+            clear_session(s);
+        } else {
+            tg_send_text(update->chat_id,
+                "\xe2\x9d\x8c Wrong password. Send the shared admin password again or /cancel.");
         }
         return true;
     }
@@ -1061,21 +1218,10 @@ static void poll_task(void *arg)
 {
     (void)arg;
 
-    {
-        char token[128];
-        tg_get_token(token, sizeof(token));
-        if (token[0] == '\0') {
-            ESP_LOGW(TAG, "Bot token not set — bot disabled");
-            vTaskDelete(NULL);
-            return;
-        }
-        size_t tlen = strlen(token);
-        ESP_LOGI(TAG, "Bot token configured (%zu chars)", tlen);
-        if (tlen < 20) {
-            ESP_LOGE(TAG, "Token too short (%zu chars) — expected ~45 chars. Set via serial: set_token <your_token>", tlen);
-            vTaskDelete(NULL);
-            return;
-        }
+    if (validate_configured_token(false) != ESP_OK) {
+        s_poll_task = NULL;
+        vTaskDelete(NULL);
+        return;
     }
 
     load_state();
@@ -1106,7 +1252,7 @@ static void poll_task(void *arg)
             if (!boot_notified) {
                 boot_notified = true;
                 char _bip[16] = {0};
-                wifi_manager_get_ip(_bip, sizeof(_bip));
+                network_manager_get_ip(_bip, sizeof(_bip));
                 char boot_msg[512];
                 snprintf(boot_msg, sizeof(boot_msg),
                     "\xf0\x9f\x9f\xa2 <b>ESP-IDMS Online</b>\n\n"
@@ -1116,13 +1262,15 @@ static void poll_task(void *arg)
                     "Monitoring is active. Use the menu below.",
                     ota_get_version(), _bip[0] ? _bip : "N/A");
                 uint8_t n = config_get_tech_count();
+                uint8_t sent = 0;
                 for (int i = 0; i < n; i++) {
-                    char id[64];
-                    if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK) {
+                    char id[64] = "";
+                    if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
                         tg_send_kb(id, boot_msg, TG_KB_MAIN);
+                        sent++;
                     }
                 }
-                ESP_LOGI(TAG, "Boot notification sent to %u technicians", n);
+                ESP_LOGI(TAG, "Boot notification sent to %u/%u technicians", sent, n);
             }
         }
 
@@ -1301,6 +1449,11 @@ esp_err_t tg_bot_start(void)
 {
     if (s_poll_task) {
         return ESP_OK;
+    }
+
+    esp_err_t token_err = validate_configured_token(true);
+    if (token_err != ESP_OK) {
+        return token_err;
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(poll_task, "tg_bot", 24576,

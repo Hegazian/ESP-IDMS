@@ -2,7 +2,7 @@
 
 #include "config_store.h"
 #include "telemetry.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -49,14 +49,19 @@ static uint64_t load_csv_offset(void)
     return offset;
 }
 
-static void save_csv_offset(uint64_t offset)
+static esp_err_t save_csv_offset(uint64_t offset)
 {
     nvs_handle_t h;
-    if (nvs_open(CLOUD_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u64(h, CLOUD_NVS_OFFSET_KEY, offset);
-        nvs_commit(h);
-        nvs_close(h);
+    esp_err_t err = nvs_open(CLOUD_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
     }
+    err = nvs_set_u64(h, CLOUD_NVS_OFFSET_KEY, offset);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
 }
 
 static bool append_raw(char *buf, size_t buf_sz, size_t *pos, const char *text)
@@ -237,6 +242,9 @@ static esp_err_t upload_pending_rows(void)
     FILE *f = NULL;
     esp_err_t result = ESP_OK;
     bool csv_locked = false;
+    uint64_t offset = 0;
+    uint64_t new_offset = 0;
+    off_t locked_size = 0;
 
     ESP_RETURN_ON_ERROR(config_get_cloud_url(url, sizeof(url)), TAG, "get cloud url");
     if (url[0] == '\0') {
@@ -250,7 +258,7 @@ static esp_err_t upload_pending_rows(void)
         ESP_LOGW(TAG, "Cloud sync disabled: invalid URL '%s'", url);
         return ESP_ERR_INVALID_ARG;
     }
-    if (!wifi_manager_is_connected()) {
+    if (!network_manager_is_connected()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -268,6 +276,7 @@ static esp_err_t upload_pending_rows(void)
         result = ESP_ERR_NOT_FOUND;
         goto cleanup;
     }
+    locked_size = st.st_size;
 
     f = fopen(path, "r");
     if (!f) {
@@ -275,14 +284,17 @@ static esp_err_t upload_pending_rows(void)
         goto cleanup;
     }
 
-    uint64_t offset = load_csv_offset();
+    offset = load_csv_offset();
     if (offset == (uint64_t)st.st_size) {
         result = ESP_ERR_NOT_FOUND;
         goto cleanup;
     }
     if (offset == 0 || offset > (uint64_t)st.st_size) {
         offset = skip_header(f);
-        save_csv_offset(offset);
+        result = save_csv_offset(offset);
+        if (result != ESP_OK) {
+            goto cleanup;
+        }
     } else {
         fseek(f, (long)offset, SEEK_SET);
     }
@@ -294,7 +306,7 @@ static esp_err_t upload_pending_rows(void)
     }
 
     int rows = 0;
-    uint64_t new_offset = offset;
+    new_offset = offset;
     bool built = build_payload(f, payload, CLOUD_PAYLOAD_MAX, &rows, &new_offset);
     fclose(f);
     f = NULL;
@@ -308,11 +320,37 @@ static esp_err_t upload_pending_rows(void)
         goto cleanup;
     }
 
+    telemetry_csv_unlock();
+    csv_locked = false;
+
     result = post_payload(url, token, payload);
     if (result == ESP_OK) {
-        save_csv_offset(new_offset);
-        ESP_LOGI(TAG, "Uploaded %d telemetry row(s), csv_offset=%llu",
-                 rows, (unsigned long long)new_offset);
+        result = telemetry_csv_lock(15000);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Uploaded %d telemetry row(s), but could not relock CSV to save offset: %s",
+                     rows, esp_err_to_name(result));
+            goto cleanup;
+        }
+        csv_locked = true;
+
+        struct stat st_after;
+        uint64_t saved_offset = load_csv_offset();
+        if (saved_offset != offset) {
+            ESP_LOGW(TAG, "CSV offset changed during upload (%llu -> %llu); not advancing",
+                     (unsigned long long)offset, (unsigned long long)saved_offset);
+            result = ESP_OK;
+        } else if (stat(path, &st_after) != 0 ||
+                   st_after.st_size < (off_t)new_offset ||
+                   st_after.st_size < locked_size) {
+            ESP_LOGW(TAG, "Telemetry CSV changed during upload; not advancing offset");
+            result = ESP_OK;
+        } else {
+            result = save_csv_offset(new_offset);
+            if (result == ESP_OK) {
+                ESP_LOGI(TAG, "Uploaded %d telemetry row(s), csv_offset=%llu",
+                         rows, (unsigned long long)new_offset);
+            }
+        }
     }
 
 cleanup:

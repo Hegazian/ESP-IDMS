@@ -10,7 +10,7 @@
 #include "topway_lcd.h"
 #include "monitor.h"
 #include "config_store.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -62,8 +62,18 @@ static uint32_t s_wifi_btn_last_trigger = 0;
 #define UI_TOPWAY_TELEGRAM_POLL_MS 5000
 #define UI_TOPWAY_RTC_UPDATE_MS 30000
 #define UI_TOPWAY_PANEL_RTC_SYNC_MS (60 * 60 * 1000)
+#define UI_TOPWAY_RECONNECT_MS 3000
+#define UI_TOPWAY_BOOT_SETTLE_MS 750
+#define UI_TOPWAY_POST_CONNECT_RESYNC_MS 3000
+#define UI_TOPWAY_HEALTHCHECK_MS 5000
+#ifndef CONFIG_IDMS_TOPWAY_FULL_REFRESH_MS
+#define CONFIG_IDMS_TOPWAY_FULL_REFRESH_MS 60000
+#endif
+#define UI_TOPWAY_PERIODIC_RESYNC_MS CONFIG_IDMS_TOPWAY_FULL_REFRESH_MS
+#define UI_TOPWAY_MAX_IO_FAILURES 3
 #define TOPWAY_WRITE_CACHE_MAX 48
 #define TOPWAY_WRITE_STR_CACHE_LEN 96
+#define TOPWAY_INVALID_READING_N16 ((uint16_t)0xFC19)  /* -999 when N16 is signed */
 #define TZ_AFRICA_CAIRO "EET-2EEST,M4.5.5/0,M10.5.4/24"
 
 typedef enum {
@@ -85,9 +95,26 @@ static uint32_t s_last_control_poll = 0;
 static uint32_t s_control_backoff_until = 0;
 static uint32_t s_last_rtc_update = 0;
 static uint32_t s_last_panel_rtc_sync = 0;
+static uint32_t s_last_reconnect_attempt = 0;
+static uint32_t s_last_healthcheck = 0;
+static uint32_t s_last_periodic_resync = 0;
+static uint32_t s_full_resync_due = 0;
+static bool s_full_resync_pending = false;
+static int s_topway_io_failures = 0;
 
 static uint16_t display_round_n16(float value);
 static uint16_t status_color_for_state(uint16_t device_state);
+static void topway_invalidate_write_cache(void);
+static void topway_note_io_result(esp_err_t err);
+static esp_err_t topway_merge_err(esp_err_t current, esp_err_t next);
+static esp_err_t topway_n16_write_checked(uint32_t vp, uint16_t value);
+static esp_err_t topway_str_write_checked(uint32_t vp, const char *value);
+static esp_err_t update_display_values(void);
+static esp_err_t update_telegram_panel(bool force);
+static esp_err_t send_device_info_to_topway(bool reset_controls);
+static esp_err_t send_config_to_topway(void);
+static esp_err_t send_calibration_to_topway(void);
+static esp_err_t topway_connect_sequence(void);
 
 static uint8_t topway_baud_code_from_rate(uint32_t baud_rate)
 {
@@ -134,6 +161,85 @@ static topway_write_cache_t *find_write_cache(uint32_t vp, topway_cache_type_t t
   return slot;
 }
 
+static void topway_invalidate_write_cache(void)
+{
+  memset(s_write_cache, 0, sizeof(s_write_cache));
+}
+
+static void topway_mark_not_ready(const char *reason, esp_err_t err)
+{
+  if (s_display_ready) {
+    ESP_LOGW(TAG, "Topway link lost (%s: %s); will retry handshake",
+             reason ? reason : "I/O", esp_err_to_name(err));
+  }
+  s_display_ready = false;
+  s_topway_io_failures = 0;
+  s_control_backoff_until = 0;
+  s_last_reconnect_attempt = 0;
+  s_wifi_fields_cleared = false;
+  s_full_resync_pending = false;
+  topway_invalidate_write_cache();
+}
+
+static void topway_note_io_result(esp_err_t err)
+{
+  if (err == ESP_OK) {
+    s_topway_io_failures = 0;
+    return;
+  }
+
+  if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_RESPONSE ||
+      err == ESP_ERR_INVALID_STATE) {
+    s_topway_io_failures++;
+    if (s_display_ready && s_topway_io_failures >= UI_TOPWAY_MAX_IO_FAILURES) {
+      topway_mark_not_ready("I/O failures", err);
+    }
+  }
+}
+
+static esp_err_t topway_merge_err(esp_err_t current, esp_err_t next)
+{
+  return current == ESP_OK ? next : current;
+}
+
+static void topway_cache_n16_value(uint32_t vp, uint16_t value)
+{
+  topway_write_cache_t *cache = find_write_cache(vp, TOPWAY_CACHE_N16);
+  cache->n16 = value;
+  cache->valid = true;
+}
+
+static void topway_cache_str_value(uint32_t vp, const char *value)
+{
+  topway_write_cache_t *cache = find_write_cache(vp, TOPWAY_CACHE_STR);
+  strncpy(cache->str, value ? value : "", sizeof(cache->str) - 1);
+  cache->str[sizeof(cache->str) - 1] = '\0';
+  cache->valid = true;
+}
+
+static esp_err_t topway_n16_write_checked(uint32_t vp, uint16_t value)
+{
+  esp_err_t err = topway_n16_write(vp, value);
+  topway_note_io_result(err);
+  if (err == ESP_OK) {
+    topway_cache_n16_value(vp, value);
+  }
+  return err;
+}
+
+static esp_err_t topway_str_write_checked(uint32_t vp, const char *value)
+{
+  if (!value) {
+    value = "";
+  }
+  esp_err_t err = topway_str_write(vp, value);
+  topway_note_io_result(err);
+  if (err == ESP_OK) {
+    topway_cache_str_value(vp, value);
+  }
+  return err;
+}
+
 static esp_err_t topway_n16_write_cached(uint32_t vp, uint16_t value)
 {
   topway_write_cache_t *cache = find_write_cache(vp, TOPWAY_CACHE_N16);
@@ -141,9 +247,9 @@ static esp_err_t topway_n16_write_cached(uint32_t vp, uint16_t value)
     return ESP_OK;
   }
   esp_err_t err = topway_n16_write(vp, value);
+  topway_note_io_result(err);
   if (err == ESP_OK) {
-    cache->n16 = value;
-    cache->valid = true;
+    topway_cache_n16_value(vp, value);
   }
   return err;
 }
@@ -158,16 +264,19 @@ static esp_err_t topway_str_write_cached(uint32_t vp, const char *value)
     return ESP_OK;
   }
   esp_err_t err = topway_str_write(vp, value);
+  topway_note_io_result(err);
   if (err == ESP_OK) {
-    strncpy(cache->str, value, sizeof(cache->str) - 1);
-    cache->str[sizeof(cache->str) - 1] = '\0';
-    cache->valid = true;
+    topway_cache_str_value(vp, value);
   }
   return err;
 }
 
 static esp_err_t topway_control_n16_read(uint32_t vp, uint16_t *value)
 {
+  if (topway_take_touch_event(vp, value)) {
+    return ESP_OK;
+  }
+
   esp_err_t err = topway_n16_read(vp, value);
   if (err != ESP_OK) {
     s_control_backoff_until = xTaskGetTickCount() * portTICK_PERIOD_MS + UI_TOPWAY_CONTROL_BACKOFF_MS;
@@ -192,13 +301,13 @@ static void copy_info_cache(char *dst, const char *src)
   dst[INFO_FIELD_MAX_LEN - 1] = '\0';
 }
 
-static void update_wifi_status_on_lcd(void)
+static esp_err_t update_wifi_status_on_lcd(bool force)
 {
   if (!s_display_ready)
-    return;
+    return ESP_ERR_INVALID_STATE;
 
   uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  bool is_connected = wifi_manager_is_connected();
+  bool is_connected = network_manager_is_connected();
 
   /* Track when we were last connected */
   if (is_connected) {
@@ -206,37 +315,41 @@ static void update_wifi_status_on_lcd(void)
   }
 
   /* Only update when state changes or on interval */
-  if (is_connected == s_last_wifi_connected &&
+  if (!force &&
+      is_connected == s_last_wifi_connected &&
       (now - s_wifi_status_last_update) < WIFI_STATUS_UPDATE_INTERVAL_MS) {
-    return;
+    return ESP_OK;
   }
 
   s_last_wifi_connected = is_connected;
   s_wifi_status_last_update = now;
+  esp_err_t result = ESP_OK;
 
   if (is_connected) {
     /* Connected - show IP without touching editable SSID/password fields */
     char ip[16] = {0};
-    wifi_manager_get_ip(ip, sizeof(ip));
+    network_manager_get_ip(ip, sizeof(ip));
 
     char status_msg[32];
     snprintf(status_msg, sizeof(status_msg), "WiFi: %s", ip);
-    topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, status_msg);
+    result = topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, status_msg);
   } else {
     /* Disconnected - check if credentials are configured */
     char ssid[64] = {0};
     config_get_wifi_ssid(ssid, sizeof(ssid));
 
     if (ssid[0] == '\0') {
-      topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Not Configured");
+      result = topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Not Configured");
     } else if ((now - s_wifi_last_connected_tick) < WIFI_CONNECTION_TIMEOUT_MS) {
       /* Recently disconnected, might be reconnecting */
-      topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Connecting...");
+      result = topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Connecting...");
     } else {
       /* Connection failed or timeout */
-      topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Check Password");
+      result = topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Check Password");
     }
   }
+
+  return result;
 }
 
 static bool esp_rtc_time_valid(time_t now)
@@ -244,33 +357,31 @@ static bool esp_rtc_time_valid(time_t now)
   return now > 1704067200; /* 2024-01-01 UTC: rejects unsynced boot epoch */
 }
 
-static void update_rtc_on_lcd(bool force)
+static esp_err_t update_rtc_on_lcd(bool force)
 {
   if (!s_display_ready) {
-    return;
+    return ESP_ERR_INVALID_STATE;
   }
 
   uint32_t tick_now = xTaskGetTickCount() * portTICK_PERIOD_MS;
   if (!force && (tick_now - s_last_rtc_update) < UI_TOPWAY_RTC_UPDATE_MS) {
-    return;
+    return ESP_OK;
   }
   s_last_rtc_update = tick_now;
 
   time_t now = time(NULL);
   if (!esp_rtc_time_valid(now)) {
-    topway_str_write_cached(VP_STR_RTC_DATETIME, "Time not synced");
-    return;
+    return topway_str_write_cached(VP_STR_RTC_DATETIME, "Time not synced");
   }
 
   struct tm local_tm;
   if (localtime_r(&now, &local_tm) == NULL) {
-    topway_str_write_cached(VP_STR_RTC_DATETIME, "Time unavailable");
-    return;
+    return topway_str_write_cached(VP_STR_RTC_DATETIME, "Time unavailable");
   }
 
   char dt[32];
   strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M", &local_tm);
-  topway_str_write_cached(VP_STR_RTC_DATETIME, dt);
+  esp_err_t result = topway_str_write_cached(VP_STR_RTC_DATETIME, dt);
 
   if (force || (tick_now - s_last_panel_rtc_sync) >= UI_TOPWAY_PANEL_RTC_SYNC_MS) {
     esp_err_t err = topway_rtc_set((uint8_t)(local_tm.tm_year % 100),
@@ -284,12 +395,16 @@ static void update_rtc_on_lcd(bool force)
     } else {
       ESP_LOGW(TAG, "Topway RTC sync failed: %s", esp_err_to_name(err));
     }
+    result = topway_merge_err(result, err);
   }
+  return result;
 }
 
-static void update_display_values(void) {
+static esp_err_t update_display_values(void) {
   if (!s_display_ready)
-    return;
+    return ESP_ERR_INVALID_STATE;
+
+  esp_err_t result = ESP_OK;
 
   idms_metrics_t m;
   monitor_get_metrics(&m);
@@ -299,12 +414,13 @@ static void update_display_values(void) {
   float tout_rounded = m.t_out_valid ? (float)(int)(m.t_out_c >= 0.0f ? m.t_out_c + 0.5f : m.t_out_c - 0.5f) : -999.0f;
 
   if (m.current_valid) {
-    topway_n16_write_cached(VP_N16_CUR_VALUE, display_round_n16(m.current_a));
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_CUR_VALUE, display_round_n16(m.current_a)));
     if (current_rounded != s_last_current) {
       ESP_LOGI(TAG, "Current=%.0fA", current_rounded);
       s_last_current = current_rounded;
     }
   } else {
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_CUR_VALUE, TOPWAY_INVALID_READING_N16));
     if (s_last_current != -888.0f) {
       ESP_LOGI(TAG, "Current=-- (invalid)");
       s_last_current = -888.0f;
@@ -312,18 +428,30 @@ static void update_display_values(void) {
   }
 
   if (m.t_in_valid) {
-    topway_n16_write_cached(VP_N16_TIN_VALUE, display_round_n16(m.t_in_c));
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_TIN_VALUE, display_round_n16(m.t_in_c)));
     if (tin_rounded != s_last_tin) {
       ESP_LOGI(TAG, "T_in=%.0fC", tin_rounded);
       s_last_tin = tin_rounded;
     }
+  } else {
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_TIN_VALUE, TOPWAY_INVALID_READING_N16));
+    if (s_last_tin != -888.0f) {
+      ESP_LOGI(TAG, "T_in=-- (invalid)");
+      s_last_tin = -888.0f;
+    }
   }
 
   if (m.t_out_valid) {
-    topway_n16_write_cached(VP_N16_TOUT_VALUE, display_round_n16(m.t_out_c));
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_TOUT_VALUE, display_round_n16(m.t_out_c)));
     if (tout_rounded != s_last_tout) {
       ESP_LOGI(TAG, "T_out=%.0fC", tout_rounded);
       s_last_tout = tout_rounded;
+    }
+  } else {
+    result = topway_merge_err(result, topway_n16_write_cached(VP_N16_TOUT_VALUE, TOPWAY_INVALID_READING_N16));
+    if (s_last_tout != -888.0f) {
+      ESP_LOGI(TAG, "T_out=-- (invalid)");
+      s_last_tout = -888.0f;
     }
   }
 
@@ -371,14 +499,16 @@ static void update_display_values(void) {
     device_state = DEVICE_STATE_INACTIVE;
   }
 
-  topway_n16_write_cached(VP_N16_STATUS_COLOR, status_color_for_state(device_state));
-  topway_str_write_cached(VP_STR_STATUS, status_str);
-  topway_str_write_cached(VP_STR_DIAG, diag_str);
+  result = topway_merge_err(result, topway_n16_write_cached(VP_N16_STATUS_COLOR, status_color_for_state(device_state)));
+  result = topway_merge_err(result, topway_str_write_cached(VP_STR_STATUS, status_str));
+  result = topway_merge_err(result, topway_str_write_cached(VP_STR_DIAG, diag_str));
   if (strcmp(diag_str, s_last_diag) != 0) {
     ESP_LOGI(TAG, "Status=%s Diag=%s", status_str, diag_str);
     strncpy(s_last_diag, diag_str, sizeof(s_last_diag) - 1);
     s_last_diag[sizeof(s_last_diag) - 1] = '\0';
   }
+
+  return result;
 }
 
 static bool validate_lcd_config(int16_t min_tin, int16_t max_tin,
@@ -575,18 +705,37 @@ static esp_err_t read_lcd_calibration(uint32_t *current_cal_x100,
 {
   uint16_t val = 0;
   esp_err_t err = topway_n16_read(VP_N16_CAL_CURRENT_SCALE, &val);
-  if (err != ESP_OK) return err;
-  if (val == 0 || val > 5000) return ESP_ERR_INVALID_ARG;
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Calibration read failed: current scale VP 0x%06lX (%s)",
+             (unsigned long)VP_N16_CAL_CURRENT_SCALE, esp_err_to_name(err));
+    return err;
+  }
+  if (val == 0 || val > 5000) {
+    ESP_LOGW(TAG, "Calibration read failed: current scale value %u out of range", val);
+    return ESP_ERR_INVALID_ARG;
+  }
   if (current_cal_x100) *current_cal_x100 = (uint32_t)val * 100;
 
   err = topway_n16_read(VP_N16_CAL_TIN_OFFSET, &val);
-  if (err != ESP_OK) return err;
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Calibration read failed: T_in offset VP 0x%06lX (%s)",
+             (unsigned long)VP_N16_CAL_TIN_OFFSET, esp_err_to_name(err));
+    return err;
+  }
   if (tin_offset_x10) *tin_offset_x10 = (int16_t)val * 10;
 
   err = topway_n16_read(VP_N16_CAL_TOUT_OFFSET, &val);
-  if (err != ESP_OK) return err;
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Calibration read failed: T_out offset VP 0x%06lX (%s)",
+             (unsigned long)VP_N16_CAL_TOUT_OFFSET, esp_err_to_name(err));
+    return err;
+  }
   if (tout_offset_x10) *tout_offset_x10 = (int16_t)val * 10;
 
+  ESP_LOGI(TAG, "LCD calibration read: current=%.1f A/V, TinOffset=%.1f C, ToutOffset=%.1f C",
+           current_cal_x100 ? (double)*current_cal_x100 / 100.0 : 0.0,
+           tin_offset_x10 ? (double)*tin_offset_x10 / 10.0 : 0.0,
+           tout_offset_x10 ? (double)*tout_offset_x10 / 10.0 : 0.0);
   return ESP_OK;
 }
 
@@ -641,7 +790,7 @@ static void zero_current_from_lcd(void)
 #if CONFIG_IDMS_SCT_AUTOZERO_ENABLE
   topway_str_write_cached(VP_STR_CAL_STATUS_MSG, "Zeroing current...");
   ESP_LOGI(TAG, "LCD requested current zero calibration");
-  esp_err_t err = monitor_calibrate_zero();
+  esp_err_t err = monitor_calibrate_zero_manual();
   monitor_reset_current_filter();
   if (err == ESP_OK) {
     topway_str_write_cached(VP_STR_CAL_STATUS_MSG, "Current zero saved");
@@ -655,22 +804,24 @@ static void zero_current_from_lcd(void)
   topway_n16_write(VP_N16_CAL_ZERO_BTN, 0);
 }
 
-static void idms_ui_topway_send_calibration(void)
+static esp_err_t send_calibration_to_topway(void)
 {
   if (!s_display_ready) {
-    return;
+    return ESP_ERR_INVALID_STATE;
   }
 
-  topway_n16_write(VP_N16_CAL_CURRENT_SCALE,
-                   current_cal_x100_to_vp(config_get_current_cal_x100()));
-  topway_n16_write(VP_N16_CAL_TIN_OFFSET,
-                   temp_offset_x10_to_vp(config_get_tin_offset_x10()));
-  topway_n16_write(VP_N16_CAL_TOUT_OFFSET,
-                   temp_offset_x10_to_vp(config_get_tout_offset_x10()));
-  topway_n16_write(VP_N16_CAL_ZERO_BTN, 0);
-  topway_n16_write(VP_N16_CAL_APPLY_BTN, 0);
-  topway_n16_write(VP_N16_CAL_SAVE_BTN, 0);
-  topway_str_write_cached(VP_STR_CAL_STATUS_MSG, "");
+  esp_err_t result = ESP_OK;
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_CURRENT_SCALE,
+                                                            current_cal_x100_to_vp(config_get_current_cal_x100())));
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_TIN_OFFSET,
+                                                            temp_offset_x10_to_vp(config_get_tin_offset_x10())));
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_TOUT_OFFSET,
+                                                            temp_offset_x10_to_vp(config_get_tout_offset_x10())));
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_ZERO_BTN, 0));
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_APPLY_BTN, 0));
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CAL_SAVE_BTN, 0));
+  result = topway_merge_err(result, topway_str_write_cached(VP_STR_CAL_STATUS_MSG, ""));
+  return result;
 }
 
 static void idms_ui_topway_check_calibration_buttons(void)
@@ -697,23 +848,24 @@ static void idms_ui_topway_check_calibration_buttons(void)
   }
 }
 
-static void update_telegram_panel(bool force)
+static esp_err_t update_telegram_panel(bool force)
 {
   if (!s_display_ready) {
-    return;
+    return ESP_ERR_INVALID_STATE;
   }
 
   uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
   if (!force && (now - s_last_telegram_panel_update) < UI_TOPWAY_TELEGRAM_POLL_MS) {
-    return;
+    return ESP_OK;
   }
   s_last_telegram_panel_update = now;
+  esp_err_t result = ESP_OK;
 
   char qr_code[CONFIG_INFO_STRING_MAX_LEN + 1] = {0};
   if (config_get_qr_code(qr_code, sizeof(qr_code)) != ESP_OK || qr_code[0] == '\0') {
     copy_info_cache(qr_code, CONFIG_DEFAULT_QR_CODE);
   }
-  topway_str_write_cached(VP_STR_TELEGRAM_QR_URL, qr_code);
+  result = topway_merge_err(result, topway_str_write_cached(VP_STR_TELEGRAM_QR_URL, qr_code));
 
   const uint32_t rows[CONFIG_TECH_MAX_COUNT] = {
       VP_STR_TELEGRAM_AUTH_ROW0,
@@ -736,8 +888,9 @@ static void update_telegram_panel(bool force)
         snprintf(row, sizeof(row), "%d  Phone required", i + 1);
       }
     }
-    topway_str_write_cached(rows[i], row);
+    result = topway_merge_err(result, topway_str_write_cached(rows[i], row));
   }
+  return result;
 }
 
 static void idms_ui_topway_check_telegram_authorize_button(void)
@@ -860,9 +1013,9 @@ void idms_ui_topway_check_apply_button(void) {
   s_last_apply_btn = apply_btn;
 }
 
-void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id) {
-  (void)page_id;
-  (void)key_id;
+void idms_ui_topway_process_touch_event(uint32_t vp, uint16_t value) {
+  (void)vp;
+  (void)value;
   idms_ui_topway_update();
 }
 
@@ -930,12 +1083,161 @@ esp_err_t idms_ui_topway_read_config(int16_t *min_tin, int16_t *min_tout, uint16
   return ESP_OK;
 }
 
+static esp_err_t topway_push_full_state(bool clear_wifi_fields, bool reset_controls)
+{
+  topway_invalidate_write_cache();
+
+  esp_err_t result = ESP_OK;
+  result = topway_merge_err(result, update_display_values());
+  result = topway_merge_err(result, update_wifi_status_on_lcd(true));
+  result = topway_merge_err(result, update_rtc_on_lcd(true));
+  result = topway_merge_err(result, send_device_info_to_topway(reset_controls));
+  result = topway_merge_err(result, send_config_to_topway());
+  result = topway_merge_err(result, send_calibration_to_topway());
+
+  if (clear_wifi_fields) {
+    ESP_LOGI(TAG, "Clearing WiFi credential fields on Topway");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    result = topway_merge_err(result, topway_str_write_checked(VP_STR_WIFI_SSID, ""));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    result = topway_merge_err(result, topway_str_write_checked(VP_STR_WIFI_PASSWORD, ""));
+    if (result == ESP_OK) {
+      s_wifi_fields_cleared = true;
+    }
+  }
+
+  return result;
+}
+
+static esp_err_t topway_connect_sequence(void)
+{
+  ESP_LOGI(TAG, "Trying Topway handshake/setup...");
+  esp_err_t err = topway_handshake();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Topway handshake failed: %s; display not ready yet",
+             esp_err_to_name(err));
+    s_display_ready = false;
+    topway_invalidate_write_cache();
+    return err;
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(UI_TOPWAY_BOOT_SETTLE_MS));
+
+  err = topway_set_sys_config(topway_baud_code_from_rate(CONFIG_IDMS_TOPWAY_BAUD),
+                              TOPWAY_TOUCH_KEY_ID_CFG);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "set_sys_config failed: %s", esp_err_to_name(err));
+    s_display_ready = false;
+    topway_invalidate_write_cache();
+    return err;
+  }
+
+  err = topway_set_codepage(1, 12);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "set_codepage failed: %s", esp_err_to_name(err));
+    s_display_ready = false;
+    topway_invalidate_write_cache();
+    return err;
+  }
+
+  err = topway_disp_page(PAGE_MAIN);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "disp_page failed: %s", esp_err_to_name(err));
+    s_display_ready = false;
+    topway_invalidate_write_cache();
+    return err;
+  }
+
+  topway_register_touch_callback(idms_ui_topway_process_touch_event);
+
+  s_display_ready = true;
+  s_topway_io_failures = 0;
+  s_last_healthcheck = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  s_last_periodic_resync = s_last_healthcheck;
+  s_wifi_fields_cleared = false;
+
+  ESP_LOGI(TAG, "Topway ready; sending full UI state");
+  err = topway_push_full_state(true, true);
+  if (err != ESP_OK) {
+    topway_mark_not_ready("full-state sync", err);
+    return err;
+  }
+  s_full_resync_due = xTaskGetTickCount() * portTICK_PERIOD_MS + UI_TOPWAY_POST_CONNECT_RESYNC_MS;
+  s_full_resync_pending = true;
+
+  ESP_LOGI(TAG, "Topway handshake/setup complete");
+  return ESP_OK;
+}
+
+static void topway_healthcheck(void)
+{
+  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  if ((now - s_last_healthcheck) < UI_TOPWAY_HEALTHCHECK_MS) {
+    return;
+  }
+  s_last_healthcheck = now;
+
+  esp_err_t err = topway_handshake();
+  if (err != ESP_OK) {
+    topway_mark_not_ready("healthcheck", err);
+  }
+}
+
+static void topway_maybe_resync(void)
+{
+  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+  if (s_full_resync_pending && now >= s_full_resync_due) {
+    s_full_resync_pending = false;
+    s_last_periodic_resync = now;
+    ESP_LOGI(TAG, "Sending delayed Topway full-state refresh");
+    esp_err_t err = topway_push_full_state(false, true);
+    if (err != ESP_OK) {
+      topway_mark_not_ready("full-state refresh", err);
+    }
+    return;
+  }
+
+  if ((now - s_last_periodic_resync) < UI_TOPWAY_PERIODIC_RESYNC_MS) {
+    return;
+  }
+
+  s_last_periodic_resync = now;
+  ESP_LOGI(TAG, "Sending periodic Topway full-state refresh");
+  esp_err_t err = topway_push_full_state(false, false);
+  if (err != ESP_OK) {
+    topway_mark_not_ready("periodic full-state refresh", err);
+  }
+}
+
 static void ui_topway_task(void *arg) {
   (void)arg;
 
   for (;;) {
+    if (!s_display_ready) {
+      uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+      if ((now - s_last_reconnect_attempt) >= UI_TOPWAY_RECONNECT_MS) {
+        s_last_reconnect_attempt = now;
+        topway_connect_sequence();
+      }
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_TOPWAY_REFRESH_MS));
+      continue;
+    }
+
+    topway_healthcheck();
+    if (!s_display_ready) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_TOPWAY_REFRESH_MS));
+      continue;
+    }
+
+    topway_maybe_resync();
+    if (!s_display_ready) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_TOPWAY_REFRESH_MS));
+      continue;
+    }
+
     update_display_values();
-    update_wifi_status_on_lcd();
+    (void)update_wifi_status_on_lcd(false);
     update_rtc_on_lcd(false);
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now >= s_control_backoff_until &&
@@ -975,46 +1277,9 @@ esp_err_t idms_ui_topway_init(void) {
 
   vTaskDelay(pdMS_TO_TICKS(200));
 
-  err = topway_set_sys_config(topway_baud_code_from_rate(CONFIG_IDMS_TOPWAY_BAUD),
-                              TOPWAY_TOUCH_KEY_ID_CFG);
+  err = topway_connect_sequence();
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "set_sys_config failed (may need RS232 level shifter)");
-  }
-
-  /* Brightness/backlight controls are owned by the Topway project itself. */
-
-  topway_set_codepage(1, 12);
-
-  topway_disp_page(PAGE_MAIN);
-
-  /* Register touch event callback */
-  topway_register_touch_callback(idms_ui_topway_process_touch_event);
-
-  s_display_ready = true;
-
-  update_display_values();
-  update_rtc_on_lcd(true);
-
-  /* Send Telegram QR/list panel values */
-  idms_ui_topway_send_device_info();
-
-  /* Send config parameters to LCD */
-  idms_ui_topway_send_config();
-
-  /* Send calibration parameters to LCD */
-  idms_ui_topway_send_calibration();
-
-  /* One-time clear of WiFi fields at boot to remove LCD default values.
-   * This is a workaround - the LCD project should disable auto-refresh
-   * and remove default values for VP_STR_WIFI_SSID and VP_STR_WIFI_PASSWORD.
-   * We do this AFTER all other init to ensure LCD is fully ready. */
-  if (!s_wifi_fields_cleared) {
-    ESP_LOGI(TAG, "Clearing WiFi credential fields (one-time workaround)");
-    vTaskDelay(pdMS_TO_TICKS(100));  /* Give LCD time to stabilize */
-    topway_str_write(VP_STR_WIFI_SSID, "");
-    vTaskDelay(pdMS_TO_TICKS(50));
-    topway_str_write(VP_STR_WIFI_PASSWORD, "");
-    s_wifi_fields_cleared = true;
+    ESP_LOGW(TAG, "Topway not connected yet; UI task will keep retrying");
   }
 
   if (!s_ui_task) {
@@ -1028,7 +1293,8 @@ esp_err_t idms_ui_topway_init(void) {
     }
   }
 
-  ESP_LOGI(TAG, "Topway UI ready (800x480)");
+  ESP_LOGI(TAG, "Topway UI task ready (800x480, full refresh every %d ms)",
+           CONFIG_IDMS_TOPWAY_FULL_REFRESH_MS);
   return ESP_OK;
 }
 
@@ -1038,25 +1304,33 @@ void idms_ui_topway_update(void) {
   }
 }
 
-void idms_ui_topway_send_device_info(void) {
+static esp_err_t send_device_info_to_topway(bool reset_controls) {
   if (!s_display_ready)
-    return;
+    return ESP_ERR_INVALID_STATE;
 
   ESP_LOGI(TAG, "Sending Telegram page values to Topway LCD");
-  topway_str_write(VP_STR_TELEGRAM_TECH_INPUT, "");
-  topway_str_write_cached(VP_STR_TELEGRAM_STATUS_MSG, "");
-  topway_n16_write(VP_N16_TELEGRAM_AUTHORIZE_BTN, 0);
-  topway_n16_write(VP_N16_TELEGRAM_DELETE_ROW0, 0);
-  topway_n16_write(VP_N16_TELEGRAM_DELETE_ROW1, 0);
-  topway_n16_write(VP_N16_TELEGRAM_DELETE_ROW2, 0);
-  topway_n16_write(VP_N16_TELEGRAM_DELETE_ROW3, 0);
-  topway_n16_write(VP_N16_TELEGRAM_DELETE_ROW4, 0);
-  update_telegram_panel(true);
+  esp_err_t result = ESP_OK;
+  if (reset_controls) {
+    result = topway_merge_err(result, topway_str_write_checked(VP_STR_TELEGRAM_TECH_INPUT, ""));
+    result = topway_merge_err(result, topway_str_write_cached(VP_STR_TELEGRAM_STATUS_MSG, ""));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_AUTHORIZE_BTN, 0));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_DELETE_ROW0, 0));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_DELETE_ROW1, 0));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_DELETE_ROW2, 0));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_DELETE_ROW3, 0));
+    result = topway_merge_err(result, topway_n16_write_checked(VP_N16_TELEGRAM_DELETE_ROW4, 0));
+  }
+  result = topway_merge_err(result, update_telegram_panel(true));
+  return result;
 }
 
-void idms_ui_topway_send_config(void) {
+void idms_ui_topway_send_device_info(void) {
+  (void)send_device_info_to_topway(true);
+}
+
+static esp_err_t send_config_to_topway(void) {
   if (!s_display_ready)
-    return;
+    return ESP_ERR_INVALID_STATE;
 
   ESP_LOGI(TAG, "Sending config parameters to Topway LCD");
 
@@ -1077,36 +1351,43 @@ void idms_ui_topway_send_config(void) {
   s_cfg_max_current = max_current;
   s_cfg_dt_alert = dt_alert;
 
+  esp_err_t result = ESP_OK;
+
   /* Send Min Temp IN threshold (pure Celsius) */
-  topway_n16_write(VP_N16_CFG_MIN_TIN, (uint16_t)min_tin);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MIN_TIN, (uint16_t)min_tin));
   ESP_LOGI(TAG, "Min Temp IN: %d C", min_tin);
 
   /* Send Max Temp IN threshold (pure Celsius) */
-  topway_n16_write(VP_N16_CFG_MAX_TIN, (uint16_t)max_tin);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MAX_TIN, (uint16_t)max_tin));
   ESP_LOGI(TAG, "Max Temp IN: %d C", max_tin);
 
   /* Send Min Temp OUT threshold (pure Celsius) */
-  topway_n16_write(VP_N16_CFG_MIN_TOUT, (uint16_t)min_tout);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MIN_TOUT, (uint16_t)min_tout));
   ESP_LOGI(TAG, "Min Temp OUT: %d C", min_tout);
 
   /* Send Max Temp OUT threshold (pure Celsius) */
-  topway_n16_write(VP_N16_CFG_MAX_TOUT, (uint16_t)max_tout);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MAX_TOUT, (uint16_t)max_tout));
   ESP_LOGI(TAG, "Max Temp OUT: %d C", max_tout);
 
   /* Send Min Current threshold (pure Amperes) */
-  topway_n16_write(VP_N16_CFG_MIN_CURRENT, min_current);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MIN_CURRENT, min_current));
   ESP_LOGI(TAG, "Min Current: %d A", min_current);
 
   /* Send Max Current threshold (pure Amperes) */
-  topway_n16_write(VP_N16_CFG_MAX_CURRENT, max_current);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_MAX_CURRENT, max_current));
   ESP_LOGI(TAG, "Max Current: %d A", max_current);
 
   /* Send Delta_T threshold (pure Celsius) */
-  topway_n16_write(VP_N16_CFG_DT_ALERT, (uint16_t)dt_alert);
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_DT_ALERT, (uint16_t)dt_alert));
   ESP_LOGI(TAG, "Delta_T threshold: %d C", dt_alert);
 
-  topway_n16_write(VP_N16_CFG_APPLY_BTN, 0);
-  topway_str_write_cached(VP_STR_CFG_STATUS_MSG, "");
+  result = topway_merge_err(result, topway_n16_write_checked(VP_N16_CFG_APPLY_BTN, 0));
+  result = topway_merge_err(result, topway_str_write_cached(VP_STR_CFG_STATUS_MSG, ""));
+  return result;
+}
+
+void idms_ui_topway_send_config(void) {
+  (void)send_config_to_topway();
 }
 
 void idms_ui_topway_check_wifi_button(void)
@@ -1158,7 +1439,7 @@ void idms_ui_topway_check_wifi_button(void)
     /* Validate - SSID cannot be empty or placeholder */
     if (ssid[0] == '\0' || strcmp(ssid, "--") == 0 || strlen(ssid) < 2) {
       /* Only clear fields and show warning if WiFi is not connected */
-      if (!wifi_manager_is_connected()) {
+      if (!network_manager_is_connected()) {
         ESP_LOGW(TAG, "WiFi SSID invalid or placeholder: '%s' - clearing fields", ssid);
         topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Enter SSID/Pass");
         topway_str_write(VP_STR_WIFI_SSID, "");
@@ -1191,7 +1472,7 @@ void idms_ui_topway_check_wifi_button(void)
     }
 
     /* Check if already connected with same credentials - skip if so */
-    if (wifi_manager_is_connected() && 
+    if (network_manager_is_connected() && 
         strcmp(current_ssid, ssid) == 0 && 
         strcmp(current_pass, password) == 0) {
       ESP_LOGI(TAG, "WiFi already connected with same credentials, skipping reconnect");
@@ -1200,7 +1481,7 @@ void idms_ui_topway_check_wifi_button(void)
     }
     
     /* If connected with same SSID but different password, save but don't reconnect */
-    if (wifi_manager_is_connected() && strcmp(current_ssid, ssid) == 0) {
+    if (network_manager_is_connected() && strcmp(current_ssid, ssid) == 0) {
       ESP_LOGI(TAG, "WiFi connected - saving new password for next connection");
       if (config_set_wifi_password(password) == ESP_OK) {
         topway_str_write(VP_STR_WIFI_PASSWORD, "");
@@ -1232,7 +1513,7 @@ void idms_ui_topway_check_wifi_button(void)
       topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Changing Network...");
       
       /* Trigger WiFi reconnect */
-      wifi_manager_reconnect();
+      network_manager_reconnect();
     } else {
       ESP_LOGE(TAG, "Failed to save WiFi credentials to NVS");
       topway_str_write_cached(VP_STR_WIFI_STATUS_MSG, "WiFi: Save Error");

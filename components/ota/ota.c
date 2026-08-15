@@ -663,8 +663,18 @@ static esp_err_t ota_export_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    esp_err_t lock_err = telemetry_csv_lock(15000);
+    if (lock_err != ESP_OK) {
+        ESP_LOGW(TAG, "Telemetry export lock failed: %s", esp_err_to_name(lock_err));
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "Telemetry CSV is busy; try again shortly");
+        return ESP_OK;
+    }
+
     FILE *f = fopen(telemetry_csv_path(), "r");
     if (!f) {
+        telemetry_csv_unlock();
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_sendstr(req, "No telemetry CSV has been collected yet");
@@ -684,6 +694,7 @@ static esp_err_t ota_export_handler(httpd_req_t *req)
         }
     }
     fclose(f);
+    telemetry_csv_unlock();
 
     if (err == ESP_OK) {
         httpd_resp_send_chunk(req, NULL, 0);

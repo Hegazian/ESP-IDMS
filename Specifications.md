@@ -1,4 +1,4 @@
-﻿# Technical Specifications - ESP-IDMS
+# Technical Specifications - ESP-IDMS
 
 Document version: 3.0
 Last updated: 2026-05-10
@@ -12,8 +12,10 @@ Target: ESP32-S3 N16R8 + Topway HKT070DTA-1C
 | Framework | ESP-IDF v5.5.x |
 | Display | Topway HKT070DTA-1C, 800x480, UART smart LCD |
 | Current sensor | SCT-013 voltage-output CT by default |
-| Temperature sensors | Two DS18B20 waterproof probes |
-| Connectivity | Wi-Fi STA, SNTP |
+| Temperature sensors | Two DS18B20 waterproof probes or MAX31865 PT100 RTDs |
+| Primary Connectivity | ENC28J60 SPI Ethernet |
+| Fallback Connectivity | Wi-Fi STA, SNTP |
+| Industrial Protocols | MQTT (JSON), Modbus RTU / TCP (Slave) |
 | Alerting | Telegram Bot API over HTTPS |
 | OTA | HTTPS server on port 8080 |
 | Storage | NVS for config/secrets, SPIFFS for telemetry CSV |
@@ -30,13 +32,19 @@ Target: ESP32-S3 N16R8 + Topway HKT070DTA-1C
 | SCT-013 ADC | 6 | Analog input | ADC unit 0, channel 5 |
 | DS18B20 T_in | 4 | Bidirectional | 1-Wire bus 0 |
 | DS18B20 T_out | 15 | Bidirectional | 1-Wire bus 1 |
-| Touch SCLK | 12 | Output | Optional/legacy |
-| Touch MOSI | 13 | Output | Optional/legacy |
-| Touch MISO | 16 | Input | Optional/legacy |
-| Touch CS | 11 | Output | Optional/legacy |
-| Touch IRQ | 14 | Input | Optional/legacy |
+| Ethernet SPI SCLK | 12 | Output | ENC28J60 SPI3 Host |
+| Ethernet SPI MOSI | 13 | Output | ENC28J60 SPI3 Host |
+| Ethernet SPI MISO | 16 | Input | ENC28J60 SPI3 Host |
+| Ethernet SPI CS | 11 | Output | ENC28J60 SPI3 Host |
+| Ethernet INT | 14 | Input | ENC28J60 Interrupt line |
+| Modbus RS485 TX | 17 | Output | Modbus RTU UART2 |
+| Modbus RS485 RX | 18 | Input | Modbus RTU UART2 |
 
 ## 3. Current Sensor
+
+GPIO20 note: on ESP32-S3, GPIO20 is the native USB D+ pad. It may be used as
+Topway UART RX only when native USB Serial/JTAG/OTG is not used at runtime.
+Use GPIO43/44 UART0 or an external USB-UART adapter for console access.
 
 | Parameter | Current value |
 |-----------|---------------|

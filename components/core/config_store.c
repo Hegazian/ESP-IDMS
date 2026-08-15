@@ -6,7 +6,9 @@
 #include "esp_random.h"
 #include "sdkconfig.h"
 #include "mbedtls/sha256.h"
+#include "esp_mac.h"
 #include <ctype.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -115,22 +117,35 @@ static bool ct_equal_hex(const char *a, const char *b, size_t len)
     return diff == 0;
 }
 
-static void erase_tech_slot(nvs_handle_t h, int idx)
+static esp_err_t keep_first_err(esp_err_t current, esp_err_t next)
 {
-    char key[20];
-    tech_key(key, sizeof(key), "tech_id", idx);
-    nvs_erase_key(h, key);
-    tech_key(key, sizeof(key), "tech_name", idx);
-    nvs_erase_key(h, key);
-    tech_key(key, sizeof(key), "tech_salt", idx);
-    nvs_erase_key(h, key);
-    tech_key(key, sizeof(key), "tech_pwd", idx);
-    nvs_erase_key(h, key);
-    tech_key(key, sizeof(key), "tech_phone", idx);
-    nvs_erase_key(h, key);
+    return current == ESP_OK ? next : current;
 }
 
-static void move_str_key(nvs_handle_t h, const char *prefix, int dst_idx, int src_idx, size_t buf_len)
+static esp_err_t erase_key_if_exists(nvs_handle_t h, const char *key)
+{
+    esp_err_t err = nvs_erase_key(h, key);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+}
+
+static esp_err_t erase_tech_slot(nvs_handle_t h, int idx)
+{
+    char key[20];
+    esp_err_t err = ESP_OK;
+    tech_key(key, sizeof(key), "tech_id", idx);
+    err = keep_first_err(err, erase_key_if_exists(h, key));
+    tech_key(key, sizeof(key), "tech_name", idx);
+    err = keep_first_err(err, erase_key_if_exists(h, key));
+    tech_key(key, sizeof(key), "tech_salt", idx);
+    err = keep_first_err(err, erase_key_if_exists(h, key));
+    tech_key(key, sizeof(key), "tech_pwd", idx);
+    err = keep_first_err(err, erase_key_if_exists(h, key));
+    tech_key(key, sizeof(key), "tech_phone", idx);
+    err = keep_first_err(err, erase_key_if_exists(h, key));
+    return err;
+}
+
+static esp_err_t move_str_key(nvs_handle_t h, const char *prefix, int dst_idx, int src_idx, size_t buf_len)
 {
     char src_key[20];
     char dst_key[20];
@@ -141,11 +156,14 @@ static void move_str_key(nvs_handle_t h, const char *prefix, int dst_idx, int sr
     tech_key(src_key, sizeof(src_key), prefix, src_idx);
     tech_key(dst_key, sizeof(dst_key), prefix, dst_idx);
     size_t len = buf_len;
-    if (nvs_get_str(h, src_key, val, &len) == ESP_OK) {
-        nvs_set_str(h, dst_key, val);
-    } else {
-        nvs_erase_key(h, dst_key);
+    esp_err_t err = nvs_get_str(h, src_key, val, &len);
+    if (err == ESP_OK) {
+        return nvs_set_str(h, dst_key, val);
     }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return erase_key_if_exists(h, dst_key);
+    }
+    return err;
 }
 
 static void copy_str_or_empty(char *out, size_t out_len, const char *value)
@@ -766,13 +784,20 @@ esp_err_t config_remove_tech(int idx)
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
 
-    for (int i = idx; i < count - 1; i++) {
-        move_str_key(h, "tech_id", i, i + 1, TECH_ID_MAX_LEN + 1);
-        move_str_key(h, "tech_name", i, i + 1, CONFIG_TECH_NAME_MAX_LEN + 1);
-        move_str_key(h, "tech_phone", i, i + 1, TECH_PHONE_MAX_LEN);
+    esp_err_t err = ESP_OK;
+    for (int i = idx; i < count - 1 && err == ESP_OK; i++) {
+        err = keep_first_err(err, move_str_key(h, "tech_id", i, i + 1, TECH_ID_MAX_LEN + 1));
+        err = keep_first_err(err, move_str_key(h, "tech_name", i, i + 1, CONFIG_TECH_NAME_MAX_LEN + 1));
+        err = keep_first_err(err, move_str_key(h, "tech_salt", i, i + 1, TECH_SALT_HEX_LEN + 1));
+        err = keep_first_err(err, move_str_key(h, "tech_pwd", i, i + 1, TECH_HASH_HEX_LEN + 1));
+        err = keep_first_err(err, move_str_key(h, "tech_phone", i, i + 1, TECH_PHONE_MAX_LEN));
     }
-    erase_tech_slot(h, count - 1);
-    esp_err_t err = nvs_set_u8(h, "tech_count", count - 1);
+    if (err == ESP_OK) {
+        err = erase_tech_slot(h, count - 1);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "tech_count", count - 1);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
@@ -784,10 +809,13 @@ esp_err_t config_clear_techs(void)
 {
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
-    for (int i = 0; i < CONFIG_TECH_MAX_COUNT; i++) {
-        erase_tech_slot(h, i);
+    esp_err_t err = ESP_OK;
+    for (int i = 0; i < CONFIG_TECH_MAX_COUNT && err == ESP_OK; i++) {
+        err = erase_tech_slot(h, i);
     }
-    esp_err_t err = nvs_set_u8(h, "tech_count", 0);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "tech_count", 0);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
@@ -1003,6 +1031,88 @@ esp_err_t config_get_cloud_token(char *out, size_t out_len)
 esp_err_t config_set_cloud_token(const char *token)
 {
     return secrets_set("cloud_token", token);
+}
+
+#ifndef CONFIG_IDMS_MQTT_URI_DEFAULT
+#define CONFIG_IDMS_MQTT_URI_DEFAULT "mqtt://broker.hivemq.com:1883"
+#endif
+
+#ifndef CONFIG_IDMS_MODBUS_SLAVE_ID_DEFAULT
+#define CONFIG_IDMS_MODBUS_SLAVE_ID_DEFAULT 1
+#endif
+
+esp_err_t config_get_mqtt_uri(char *out, size_t out_len)
+{
+    return secrets_get("mqtt_uri", CONFIG_IDMS_MQTT_URI_DEFAULT, out, out_len);
+}
+
+esp_err_t config_set_mqtt_uri(const char *uri)
+{
+    return secrets_set("mqtt_uri", uri);
+}
+
+esp_err_t config_get_mqtt_user(char *out, size_t out_len)
+{
+    return secrets_get("mqtt_user", "", out, out_len);
+}
+
+esp_err_t config_set_mqtt_user(const char *user)
+{
+    return secrets_set("mqtt_user", user);
+}
+
+esp_err_t config_get_mqtt_pass(char *out, size_t out_len)
+{
+    return secrets_get("mqtt_pass", "", out, out_len);
+}
+
+esp_err_t config_set_mqtt_pass(const char *pass)
+{
+    return secrets_set("mqtt_pass", pass);
+}
+
+esp_err_t config_get_mqtt_client_id(char *out, size_t out_len)
+{
+    char default_id[32];
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(default_id, sizeof(default_id), "idms_%02x%02x%02x", mac[3], mac[4], mac[5]);
+    return secrets_get("mqtt_cid", default_id, out, out_len);
+}
+
+esp_err_t config_set_mqtt_client_id(const char *id)
+{
+    return secrets_set("mqtt_cid", id);
+}
+
+esp_err_t config_get_mb_slave_id(uint8_t *id)
+{
+    if (!id) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        *id = CONFIG_IDMS_MODBUS_SLAVE_ID_DEFAULT;
+        return ESP_OK;
+    }
+    esp_err_t err = nvs_get_u8(h, "mb_id", id);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        *id = CONFIG_IDMS_MODBUS_SLAVE_ID_DEFAULT;
+        return ESP_OK;
+    }
+    return ESP_OK;
+}
+
+esp_err_t config_set_mb_slave_id(uint8_t id)
+{
+    if (id < 1 || id > 247) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "open");
+    esp_err_t err = nvs_set_u8(h, "mb_id", id);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
 }
 
 /* ------------------------------------------------------------------ */

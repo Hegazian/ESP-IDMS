@@ -149,12 +149,18 @@ esp_err_t tg_broadcast_text(const char *text)
     uint8_t n = config_get_tech_count();
     if (n == 0) { ESP_LOGW(TAG, "No technicians configured"); return ESP_ERR_NOT_FOUND; }
     esp_err_t last = ESP_OK;
+    uint8_t sent = 0;
     for (int i = 0; i < n; i++) {
         char id[64];
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
+            sent++;
             esp_err_t e = tg_send_text(id, text);
             if (e != ESP_OK) last = e;
         }
+    }
+    if (sent == 0) {
+        ESP_LOGW(TAG, "No bound Telegram chat IDs configured");
+        return ESP_ERR_NOT_FOUND;
     }
     return last;
 }
@@ -164,12 +170,18 @@ esp_err_t tg_broadcast_alert(const char *text)
     uint8_t n = config_get_tech_count();
     if (n == 0) { ESP_LOGW(TAG, "No technicians configured"); return ESP_ERR_NOT_FOUND; }
     esp_err_t last = ESP_OK;
+    uint8_t sent = 0;
     for (int i = 0; i < n; i++) {
         char id[64];
         if (config_get_tech_id(i, id, sizeof(id)) == ESP_OK && id[0] != '\0') {
+            sent++;
             esp_err_t e = tg_send_text_ext(id, text, true);
             if (e != ESP_OK) last = e;
         }
+    }
+    if (sent == 0) {
+        ESP_LOGW(TAG, "No bound Telegram chat IDs configured");
+        return ESP_ERR_NOT_FOUND;
     }
     return last;
 }
@@ -375,22 +387,37 @@ void tg_flush_offline_queue(void)
 
     ESP_LOGI(TAG, "Flushing %d queued alerts", cnt);
     int failed = 0;
+    offline_msg_t failed_batch[MAX_OFFLINE_QUEUE];
     for (int i = 0; i < cnt; i++) {
-        if (tg_send_text(batch[i].chat_id, batch[i].text) != ESP_OK)
+        if (tg_send_text(batch[i].chat_id, batch[i].text) != ESP_OK) {
+            if (failed < MAX_OFFLINE_QUEUE) {
+                failed_batch[failed] = batch[i];
+            }
             failed++;
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     if (xSemaphoreTake(s_queue_mux, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        int remaining = s_offline_cnt > cnt ? s_offline_cnt - cnt : 0;
         if (failed == 0) {
-            int remaining = s_offline_cnt > cnt ? s_offline_cnt - cnt : 0;
             if (remaining > 0) {
                 memmove(s_offline_q, &s_offline_q[cnt], sizeof(s_offline_q[0]) * remaining);
             }
             s_offline_cnt = remaining;
             ESP_LOGI(TAG, "Queue flushed OK");
         } else {
-            ESP_LOGW(TAG, "Flush had %d failures — entries retained", failed);
+            int new_count = 0;
+            int failed_to_keep = failed < MAX_OFFLINE_QUEUE ? failed : MAX_OFFLINE_QUEUE;
+            for (int i = 0; i < failed_to_keep; i++) {
+                s_offline_q[new_count++] = failed_batch[i];
+            }
+            for (int i = 0; i < remaining && new_count < MAX_OFFLINE_QUEUE; i++) {
+                s_offline_q[new_count++] = s_offline_q[cnt + i];
+            }
+            s_offline_cnt = new_count;
+            ESP_LOGW(TAG, "Flush had %d failures; retained %d failed/new queued alerts",
+                     failed, new_count);
         }
         xSemaphoreGive(s_queue_mux);
     }

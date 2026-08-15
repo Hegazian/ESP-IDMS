@@ -7,6 +7,7 @@
 #define UI_TOPWAY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -79,7 +80,7 @@ void idms_ui_topway_check_apply_button(void);
  * @param page_id Page ID where touch occurred
  * @param key_id  Key/element ID that was touched
  */
-void idms_ui_topway_process_touch_event(uint8_t page_id, uint8_t key_id);
+void idms_ui_topway_process_touch_event(uint32_t vp, uint16_t value);
 
 /**
  * @brief Get the applied configuration values from LCD

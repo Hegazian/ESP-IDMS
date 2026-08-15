@@ -1,4 +1,6 @@
 ## Managed dependencies (ESP-IDF Component Manager)
-dependencies:
-  lvgl/lvgl: "8.3.11"
-  espressif/esp_lcd_ili9341: "^2.0.2"
+##
+## Topway builds use the UART smart-display path and do not need LVGL or
+## esp_lcd. Legacy LVGL LCD targets are hidden by default in Kconfig; only
+## enable them after adding the matching managed display packages back here.
+dependencies: {}

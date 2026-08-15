@@ -54,6 +54,18 @@ esp_err_t config_set_cloud_url(const char *url);
 esp_err_t config_get_cloud_token(char *out, size_t out_len);
 esp_err_t config_set_cloud_token(const char *token);
 
+esp_err_t config_get_mqtt_uri(char *out, size_t out_len);
+esp_err_t config_set_mqtt_uri(const char *uri);
+esp_err_t config_get_mqtt_user(char *out, size_t out_len);
+esp_err_t config_set_mqtt_user(const char *user);
+esp_err_t config_get_mqtt_pass(char *out, size_t out_len);
+esp_err_t config_set_mqtt_pass(const char *pass);
+esp_err_t config_get_mqtt_client_id(char *out, size_t out_len);
+esp_err_t config_set_mqtt_client_id(const char *id);
+
+esp_err_t config_get_mb_slave_id(uint8_t *id);
+esp_err_t config_set_mb_slave_id(uint8_t id);
+
 /* ------------------------------------------------------------------ */
 /*  Device/Telegram display strings shown on the Topway pages          */
 /*  Stored in NVS namespace "idms" and persisted across reboots.       */

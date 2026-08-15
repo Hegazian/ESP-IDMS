@@ -1,0 +1,2 @@
+dependencies:
+  espressif/enc28j60: "*"

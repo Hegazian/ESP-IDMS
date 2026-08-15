@@ -3,7 +3,7 @@
 #include "monitor.h"
 #include "ota.h"
 #include "telemetry.h"
-#include "wifi_manager.h"
+#include "network_manager.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -77,7 +77,7 @@ void tg_build_weekly(char *buf, size_t sz)
 void tg_build_export(char *buf, size_t sz)
 {
     char ip[16];
-    wifi_manager_get_ip(ip, sizeof(ip));
+    network_manager_get_ip(ip, sizeof(ip));
     const char *proto =
 #if CONFIG_IDMS_OTA_HTTPS_ENABLE
         "https";
@@ -103,7 +103,7 @@ void tg_build_export(char *buf, size_t sz)
 void tg_build_ota(char *buf, size_t sz)
 {
     char ip[16];
-    wifi_manager_get_ip(ip, sizeof(ip));
+    network_manager_get_ip(ip, sizeof(ip));
     const char *proto =
 #if CONFIG_IDMS_OTA_HTTPS_ENABLE
         "https";
